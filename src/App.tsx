@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 type DriveInfo = {
@@ -23,6 +24,15 @@ type CataloguedDrive = {
   fileCount: number;
   directoryCount: number;
   cataloguedBytes: number;
+};
+
+type ScanProgress = {
+  persistentIdentifier: string;
+  fileCount: number;
+  directoryCount: number;
+  cataloguedBytes: number;
+  skippedCount: number;
+  currentPath: string;
 };
 
 type CatalogueEntry = {
@@ -52,6 +62,8 @@ function App() {
   const [catalogued, setCatalogued] = useState<CataloguedDrive[]>([]);
   const [loading, setLoading] = useState(true);
   const [scanningId, setScanningId] = useState<string | null>(null);
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
+  const [scanComplete, setScanComplete] = useState<ScanProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
@@ -79,6 +91,13 @@ function App() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<ScanProgress>("scan-progress", (event) => setScanProgress(event.payload))
+      .then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, []);
 
   const connectedIds = useMemo(
     () => new Set(connected.flatMap((drive) => drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
@@ -133,14 +152,19 @@ function App() {
       return;
     }
     setScanningId(drive.persistentIdentifier);
+    setScanComplete(null);
+    setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
     setError(null);
     try {
-      await invoke("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
+      const result = await invoke<ScanProgress>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
+      setScanComplete({ ...result, currentPath: "" });
       await refresh();
+      window.setTimeout(() => setScanComplete(null), 4000);
     } catch (cause) {
       setError(String(cause));
     } finally {
       setScanningId(null);
+      setScanProgress(null);
     }
   };
 
@@ -284,6 +308,16 @@ function App() {
                   {catalogue && <div><dt>Files catalogued</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
                   {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
                 </dl>
+                {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier && (
+                  <div className="scan-progress" aria-live="polite">
+                    <div className="scan-progress-row"><strong>Scanning catalogue…</strong><span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span></div>
+                    <div className="scan-progress-stats"><span>{scanProgress.fileCount.toLocaleString()} files</span><span>{scanProgress.directoryCount.toLocaleString()} folders</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
+                    <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
+                  </div>
+                )}
+                {!scanning && scanComplete?.persistentIdentifier === drive.persistentIdentifier && (
+                  <div className="scan-complete" aria-live="polite">Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}</div>
+                )}
               </article>
             );
           })}

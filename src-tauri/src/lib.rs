@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +43,28 @@ struct ScanResult {
     catalogued_bytes: i64,
     skipped_count: i64,
     scanned_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    persistent_identifier: String,
+    file_count: i64,
+    directory_count: i64,
+    catalogued_bytes: i64,
+    skipped_count: i64,
+    current_path: String,
+}
+
+fn emit_scan_progress(app: &tauri::AppHandle, drive_id: &str, counters: &(i64, i64, i64, i64), current_path: &str) {
+    let _ = app.emit("scan-progress", ScanProgress {
+        persistent_identifier: drive_id.to_owned(),
+        file_count: counters.0,
+        directory_count: counters.1,
+        catalogued_bytes: counters.2,
+        skipped_count: counters.3,
+        current_path: current_path.to_owned(),
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -275,6 +297,8 @@ fn scan_directory(
     transaction: &rusqlite::Transaction<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
+    app: &tauri::AppHandle,
+    last_emitted: &mut i64,
 ) -> Result<(), String> {
     let entries = match fs::read_dir(current) {
         Ok(entries) => entries,
@@ -344,12 +368,21 @@ fn scan_directory(
 
         if is_directory {
             counters.1 += 1;
-            scan_directory(root, &path, transaction, drive_id, counters)?;
         } else if metadata.is_file() {
             counters.0 += 1;
             counters.2 = counters.2.saturating_add(size_bytes.unwrap_or(0));
         } else {
             counters.3 += 1;
+        }
+
+        let processed = counters.0 + counters.1;
+        if processed - *last_emitted >= 25 {
+            emit_scan_progress(app, drive_id, counters, &relative);
+            *last_emitted = processed;
+        }
+
+        if is_directory {
+            scan_directory(root, &path, transaction, drive_id, counters, app, last_emitted)?;
         }
     }
 
@@ -367,6 +400,7 @@ async fn scan_drive(
         .ok_or_else(|| "That drive is no longer connected.".to_string())?;
 
     let database = database_path(&app)?;
+    let progress_app = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         let drive_id = drive
@@ -420,7 +454,10 @@ async fn scan_drive(
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
 
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
-        scan_directory(&root, &root, &transaction, &drive_id, &mut counters)?;
+        let mut last_emitted = 0_i64;
+        emit_scan_progress(&progress_app, &drive_id, &counters, "");
+        scan_directory(&root, &root, &transaction, &drive_id, &mut counters, &progress_app, &mut last_emitted)?;
+        emit_scan_progress(&progress_app, &drive_id, &counters, "");
 
         transaction
             .execute(
