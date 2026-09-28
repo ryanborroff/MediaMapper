@@ -1,8 +1,10 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
@@ -65,6 +67,32 @@ fn emit_scan_progress(app: &tauri::AppHandle, drive_id: &str, counters: &(i64, i
         skipped_count: counters.3,
         current_path: current_path.to_owned(),
     });
+}
+
+static CANCELLED_SCANS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+const SCAN_CANCELLED: &str = "__MEDIA_MAPPER_SCAN_CANCELLED__";
+
+fn cancelled_scans() -> &'static Mutex<HashSet<String>> {
+    CANCELLED_SCANS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn scan_is_cancelled(drive_id: &str) -> bool {
+    cancelled_scans().lock().map(|scans| scans.contains(drive_id)).unwrap_or(false)
+}
+
+fn clear_scan_cancel(drive_id: &str) {
+    if let Ok(mut scans) = cancelled_scans().lock() {
+        scans.remove(drive_id);
+    }
+}
+
+#[tauri::command]
+fn cancel_scan(persistent_identifier: String) -> Result<(), String> {
+    cancelled_scans()
+        .lock()
+        .map_err(|_| "Unable to access scan cancellation state.".to_string())?
+        .insert(persistent_identifier);
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +328,10 @@ fn scan_directory(
     app: &tauri::AppHandle,
     last_emitted: &mut i64,
 ) -> Result<(), String> {
+    if scan_is_cancelled(drive_id) {
+        return Err(SCAN_CANCELLED.to_string());
+    }
+
     let entries = match fs::read_dir(current) {
         Ok(entries) => entries,
         Err(_) => {
@@ -309,6 +341,10 @@ fn scan_directory(
     };
 
     for entry_result in entries {
+        if scan_is_cancelled(drive_id) {
+            return Err(SCAN_CANCELLED.to_string());
+        }
+
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(_) => {
@@ -408,6 +444,7 @@ async fn scan_drive(
             .clone()
             .ok_or_else(|| "This drive does not provide a stable volume identifier.".to_string())?;
         let root = PathBuf::from(&drive.mount_point);
+        clear_scan_cancel(&drive_id);
 
         if !root.is_dir() {
             return Err("The drive mount point is no longer available.".to_string());
@@ -456,8 +493,15 @@ async fn scan_drive(
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
         let mut last_emitted = 0_i64;
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
-        scan_directory(&root, &root, &transaction, &drive_id, &mut counters, &progress_app, &mut last_emitted)?;
+        if let Err(error) = scan_directory(&root, &root, &transaction, &drive_id, &mut counters, &progress_app, &mut last_emitted) {
+            clear_scan_cancel(&drive_id);
+            if error == SCAN_CANCELLED {
+                return Err("Scan cancelled.".to_string());
+            }
+            return Err(error);
+        }
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
+        clear_scan_cancel(&drive_id);
 
         transaction
             .execute(
@@ -568,6 +612,7 @@ pub fn run() {
             list_external_drives,
             list_catalogued_drives,
             scan_drive,
+            cancel_scan,
             list_catalogue_entries,
             search_catalogue
         ])

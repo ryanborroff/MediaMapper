@@ -64,6 +64,8 @@ function App() {
   const [scanningId, setScanningId] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [scanComplete, setScanComplete] = useState<ScanProgress | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
@@ -146,12 +148,24 @@ function App() {
     await openFolder(drive, destination);
   };
 
+  const cancelScan = async (persistentIdentifier: string) => {
+    setCancellingId(persistentIdentifier);
+    try {
+      await invoke("cancel_scan", { persistentIdentifier });
+    } catch (cause) {
+      setCancellingId(null);
+      setError(String(cause));
+    }
+  };
+
   const scan = async (drive: DriveInfo) => {
     if (!drive.persistentIdentifier) {
       setError("This drive does not provide a stable volume identifier, so it cannot be catalogued safely.");
       return;
     }
     setScanningId(drive.persistentIdentifier);
+    setCancellingId(null);
+    setScanCancelledId(null);
     setScanComplete(null);
     setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
     setError(null);
@@ -161,9 +175,16 @@ function App() {
       await refresh();
       window.setTimeout(() => setScanComplete(null), 4000);
     } catch (cause) {
-      setError(String(cause));
+      const message = String(cause);
+      if (message.includes("Scan cancelled.")) {
+        setScanCancelledId(drive.persistentIdentifier);
+        window.setTimeout(() => setScanCancelledId(null), 4000);
+      } else {
+        setError(message);
+      }
     } finally {
       setScanningId(null);
+      setCancellingId(null);
       setScanProgress(null);
     }
   };
@@ -308,16 +329,27 @@ function App() {
                   {catalogue && <div><dt>Files catalogued</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
                   {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
                 </dl>
-                {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier && (
-                  <div className="scan-progress" aria-live="polite">
-                    <div className="scan-progress-row"><strong>Scanning catalogue…</strong><span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span></div>
-                    <div className="scan-progress-stats"><span>{scanProgress.fileCount.toLocaleString()} files</span><span>{scanProgress.directoryCount.toLocaleString()} folders</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
-                    <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
-                  </div>
-                )}
-                {!scanning && scanComplete?.persistentIdentifier === drive.persistentIdentifier && (
-                  <div className="scan-complete" aria-live="polite">Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}</div>
-                )}
+                <div className="scan-status-slot" aria-live="polite">
+                  {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
+                    <div className="scan-progress">
+                      <div className="scan-progress-row">
+                        <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : "Scanning catalogue…"}</strong>
+                        <div className="scan-progress-actions">
+                          <span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span>
+                          <button className="cancel-scan-button" disabled={cancellingId === drive.persistentIdentifier} onClick={() => void cancelScan(drive.persistentIdentifier!)}>
+                            {cancellingId === drive.persistentIdentifier ? "Cancelling…" : "Cancel scan"}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="scan-progress-stats"><span>{scanProgress.fileCount.toLocaleString()} files</span><span>{scanProgress.directoryCount.toLocaleString()} folders</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
+                      <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
+                    </div>
+                  ) : scanComplete?.persistentIdentifier === drive.persistentIdentifier ? (
+                    <div className="scan-complete">Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}</div>
+                  ) : scanCancelledId === drive.persistentIdentifier ? (
+                    <div className="scan-cancelled">Scan cancelled · previous catalogue kept unchanged</div>
+                  ) : null}
+                </div>
               </article>
             );
           })}
