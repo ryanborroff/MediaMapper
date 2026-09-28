@@ -1,116 +1,42 @@
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafb);
-}
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  color: #171717;
+  background: #f5f5f3;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
 }
 
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 640px; min-height: 100vh; background: #f5f5f3; }
+button { font: inherit; }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
+.app-shell { max-width: 1040px; margin: 0 auto; padding: 56px 48px 32px; }
+.app-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 32px; margin-bottom: 40px; }
+.eyebrow { margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .16em; color: #777; }
+h1 { margin: 0; font-size: 34px; letter-spacing: -.035em; font-weight: 650; }
+.intro { max-width: 620px; margin: 10px 0 0; color: #686868; font-size: 15px; line-height: 1.5; }
+.refresh-button { border: 1px solid #d2d2cf; background: #fff; border-radius: 9px; padding: 9px 15px; color: #252525; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+.refresh-button:disabled { color: #999; cursor: default; }
+.drive-list { display: grid; gap: 16px; }
+.drive-card, .empty-state, .notice { background: #fff; border: 1px solid #dededb; border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.035); }
+.drive-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.drive-title-row h2 { margin: 7px 0 0; font-size: 21px; font-weight: 620; letter-spacing: -.02em; }
+.status-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #27864a; }
+.online-label { font-size: 10px; font-weight: 700; letter-spacing: .11em; color: #27864a; }
+.capacity { font-size: 17px; font-weight: 600; color: #353535; white-space: nowrap; }
+.capacity-bar { height: 6px; margin: 20px 0 22px; overflow: hidden; border-radius: 999px; background: #e9e9e6; }
+.capacity-bar span { display: block; height: 100%; background: #555; border-radius: inherit; }
+.drive-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 32px; margin: 0; }
+.drive-details div { min-width: 0; }
+dt { margin-bottom: 4px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-height: 1.4; }
+.empty-state { padding: 56px 32px; text-align: center; }
+.empty-state h2 { margin: 0 0 8px; font-size: 20px; }
+.empty-state p { margin: 0; color: #707070; }
+.notice.error { color: #8d2626; background: #fff8f8; border-color: #ead1d1; }
+.safety-note { margin-top: 28px; color: #858585; font-size: 12px; text-align: center; }
 
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+@media (max-width: 760px) {
+  .app-shell { padding: 36px 28px 24px; }
+  .drive-details { grid-template-columns: 1fr; }
 }
