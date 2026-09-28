@@ -443,110 +443,112 @@ fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>,
 
 fn scan_directory(
     root: &Path,
-    current: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
     app: &tauri::AppHandle,
     last_emit_at: &mut Instant,
 ) -> Result<(), String> {
-    if scan_is_cancelled(drive_id) {
-        return Err(SCAN_CANCELLED.to_string());
-    }
+    // Keep directory traversal on the heap rather than the call stack. This
+    // avoids stack overflow on drives with unusually deep folder structures.
+    let mut directories = vec![root.to_path_buf()];
 
-    let entries = match fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(_) => {
-            counters.3 += 1;
-            return Ok(());
-        }
-    };
-
-    for entry_result in entries {
+    while let Some(current) = directories.pop() {
         if scan_is_cancelled(drive_id) {
             return Err(SCAN_CANCELLED.to_string());
         }
 
-        let entry = match entry_result {
-            Ok(entry) => entry,
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
             Err(_) => {
                 counters.3 += 1;
                 continue;
             }
         };
 
-        let name = entry.file_name().to_string_lossy().into_owned();
+        for entry_result in entries {
+            if scan_is_cancelled(drive_id) {
+                return Err(SCAN_CANCELLED.to_string());
+            }
 
-        // Ignore macOS Finder metadata rather than cataloguing it as user content.
-        // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
-        // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
-        if name.starts_with("._") || name == ".DS_Store" {
-            continue;
-        }
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(_) => {
+                    counters.3 += 1;
+                    continue;
+                }
+            };
 
-        let path = entry.path();
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
+            let name = entry.file_name().to_string_lossy().into_owned();
+
+            // Ignore macOS Finder metadata rather than cataloguing it as user content.
+            // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
+            // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
+            if name.starts_with("._") || name == ".DS_Store" {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    counters.3 += 1;
+                    continue;
+                }
+            };
+
+            // Never follow symlinks. This prevents a catalogue scan escaping the selected volume.
+            if metadata.file_type().is_symlink() {
                 counters.3 += 1;
                 continue;
             }
-        };
 
-        // Never follow symlinks. This prevents a catalogue scan escaping the selected volume.
-        if metadata.file_type().is_symlink() {
-            counters.3 += 1;
-            continue;
-        }
+            let relative = match path.strip_prefix(root) {
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => {
+                    counters.3 += 1;
+                    continue;
+                }
+            };
+            let is_directory = metadata.is_dir();
+            let size_bytes = if metadata.is_file() {
+                Some(metadata.len().min(i64::MAX as u64) as i64)
+            } else {
+                None
+            };
+            let modified_at = system_time_unix(metadata.modified());
+            let parent_path = Path::new(&relative)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-        let relative = match path.strip_prefix(root) {
-            Ok(relative) => relative.to_string_lossy().into_owned(),
-            Err(_) => {
+            insert_statement
+                .execute(params![
+                    drive_id,
+                    relative,
+                    name,
+                    parent_path,
+                    if is_directory { 1 } else { 0 },
+                    size_bytes,
+                    modified_at
+                ])
+                .map_err(|error| format!("Unable to write catalogue entry: {error}"))?;
+
+            if is_directory {
+                counters.1 += 1;
+                directories.push(path);
+            } else if metadata.is_file() {
+                counters.0 += 1;
+                counters.2 = counters.2.saturating_add(size_bytes.unwrap_or(0));
+            } else {
                 counters.3 += 1;
-                continue;
             }
-        };
-        let is_directory = metadata.is_dir();
-        let size_bytes = if metadata.is_file() {
-            Some(metadata.len().min(i64::MAX as u64) as i64)
-        } else {
-            None
-        };
-        let modified_at = system_time_unix(metadata.modified());
-        let parent_path = Path::new(&relative)
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
 
-        insert_statement
-            .execute(params![
-                drive_id,
-                relative,
-                name,
-                parent_path,
-                if is_directory { 1 } else { 0 },
-                size_bytes,
-                modified_at
-            ])
-            .map_err(|error| format!("Unable to write catalogue entry: {error}"))?;
-
-        if is_directory {
-            counters.1 += 1;
-        } else if metadata.is_file() {
-            counters.0 += 1;
-            counters.2 = counters.2.saturating_add(size_bytes.unwrap_or(0));
-        } else {
-            counters.3 += 1;
-        }
-
-        if last_emit_at.elapsed() >= Duration::from_millis(150) {
-            emit_scan_progress(app, drive_id, counters, &relative);
-            *last_emit_at = Instant::now();
-        }
-
-        if is_directory {
-            scan_directory(root, &path, insert_statement, drive_id, counters, app, last_emit_at)?;
+            if last_emit_at.elapsed() >= Duration::from_millis(150) {
+                emit_scan_progress(app, drive_id, counters, &relative);
+                *last_emit_at = Instant::now();
+            }
         }
     }
 
@@ -634,7 +636,6 @@ async fn scan_drive(
         let mut last_emit_at = Instant::now();
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
         if let Err(error) = scan_directory(
-            &root,
             &root,
             &mut insert_statement,
             &drive_id,
