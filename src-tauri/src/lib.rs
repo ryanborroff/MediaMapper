@@ -147,7 +147,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
                 available_bytes INTEGER,
                 last_mount_point TEXT,
                 last_seen_at INTEGER NOT NULL,
-                last_scanned_at INTEGER
+                last_scanned_at INTEGER,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                directory_count INTEGER NOT NULL DEFAULT 0,
+                catalogued_bytes INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS files (
@@ -170,6 +173,65 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             ",
         )
         .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
+
+    let existing_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(drives)")
+            .map_err(|error| format!("Unable to inspect drive schema: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("Unable to inspect drive columns: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("Unable to read drive columns: {error}"))?
+    };
+
+    let mut added_summary_columns = false;
+    if !existing_columns.contains("file_count") {
+        connection
+            .execute("ALTER TABLE drives ADD COLUMN file_count INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|error| format!("Unable to add drive file count: {error}"))?;
+        added_summary_columns = true;
+    }
+    if !existing_columns.contains("directory_count") {
+        connection
+            .execute("ALTER TABLE drives ADD COLUMN directory_count INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|error| format!("Unable to add drive directory count: {error}"))?;
+        added_summary_columns = true;
+    }
+    if !existing_columns.contains("catalogued_bytes") {
+        connection
+            .execute("ALTER TABLE drives ADD COLUMN catalogued_bytes INTEGER NOT NULL DEFAULT 0", [])
+            .map_err(|error| format!("Unable to add drive byte count: {error}"))?;
+        added_summary_columns = true;
+    }
+
+    // Existing catalogues are preserved. This aggregation runs once when the
+    // summary columns are first added; subsequent catalogue loads read the
+    // cached totals directly from the drive row.
+    if added_summary_columns {
+        connection
+            .execute_batch(
+                "
+                UPDATE drives
+                SET file_count = (
+                        SELECT COUNT(*) FROM files
+                        WHERE files.drive_id = drives.persistent_identifier
+                          AND files.is_directory = 0
+                    ),
+                    directory_count = (
+                        SELECT COUNT(*) FROM files
+                        WHERE files.drive_id = drives.persistent_identifier
+                          AND files.is_directory = 1
+                    ),
+                    catalogued_bytes = (
+                        SELECT COALESCE(SUM(files.size_bytes), 0) FROM files
+                        WHERE files.drive_id = drives.persistent_identifier
+                          AND files.is_directory = 0
+                    );
+                ",
+            )
+            .map_err(|error| format!("Unable to migrate catalogue totals: {error}"))?;
+    }
 
     Ok(connection)
 }
@@ -287,12 +349,10 @@ fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>,
                 d.available_bytes,
                 d.last_mount_point,
                 d.last_scanned_at,
-                COALESCE(SUM(CASE WHEN f.is_directory = 0 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN f.is_directory = 1 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN f.is_directory = 0 THEN f.size_bytes ELSE 0 END), 0)
+                d.file_count,
+                d.directory_count,
+                d.catalogued_bytes
             FROM drives d
-            LEFT JOIN files f ON f.drive_id = d.persistent_identifier
-            GROUP BY d.persistent_identifier
             ORDER BY lower(d.name)
             ",
         )
@@ -519,8 +579,15 @@ async fn scan_drive(
 
         transaction
             .execute(
-                "UPDATE drives SET last_scanned_at = ?1 WHERE persistent_identifier = ?2",
-                params![scanned_at, drive_id],
+                "
+                UPDATE drives
+                SET last_scanned_at = ?1,
+                    file_count = ?2,
+                    directory_count = ?3,
+                    catalogued_bytes = ?4
+                WHERE persistent_identifier = ?5
+                ",
+                params![scanned_at, counters.0, counters.1, counters.2, drive_id],
             )
             .map_err(|error| format!("Unable to finish drive scan: {error}"))?;
 
