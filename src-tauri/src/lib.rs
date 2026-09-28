@@ -158,6 +158,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
                 drive_id TEXT NOT NULL,
                 relative_path TEXT NOT NULL,
                 name TEXT NOT NULL,
+                parent_path TEXT NOT NULL DEFAULT '',
                 is_directory INTEGER NOT NULL,
                 size_bytes INTEGER,
                 modified_at INTEGER,
@@ -232,6 +233,67 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             )
             .map_err(|error| format!("Unable to migrate catalogue totals: {error}"))?;
     }
+
+    let file_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(files)")
+            .map_err(|error| format!("Unable to inspect file schema: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("Unable to inspect file columns: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("Unable to read file columns: {error}"))?
+    };
+
+    if !file_columns.contains("parent_path") {
+        connection
+            .execute("ALTER TABLE files ADD COLUMN parent_path TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|error| format!("Unable to add catalogue parent paths: {error}"))?;
+
+        let existing_paths = {
+            let mut statement = connection
+                .prepare("SELECT id, relative_path FROM files")
+                .map_err(|error| format!("Unable to read catalogue paths: {error}"))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|error| format!("Unable to read catalogue paths: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read catalogue paths: {error}"))?
+        };
+
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| format!("Unable to migrate catalogue parent paths: {error}"))?;
+        {
+            let mut update = transaction
+                .prepare("UPDATE files SET parent_path = ?1 WHERE id = ?2")
+                .map_err(|error| format!("Unable to prepare parent path migration: {error}"))?;
+
+            for (id, relative_path) in existing_paths {
+                let parent_path = Path::new(&relative_path)
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                update
+                    .execute(params![parent_path, id])
+                    .map_err(|error| format!("Unable to migrate catalogue parent path: {error}"))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to commit parent path migration: {error}"))?;
+    }
+
+    connection
+        .execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_files_drive_parent
+                ON files(drive_id, parent_path);
+            ",
+        )
+        .map_err(|error| format!("Unable to initialise parent path index: {error}"))?;
 
     Ok(connection)
 }
@@ -443,12 +505,18 @@ fn scan_directory(
             None
         };
         let modified_at = system_time_unix(metadata.modified());
+        let parent_path = Path::new(&relative)
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         insert_statement
             .execute(params![
                 drive_id,
                 relative,
                 name,
+                parent_path,
                 if is_directory { 1 } else { 0 },
                 size_bytes,
                 modified_at
@@ -548,8 +616,8 @@ async fn scan_drive(
             .prepare_cached(
                 "
                 INSERT INTO files
-                    (drive_id, relative_path, name, is_directory, size_bytes, modified_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ",
             )
             .map_err(|error| format!("Unable to prepare catalogue writer: {error}"))?;
@@ -615,17 +683,6 @@ fn list_catalogue_entries(
     parent_path: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
     let connection = open_database(&database_path(&app)?)?;
-    let separator = std::path::MAIN_SEPARATOR.to_string();
-    let prefix = if parent_path.is_empty() {
-        String::new()
-    } else {
-        format!("{parent_path}{separator}")
-    };
-    let escaped_prefix = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let pattern = format!("{escaped_prefix}%");
 
     let mut statement = connection
         .prepare(
@@ -633,15 +690,14 @@ fn list_catalogue_entries(
             SELECT relative_path, name, is_directory, size_bytes, modified_at
             FROM files
             WHERE drive_id = ?1
-              AND relative_path LIKE ?2 ESCAPE '\\'
-              AND instr(substr(relative_path, length(?3) + 1), ?4) = 0
+              AND parent_path = ?2
             ORDER BY is_directory DESC, lower(name), name
             ",
         )
         .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
 
     let rows = statement
-        .query_map(params![persistent_identifier, pattern, prefix, separator], |row| {
+        .query_map(params![persistent_identifier, parent_path], |row| {
             Ok(CatalogueEntry {
                 relative_path: row.get(0)?,
                 name: row.get(1)?,
