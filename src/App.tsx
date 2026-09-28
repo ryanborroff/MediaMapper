@@ -25,8 +25,16 @@ type CataloguedDrive = {
   cataloguedBytes: number;
 };
 
+type CatalogueEntry = {
+  relativePath: string;
+  name: string;
+  isDirectory: boolean;
+  sizeBytes: number | null;
+  modifiedAt: number | null;
+};
+
 function formatBytes(bytes: number | null) {
-  if (bytes === null) return "Unknown";
+  if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), units.length - 1);
@@ -35,10 +43,8 @@ function formatBytes(bytes: number | null) {
 
 function formatDate(timestamp: number | null) {
   if (!timestamp) return "Never";
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(timestamp * 1000));
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+    .format(new Date(timestamp * 1000));
 }
 
 function App() {
@@ -47,6 +53,10 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [scanningId, setScanningId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
+  const [browserPath, setBrowserPath] = useState("");
+  const [entries, setEntries] = useState<CatalogueEntry[]>([]);
+  const [browserLoading, setBrowserLoading] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -65,21 +75,36 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  useEffect(() => { void refresh(); }, [refresh]);
 
   const connectedIds = useMemo(
     () => new Set(connected.flatMap((drive) => drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
     [connected],
   );
 
+  const openFolder = useCallback(async (drive: CataloguedDrive, path: string) => {
+    setBrowserDrive(drive);
+    setBrowserPath(path);
+    setBrowserLoading(true);
+    setError(null);
+    try {
+      setEntries(await invoke<CatalogueEntry[]>("list_catalogue_entries", {
+        persistentIdentifier: drive.persistentIdentifier,
+        parentPath: path,
+      }));
+    } catch (cause) {
+      setError(String(cause));
+      setEntries([]);
+    } finally {
+      setBrowserLoading(false);
+    }
+  }, []);
+
   const scan = async (drive: DriveInfo) => {
     if (!drive.persistentIdentifier) {
       setError("This drive does not provide a stable volume identifier, so it cannot be catalogued safely.");
       return;
     }
-
     setScanningId(drive.persistentIdentifier);
     setError(null);
     try {
@@ -92,7 +117,80 @@ function App() {
     }
   };
 
+  const catalogueFor = (id: string | null) =>
+    id ? catalogued.find((item) => item.persistentIdentifier === id) : undefined;
+
+  const pathParts = browserPath ? browserPath.split("/") : [];
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
+
+  if (browserDrive) {
+    const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
+    const online = connectedIds.has(liveDrive.persistentIdentifier);
+
+    return (
+      <main className="app-shell browser-shell">
+        <header className="browser-header">
+          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); }}>
+            Back to drives
+          </button>
+          <div className="browser-title-row">
+            <div>
+              <p className="eyebrow">{online ? "CONNECTED CATALOGUE" : "OFFLINE CATALOGUE"}</p>
+              <h1>{liveDrive.name}</h1>
+            </div>
+            <span className={online ? "browser-status online-label" : "browser-status offline-label"}>
+              {online ? "CONNECTED" : "OFFLINE"}
+            </span>
+          </div>
+          <nav className="breadcrumbs" aria-label="Folder path">
+            <button onClick={() => void openFolder(liveDrive, "")}>{liveDrive.name}</button>
+            {pathParts.map((part, index) => {
+              const path = pathParts.slice(0, index + 1).join("/");
+              return (
+                <span key={path}>
+                  <span className="crumb-separator">/</span>
+                  <button onClick={() => void openFolder(liveDrive, path)}>{part}</button>
+                </span>
+              );
+            })}
+          </nav>
+        </header>
+
+        {error && <div className="notice error">{error}</div>}
+
+        <section className="file-browser">
+          <div className="file-browser-head">
+            <span>Name</span><span>Modified</span><span>Size</span>
+          </div>
+          {browserLoading ? (
+            <div className="browser-message">Loading catalogue…</div>
+          ) : entries.length === 0 ? (
+            <div className="browser-message">This folder is empty in the catalogue.</div>
+          ) : (
+            entries.map((entry) => (
+              <button
+                className={`file-row ${entry.isDirectory ? "folder-row" : ""}`}
+                key={entry.relativePath}
+                disabled={!entry.isDirectory}
+                onClick={() => entry.isDirectory && void openFolder(liveDrive, entry.relativePath)}
+              >
+                <span className="file-name">
+                  <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+                  {entry.name}
+                </span>
+                <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
+                <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
+              </button>
+            ))
+          )}
+        </section>
+
+        <footer className="safety-note">
+          This view comes from Media Mapper's local catalogue. It does not read the drive while you browse it.
+        </footer>
+      </main>
+    );
+  }
 
   return (
     <main className="app-shell">
@@ -110,64 +208,35 @@ function App() {
       {error && <div className="notice error">{error}</div>}
 
       <section className="section-block">
-        <div className="section-heading">
-          <h2>Connected</h2>
-          <span>{connected.length}</span>
-        </div>
-
+        <div className="section-heading"><h2>Connected</h2><span>{connected.length}</span></div>
         {!loading && connected.length === 0 && (
-          <div className="empty-state compact">
-            <h3>No external drives detected</h3>
-            <p>Connect a drive, then choose Refresh.</p>
-          </div>
+          <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive, then choose Refresh.</p></div>
         )}
-
         <div className="drive-list">
           {connected.map((drive) => {
-            const catalogue = drive.persistentIdentifier
-              ? catalogued.find((item) => item.persistentIdentifier === drive.persistentIdentifier)
-              : undefined;
-            const used = drive.totalBytes !== null && drive.availableBytes !== null
-              ? drive.totalBytes - drive.availableBytes
-              : null;
-            const usedPercent = used !== null && drive.totalBytes
-              ? Math.max(0, Math.min(100, (used / drive.totalBytes) * 100))
-              : null;
+            const catalogue = catalogueFor(drive.persistentIdentifier);
             const scanning = scanningId === drive.persistentIdentifier;
-
             return (
               <article className="drive-card" key={drive.persistentIdentifier ?? drive.mountPoint}>
                 <div className="drive-title-row">
-                  <div>
-                    <span className="status-dot" aria-hidden="true" />
-                    <span className="online-label">CONNECTED</span>
-                    <h3>{drive.name}</h3>
-                  </div>
+                  <div><span className="status-dot" /><span className="online-label">CONNECTED</span><h3>{drive.name}</h3></div>
                   <div className="drive-actions">
                     <span className="capacity">{formatBytes(drive.totalBytes)}</span>
-                    <button
-                      className="scan-button"
-                      disabled={scanningId !== null || !drive.persistentIdentifier}
-                      onClick={() => void scan(drive)}
-                    >
-                      {scanning ? "Scanning…" : catalogue ? "Rescan drive" : "Scan drive"}
-                    </button>
+                    <div className="button-row">
+                      {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse catalogue</button>}
+                      <button className="scan-button" disabled={scanningId !== null || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
+                        {scanning ? "Scanning…" : catalogue ? "Rescan drive" : "Scan drive"}
+                      </button>
+                    </div>
                   </div>
                 </div>
-
-                {usedPercent !== null && (
-                  <div className="capacity-bar" aria-label={`${usedPercent.toFixed(0)} percent used`}>
-                    <span style={{ width: `${usedPercent}%` }} />
-                  </div>
-                )}
-
-                <dl className="drive-details">
+                <dl className="drive-details offline-details">
                   <div><dt>Available</dt><dd>{formatBytes(drive.availableBytes)}</dd></div>
                   <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                   <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
                   {catalogue && <div><dt>Files catalogued</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Catalogue size</dt><dd>{formatBytes(catalogue.cataloguedBytes)}</dd></div>}
+                  {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
                 </dl>
               </article>
             );
@@ -176,35 +245,25 @@ function App() {
       </section>
 
       <section className="section-block">
-        <div className="section-heading">
-          <h2>Offline catalogue</h2>
-          <span>{offline.length}</span>
-        </div>
-
+        <div className="section-heading"><h2>Offline catalogue</h2><span>{offline.length}</span></div>
         {offline.length === 0 ? (
-          <div className="empty-state compact">
-            <h3>No offline drives yet</h3>
-            <p>Scan a connected drive, then disconnect it. Its catalogue will remain here.</p>
-          </div>
+          <div className="empty-state compact"><h3>No offline drives yet</h3><p>Scan a connected drive, then disconnect it. Its catalogue will remain here.</p></div>
         ) : (
           <div className="drive-list">
             {offline.map((drive) => (
               <article className="drive-card offline" key={drive.persistentIdentifier}>
                 <div className="drive-title-row">
-                  <div>
-                    <span className="status-dot offline-dot" aria-hidden="true" />
-                    <span className="offline-label">OFFLINE</span>
-                    <h3>{drive.name}</h3>
+                  <div><span className="status-dot offline-dot" /><span className="offline-label">OFFLINE</span><h3>{drive.name}</h3></div>
+                  <div className="drive-actions">
+                    <span className="capacity">{formatBytes(drive.totalBytes)}</span>
+                    <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
                   </div>
-                  <span className="capacity">{formatBytes(drive.totalBytes)}</span>
                 </div>
                 <dl className="drive-details offline-details">
                   <div><dt>Files</dt><dd>{drive.fileCount.toLocaleString()}</dd></div>
                   <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
                   <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
-                  <div><dt>Last mount point</dt><dd>{drive.lastMountPoint ?? "Unknown"}</dd></div>
-                  <div><dt>Volume ID</dt><dd>{drive.persistentIdentifier}</dd></div>
                 </dl>
               </article>
             ))}
@@ -212,9 +271,7 @@ function App() {
         )}
       </section>
 
-      <footer className="safety-note">
-        Scanning reads names, paths, sizes and timestamps only. It does not open media contents, rename, move, copy or delete files.
-      </footer>
+      <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only. It does not open media contents, rename, move, copy or delete files.</footer>
     </main>
   );
 }

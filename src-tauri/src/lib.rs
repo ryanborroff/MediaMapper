@@ -447,22 +447,36 @@ async fn scan_drive(
 fn list_catalogue_entries(
     app: tauri::AppHandle,
     persistent_identifier: String,
+    parent_path: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
     let connection = open_database(&database_path(&app)?)?;
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    let prefix = if parent_path.is_empty() {
+        String::new()
+    } else {
+        format!("{parent_path}{separator}")
+    };
+    let escaped_prefix = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped_prefix}%");
+
     let mut statement = connection
         .prepare(
             "
             SELECT relative_path, name, is_directory, size_bytes, modified_at
             FROM files
             WHERE drive_id = ?1
-            ORDER BY relative_path
-            LIMIT 500
+              AND relative_path LIKE ?2 ESCAPE '\\'
+              AND instr(substr(relative_path, length(?3) + 1), ?4) = 0
+            ORDER BY is_directory DESC, lower(name), name
             ",
         )
         .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
 
     let rows = statement
-        .query_map(params![persistent_identifier], |row| {
+        .query_map(params![persistent_identifier, pattern, prefix, separator], |row| {
             Ok(CatalogueEntry {
                 relative_path: row.get(0)?,
                 name: row.get(1)?,
