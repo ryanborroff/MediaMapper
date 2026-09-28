@@ -57,6 +57,23 @@ type LargestFile = {
   modifiedAt: number | null;
 };
 
+type DuplicateFile = {
+  driveId: string;
+  driveName: string;
+  relativePath: string;
+  name: string;
+  sizeBytes: number;
+  modifiedAt: number | null;
+};
+
+type DuplicateGroup = {
+  name: string;
+  sizeBytes: number;
+  copies: number;
+  potentialWastedBytes: number;
+  files: DuplicateFile[];
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -94,6 +111,10 @@ function App() {
   const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
   const [largestFilesLoading, setLargestFilesLoading] = useState(false);
   const [showLargestFiles, setShowLargestFiles] = useState(false);
+  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
+  const [duplicatesLoading, setDuplicatesLoading] = useState(false);
+  const [showDuplicates, setShowDuplicates] = useState(false);
+  const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -177,6 +198,28 @@ function App() {
     }
   }, []);
 
+  const loadDuplicates = useCallback(async () => {
+    if (showDuplicates) {
+      setShowDuplicates(false);
+      setExpandedDuplicate(null);
+      return;
+    }
+
+    setDuplicatesLoading(true);
+    setError(null);
+
+    try {
+      const results = await invoke<DuplicateGroup[]>("probable_duplicates");
+      setDuplicateGroups(results);
+      setShowDuplicates(true);
+    } catch (cause) {
+      setError(String(cause));
+      setDuplicateGroups([]);
+    } finally {
+      setDuplicatesLoading(false);
+    }
+  }, [showDuplicates]);
+
   const loadLargestFiles = useCallback(async () => {
     if (showLargestFiles) {
       setShowLargestFiles(false);
@@ -218,6 +261,23 @@ function App() {
     setLibraryQuery("");
     setLibraryResults([]);
     await openSearchResult(drive, result);
+  };
+
+  const openDuplicateFile = async (file: DuplicateFile) => {
+    const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
+
+    if (!drive) {
+      setError("That drive catalogue is no longer available.");
+      return;
+    }
+
+    await openSearchResult(drive, {
+      relativePath: file.relativePath,
+      name: file.name,
+      isDirectory: false,
+      sizeBytes: file.sizeBytes,
+      modifiedAt: file.modifiedAt,
+    });
   };
 
   const openLargestFile = async (file: LargestFile) => {
@@ -429,6 +489,66 @@ function App() {
               <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
               <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
             </button>)}
+        </div>}
+      </section>}
+
+      {catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <div>
+            <h2>Probable duplicates</h2>
+            <p className="section-description">Same filename and exact file size. Contents have not been compared.</p>
+          </div>
+          <button
+            className="browse-button"
+            onClick={() => void loadDuplicates()}
+            disabled={duplicatesLoading}
+          >
+            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
+          </button>
+        </div>
+
+        {showDuplicates && <div className="search-results">
+          {duplicateGroups.length === 0 ? (
+            <div className="browser-message">No probable duplicates found.</div>
+          ) : (
+            duplicateGroups.map((group) => {
+              const key = `${group.name}:${group.sizeBytes}`;
+              const expanded = expandedDuplicate === key;
+
+              return (
+                <div className="duplicate-group" key={key}>
+                  <button
+                    className="search-result"
+                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
+                  >
+                    <span className="search-result-main">
+                      <strong>{group.name}</strong>
+                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
+                    </span>
+                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
+                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
+                  </button>
+
+                  {expanded && <div className="duplicate-files">
+                    {group.files.map((file) => (
+                      <button
+                        className="search-result"
+                        key={`${file.driveId}:${file.relativePath}`}
+                        onClick={() => void openDuplicateFile(file)}
+                      >
+                        <span className="search-result-main">
+                          <strong>{file.driveName}</strong>
+                          <span>{file.relativePath}</span>
+                        </span>
+                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                        <span>{formatBytes(file.sizeBytes)}</span>
+                      </button>
+                    ))}
+                  </div>}
+                </div>
+              );
+            })
+          )}
         </div>}
       </section>}
 

@@ -128,6 +128,27 @@ struct LargestFile {
     modified_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateFile {
+    drive_id: String,
+    drive_name: String,
+    relative_path: String,
+    name: String,
+    size_bytes: i64,
+    modified_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateGroup {
+    name: String,
+    size_bytes: i64,
+    copies: i64,
+    potential_wasted_bytes: i64,
+    files: Vec<DuplicateFile>,
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -896,6 +917,93 @@ fn search_all_catalogues(
 }
 
 #[tauri::command]
+fn probable_duplicates(
+    app: tauri::AppHandle,
+) -> Result<Vec<DuplicateGroup>, String> {
+    let connection = open_database(&database_path(&app)?)?;
+
+    let mut groups_statement = connection
+        .prepare(
+            "SELECT MIN(f.name) AS display_name,
+                    f.size_bytes,
+                    COUNT(*) AS copies
+             FROM files f
+             WHERE f.is_directory = 0
+               AND f.size_bytes IS NOT NULL
+               AND f.size_bytes > 0
+             GROUP BY lower(f.name), f.size_bytes
+             HAVING COUNT(*) > 1
+             ORDER BY (f.size_bytes * (COUNT(*) - 1)) DESC,
+                      f.size_bytes DESC,
+                      lower(MIN(f.name))
+             LIMIT 100"
+        )
+        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+
+    let group_rows = groups_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to read probable duplicate groups: {error}"))?;
+
+    let groups = group_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read probable duplicate group rows: {error}"))?;
+
+    let mut file_statement = connection
+        .prepare(
+            "SELECT f.drive_id,
+                    d.name,
+                    f.relative_path,
+                    f.name,
+                    f.size_bytes,
+                    f.modified_at
+             FROM files f
+             JOIN drives d ON d.persistent_identifier = f.drive_id
+             WHERE f.is_directory = 0
+               AND lower(f.name) = lower(?1)
+               AND f.size_bytes = ?2
+             ORDER BY lower(d.name), lower(f.relative_path)"
+        )
+        .map_err(|error| format!("Unable to prepare probable duplicate files query: {error}"))?;
+
+    let mut results = Vec::with_capacity(groups.len());
+
+    for (name, size_bytes, copies) in groups {
+        let file_rows = file_statement
+            .query_map(params![&name, size_bytes], |row| {
+                Ok(DuplicateFile {
+                    drive_id: row.get(0)?,
+                    drive_name: row.get(1)?,
+                    relative_path: row.get(2)?,
+                    name: row.get(3)?,
+                    size_bytes: row.get(4)?,
+                    modified_at: row.get(5)?,
+                })
+            })
+            .map_err(|error| format!("Unable to read probable duplicate files: {error}"))?;
+
+        let files = file_rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read probable duplicate file rows: {error}"))?;
+
+        results.push(DuplicateGroup {
+            name,
+            size_bytes,
+            copies,
+            potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+            files,
+        });
+    }
+
+    Ok(results)
+}
+
+#[tauri::command]
 fn largest_files(
     app: tauri::AppHandle,
 ) -> Result<Vec<LargestFile>, String> {
@@ -947,7 +1055,8 @@ pub fn run() {
             list_catalogue_entries,
             search_catalogue,
             search_all_catalogues,
-            largest_files
+            largest_files,
+            probable_duplicates
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
