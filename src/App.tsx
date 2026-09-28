@@ -347,7 +347,7 @@ function App() {
                   ) : scanComplete?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-complete">Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}</div>
                   ) : scanCancelledId === drive.persistentIdentifier ? (
-                    <div className="scan-cancelled">Scan cancelled</div>
+                    <div className="scan-cancelled">Scan cancelled.</div>
                   ) : null}
                 </div>
               </article>
