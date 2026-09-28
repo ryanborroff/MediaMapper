@@ -458,26 +458,32 @@ fn scan_directory(
             return Err(SCAN_CANCELLED.to_string());
         }
 
-        let entries = match fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(_) => {
-                counters.3 += 1;
-                continue;
-            }
-        };
+        let entries = fs::read_dir(&current).map_err(|error| {
+            let relative = current
+                .strip_prefix(root)
+                .unwrap_or(&current)
+                .to_string_lossy();
+            format!(
+                "Scan could not read folder '{}': {error}. The previous catalogue has been kept unchanged.",
+                if relative.is_empty() { "/" } else { relative.as_ref() }
+            )
+        })?;
 
         for entry_result in entries {
             if scan_is_cancelled(drive_id) {
                 return Err(SCAN_CANCELLED.to_string());
             }
 
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(_) => {
-                    counters.3 += 1;
-                    continue;
-                }
-            };
+            let entry = entry_result.map_err(|error| {
+                let relative = current
+                    .strip_prefix(root)
+                    .unwrap_or(&current)
+                    .to_string_lossy();
+                format!(
+                    "Scan could not read an entry in folder '{}': {error}. The previous catalogue has been kept unchanged.",
+                    if relative.is_empty() { "/" } else { relative.as_ref() }
+                )
+            })?;
 
             let name = entry.file_name().to_string_lossy().into_owned();
 
@@ -489,13 +495,16 @@ fn scan_directory(
             }
 
             let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    counters.3 += 1;
-                    continue;
-                }
-            };
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy();
+                format!(
+                    "Scan could not read metadata for '{}': {error}. The previous catalogue has been kept unchanged.",
+                    relative
+                )
+            })?;
 
             // Never follow symlinks. This prevents a catalogue scan escaping the selected volume.
             if metadata.file_type().is_symlink() {
@@ -616,8 +625,9 @@ async fn scan_drive(
             )
             .map_err(|error| format!("Unable to save drive record: {error}"))?;
 
-        // A rescan replaces the previous snapshot atomically. If scanning fails,
-        // the transaction rolls back and the last good catalogue remains intact.
+        // A rescan replaces the previous snapshot atomically. Any filesystem read
+        // failure aborts the scan, so an incomplete traversal can never replace the
+        // last good catalogue. Cancellation and other failures roll back here too.
         transaction
             .execute("DELETE FROM files WHERE drive_id = ?1", params![drive_id])
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
