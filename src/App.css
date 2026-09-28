@@ -15,26 +15,38 @@ button { font: inherit; }
 .eyebrow { margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .16em; color: #777; }
 h1 { margin: 0; font-size: 34px; letter-spacing: -.035em; font-weight: 650; }
 .intro { max-width: 620px; margin: 10px 0 0; color: #686868; font-size: 15px; line-height: 1.5; }
-.refresh-button { border: 1px solid #d2d2cf; background: #fff; border-radius: 9px; padding: 9px 15px; color: #252525; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-.refresh-button:disabled { color: #999; cursor: default; }
+.refresh-button, .scan-button { border: 1px solid #d2d2cf; background: #fff; border-radius: 9px; padding: 9px 15px; color: #252525; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+.refresh-button:disabled, .scan-button:disabled { color: #999; cursor: default; }
+.scan-button { margin-top: 10px; padding: 7px 12px; font-size: 12px; }
+.section-block { margin-top: 30px; }
+.section-heading { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
+.section-heading h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.section-heading span { color: #888; font-size: 12px; }
 .drive-list { display: grid; gap: 16px; }
 .drive-card, .empty-state, .notice { background: #fff; border: 1px solid #dededb; border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.035); }
+.drive-card.offline { background: #fafafa; }
 .drive-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
-.drive-title-row h2 { margin: 7px 0 0; font-size: 21px; font-weight: 620; letter-spacing: -.02em; }
+.drive-title-row h3 { margin: 7px 0 0; font-size: 21px; font-weight: 620; letter-spacing: -.02em; }
+.drive-actions { display: flex; flex-direction: column; align-items: flex-end; }
 .status-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #27864a; }
-.online-label { font-size: 10px; font-weight: 700; letter-spacing: .11em; color: #27864a; }
+.status-dot.offline-dot { background: #999; }
+.online-label, .offline-label { font-size: 10px; font-weight: 700; letter-spacing: .11em; }
+.online-label { color: #27864a; }
+.offline-label { color: #777; }
 .capacity { font-size: 17px; font-weight: 600; color: #353535; white-space: nowrap; }
 .capacity-bar { height: 6px; margin: 20px 0 22px; overflow: hidden; border-radius: 999px; background: #e9e9e6; }
 .capacity-bar span { display: block; height: 100%; background: #555; border-radius: inherit; }
 .drive-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 32px; margin: 0; }
 .drive-details div { min-width: 0; }
+.offline-details { margin-top: 22px; }
 dt { margin-bottom: 4px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
 dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-height: 1.4; }
 .empty-state { padding: 56px 32px; text-align: center; }
-.empty-state h2 { margin: 0 0 8px; font-size: 20px; }
-.empty-state p { margin: 0; color: #707070; }
-.notice.error { color: #8d2626; background: #fff8f8; border-color: #ead1d1; }
-.safety-note { margin-top: 28px; color: #858585; font-size: 12px; text-align: center; }
+.empty-state.compact { padding: 28px; }
+.empty-state h3 { margin: 0 0 8px; font-size: 17px; }
+.empty-state p { margin: 0; color: #707070; font-size: 13px; }
+.notice.error { margin-bottom: 20px; color: #8d2626; background: #fff8f8; border-color: #ead1d1; }
+.safety-note { margin-top: 32px; color: #858585; font-size: 12px; text-align: center; }
 
 @media (max-width: 760px) {
   .app-shell { padding: 36px 28px 24px; }
