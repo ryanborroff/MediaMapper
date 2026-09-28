@@ -114,6 +114,9 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 
             CREATE INDEX IF NOT EXISTS idx_files_drive_path
                 ON files(drive_id, relative_path);
+
+            CREATE INDEX IF NOT EXISTS idx_files_drive_name
+                ON files(drive_id, name COLLATE NOCASE);
             ",
         )
         .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
@@ -491,6 +494,35 @@ fn list_catalogue_entries(
         .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
 }
 
+#[tauri::command]
+fn search_catalogue(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+    query: String,
+) -> Result<Vec<CatalogueEntry>, String> {
+    let query = query.trim();
+    if query.is_empty() { return Ok(Vec::new()); }
+    let connection = open_database(&database_path(&app)?)?;
+    let mut statement = connection.prepare(
+        "SELECT relative_path, name, is_directory, size_bytes, modified_at
+         FROM files
+         WHERE drive_id = ?1 AND name LIKE '%' || ?2 || '%' COLLATE NOCASE
+         ORDER BY CASE WHEN name = ?2 COLLATE NOCASE THEN 0
+                       WHEN name LIKE ?2 || '%' COLLATE NOCASE THEN 1 ELSE 2 END,
+                  is_directory DESC, lower(name), relative_path
+         LIMIT 200"
+    ).map_err(|error| format!("Unable to search catalogue: {error}"))?;
+    let rows = statement.query_map(params![persistent_identifier, query], |row| {
+        Ok(CatalogueEntry {
+            relative_path: row.get(0)?, name: row.get(1)?,
+            is_directory: row.get::<_, i64>(2)? != 0,
+            size_bytes: row.get(3)?, modified_at: row.get(4)?,
+        })
+    }).map_err(|error| format!("Unable to read search results: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read search result rows: {error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -499,7 +531,8 @@ pub fn run() {
             list_external_drives,
             list_catalogued_drives,
             scan_drive,
-            list_catalogue_entries
+            list_catalogue_entries,
+            search_catalogue
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

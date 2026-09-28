@@ -57,6 +57,9 @@ function App() {
   const [browserPath, setBrowserPath] = useState("");
   const [entries, setEntries] = useState<CatalogueEntry[]>([]);
   const [browserLoading, setBrowserLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<CatalogueEntry[]>([]);
+  const [searching, setSearching] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -100,6 +103,30 @@ function App() {
     }
   }, []);
 
+  const searchCatalogue = async (drive: CataloguedDrive, query: string) => {
+    setSearchQuery(query);
+    const trimmed = query.trim();
+    if (!trimmed) { setSearchResults([]); return; }
+    setSearching(true); setError(null);
+    try {
+      setSearchResults(await invoke<CatalogueEntry[]>("search_catalogue", {
+        persistentIdentifier: drive.persistentIdentifier, query: trimmed,
+      }));
+    } catch (cause) { setError(String(cause)); setSearchResults([]); }
+    finally { setSearching(false); }
+  };
+
+  const containingFolder = (relativePath: string) => {
+    const separator = relativePath.lastIndexOf("/");
+    return separator === -1 ? "" : relativePath.slice(0, separator);
+  };
+
+  const openSearchResult = async (drive: CataloguedDrive, entry: CatalogueEntry) => {
+    const destination = entry.isDirectory ? entry.relativePath : containingFolder(entry.relativePath);
+    setSearchQuery(""); setSearchResults([]);
+    await openFolder(drive, destination);
+  };
+
   const scan = async (drive: DriveInfo) => {
     if (!drive.persistentIdentifier) {
       setError("This drive does not provide a stable volume identifier, so it cannot be catalogued safely.");
@@ -130,7 +157,7 @@ function App() {
     return (
       <main className="app-shell browser-shell">
         <header className="browser-header">
-          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); }}>
+          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setSearchQuery(""); setSearchResults([]); }}>
             Back to drives
           </button>
           <div className="browser-title-row">
@@ -154,11 +181,30 @@ function App() {
               );
             })}
           </nav>
+          <div className="catalogue-search">
+            <input type="search" value={searchQuery} placeholder={`Search ${liveDrive.name}`}
+              aria-label={`Search ${liveDrive.name} catalogue`}
+              onChange={(event) => void searchCatalogue(liveDrive, event.target.value)} />
+            {searchQuery.trim() && <span className="search-summary">
+              {searching ? "Searching…" : `${searchResults.length}${searchResults.length === 200 ? "+" : ""} result${searchResults.length === 1 ? "" : "s"}`}
+            </span>}
+          </div>
         </header>
 
         {error && <div className="notice error">{error}</div>}
 
-        <section className="file-browser">
+        {searchQuery.trim() && <section className="search-results" aria-live="polite">
+          {searching ? <div className="browser-message">Searching catalogue…</div>
+          : searchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+          : searchResults.map((entry) => <button className="search-result" key={entry.relativePath}
+              onClick={() => void openSearchResult(liveDrive, entry)}>
+              <span className="search-result-main"><strong>{entry.name}</strong><span>{entry.relativePath}</span></span>
+              <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
+              <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
+            </button>)}
+        </section>}
+
+        {!searchQuery.trim() && <section className="file-browser">
           <div className="file-browser-head">
             <span>Name</span><span>Modified</span><span>Size</span>
           </div>
@@ -183,10 +229,10 @@ function App() {
               </button>
             ))
           )}
-        </section>
+        </section>}
 
         <footer className="safety-note">
-          This view comes from Media Mapper's local catalogue. It does not read the drive while you browse it.
+          This view comes from Media Mapper's local catalogue. Search and browsing do not read the drive.
         </footer>
       </main>
     );

@@ -84,3 +84,16 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-kind { display: inline-block; width: 18px; color: #777; }
 .browser-message { padding: 48px 20px; color: #777; font-size: 13px; text-align: center; }
+
+
+.catalogue-search { display:flex; align-items:center; gap:12px; margin-top:18px; }
+.catalogue-search input { width:min(520px,100%); border:1px solid #d2d2cf; border-radius:9px; padding:10px 12px; background:#fff; color:#222; font:inherit; font-size:13px; outline:none; }
+.catalogue-search input:focus { border-color:#999; box-shadow:0 0 0 3px rgba(0,0,0,.05); }
+.search-summary { color:#888; font-size:12px; white-space:nowrap; }
+.search-results { overflow:hidden; margin-bottom:22px; background:#fff; border:1px solid #dededb; border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,.035); }
+.search-result { display:grid; grid-template-columns:minmax(280px,1fr) 110px 210px; gap:20px; align-items:center; width:100%; padding:12px 18px; border:0; border-bottom:1px solid #eeeeeb; background:#fff; color:#555; text-align:left; cursor:pointer; }
+.search-result:last-child { border-bottom:0; }
+.search-result:hover { background:#f7f7f5; }
+.search-result-main { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.search-result-main strong { overflow:hidden; color:#222; font-size:13px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.search-result-main span { overflow:hidden; color:#888; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
