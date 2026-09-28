@@ -124,7 +124,7 @@ function App() {
     }
   }, []);
 
-  const searchCatalogue = async (drive: CataloguedDrive, query: string) => {
+  const searchCatalogue = useCallback(async (drive: CataloguedDrive, query: string) => {
     setSearchQuery(query);
     const trimmed = query.trim();
     if (!trimmed) { setSearchResults([]); return; }
@@ -135,7 +135,7 @@ function App() {
       }));
     } catch (cause) { setError(String(cause)); setSearchResults([]); }
     finally { setSearching(false); }
-  };
+  }, []);
 
   const containingFolder = (relativePath: string) => {
     const separator = relativePath.lastIndexOf("/");
@@ -173,6 +173,18 @@ function App() {
       const result = await invoke<ScanProgress>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
       await refresh();
+
+      // A successful rescan replaces the SQLite snapshot. If this drive is
+      // currently open, reload the visible folder/search from that new snapshot
+      // so the browser cannot keep showing stale in-memory entries.
+      if (browserDrive?.persistentIdentifier === drive.persistentIdentifier) {
+        if (searchQuery.trim()) {
+          await searchCatalogue(browserDrive, searchQuery);
+        } else {
+          await openFolder(browserDrive, browserPath);
+        }
+      }
+
       window.setTimeout(() => setScanComplete(null), 4000);
     } catch (cause) {
       const message = String(cause);

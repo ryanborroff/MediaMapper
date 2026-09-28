@@ -475,6 +475,15 @@ fn scan_directory(
             }
         };
 
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // Ignore macOS Finder metadata rather than cataloguing it as user content.
+        // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
+        // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
+        if name.starts_with("._") || name == ".DS_Store" {
+            continue;
+        }
+
         let path = entry.path();
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -497,7 +506,6 @@ fn scan_directory(
                 continue;
             }
         };
-        let name = entry.file_name().to_string_lossy().into_owned();
         let is_directory = metadata.is_dir();
         let size_bytes = if metadata.is_file() {
             Some(metadata.len().min(i64::MAX as u64) as i64)
