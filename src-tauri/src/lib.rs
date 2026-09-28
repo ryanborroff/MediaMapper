@@ -105,6 +105,18 @@ struct CatalogueEntry {
     modified_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySearchResult {
+    drive_id: String,
+    drive_name: String,
+    relative_path: String,
+    name: String,
+    is_directory: bool,
+    size_bytes: Option<i64>,
+    modified_at: Option<i64>,
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -731,33 +743,145 @@ fn list_catalogue_entries(
         .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
 }
 
+fn normalised_search_expression(column: &str) -> String {
+    format!(
+        "lower(replace(replace(replace({column}, '.', ' '), '_', ' '), '-', ' '))"
+    )
+}
+
+fn search_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| c.is_whitespace() || c == '.' || c == '_' || c == '-')
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
 #[tauri::command]
 fn search_catalogue(
     app: tauri::AppHandle,
     persistent_identifier: String,
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    let query = query.trim();
-    if query.is_empty() { return Ok(Vec::new()); }
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let connection = open_database(&database_path(&app)?)?;
-    let mut statement = connection.prepare(
+
+    let name_expr = normalised_search_expression("name");
+    let path_expr = normalised_search_expression("relative_path");
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 2;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
         "SELECT relative_path, name, is_directory, size_bytes, modified_at
          FROM files
-         WHERE drive_id = ?1 AND name LIKE '%' || ?2 || '%' COLLATE NOCASE
-         ORDER BY CASE WHEN name = ?2 COLLATE NOCASE THEN 0
-                       WHEN name LIKE ?2 || '%' COLLATE NOCASE THEN 1 ELSE 2 END,
-                  is_directory DESC, lower(name), relative_path
-         LIMIT 200"
-    ).map_err(|error| format!("Unable to search catalogue: {error}"))?;
-    let rows = statement.query_map(params![persistent_identifier, query], |row| {
-        Ok(CatalogueEntry {
-            relative_path: row.get(0)?, name: row.get(1)?,
-            is_directory: row.get::<_, i64>(2)? != 0,
-            size_bytes: row.get(3)?, modified_at: row.get(4)?,
+         WHERE drive_id = ?1
+           AND {}
+         ORDER BY is_directory DESC, lower(name), relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
+    values.push(&persistent_identifier);
+    for token in &tokens {
+        values.push(token);
+    }
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search catalogue: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(CatalogueEntry {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                is_directory: row.get::<_, i64>(2)? != 0,
+                size_bytes: row.get(3)?,
+                modified_at: row.get(4)?,
+            })
         })
-    }).map_err(|error| format!("Unable to read search results: {error}"))?;
+        .map_err(|error| format!("Unable to read search results: {error}"))?;
+
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to read search result rows: {error}"))
+}
+
+#[tauri::command]
+fn search_all_catalogues(
+    app: tauri::AppHandle,
+    query: String,
+) -> Result<Vec<LibrarySearchResult>, String> {
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let connection = open_database(&database_path(&app)?)?;
+
+    let name_expr = normalised_search_expression("f.name");
+    let path_expr = normalised_search_expression("f.relative_path");
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 1;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
+        "SELECT f.drive_id, d.name, f.relative_path, f.name,
+                f.is_directory, f.size_bytes, f.modified_at
+         FROM files f
+         JOIN drives d ON d.persistent_identifier = f.drive_id
+         WHERE {}
+         ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let values: Vec<&dyn rusqlite::ToSql> =
+        tokens.iter().map(|token| token as &dyn rusqlite::ToSql).collect();
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search library: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(LibrarySearchResult {
+                drive_id: row.get(0)?,
+                drive_name: row.get(1)?,
+                relative_path: row.get(2)?,
+                name: row.get(3)?,
+                is_directory: row.get::<_, i64>(4)? != 0,
+                size_bytes: row.get(5)?,
+                modified_at: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("Unable to read library search results: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read library search result rows: {error}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -770,7 +894,8 @@ pub fn run() {
             scan_drive,
             cancel_scan,
             list_catalogue_entries,
-            search_catalogue
+            search_catalogue,
+            search_all_catalogues
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -43,6 +43,11 @@ type CatalogueEntry = {
   modifiedAt: number | null;
 };
 
+type LibrarySearchResult = CatalogueEntry & {
+  driveId: string;
+  driveName: string;
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -74,6 +79,9 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<CatalogueEntry[]>([]);
   const [searching, setSearching] = useState(false);
+  const [libraryQuery, setLibraryQuery] = useState("");
+  const [libraryResults, setLibraryResults] = useState<LibrarySearchResult[]>([]);
+  const [librarySearching, setLibrarySearching] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -137,6 +145,26 @@ function App() {
     finally { setSearching(false); }
   }, []);
 
+  const searchLibrary = useCallback(async (query: string) => {
+    setLibraryQuery(query);
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setLibraryResults([]);
+      return;
+    }
+
+    setLibrarySearching(true);
+    setError(null);
+    try {
+      setLibraryResults(await invoke<LibrarySearchResult[]>("search_all_catalogues", { query: trimmed }));
+    } catch (cause) {
+      setError(String(cause));
+      setLibraryResults([]);
+    } finally {
+      setLibrarySearching(false);
+    }
+  }, []);
+
   const containingFolder = (relativePath: string) => {
     const separator = relativePath.lastIndexOf("/");
     return separator === -1 ? "" : relativePath.slice(0, separator);
@@ -146,6 +174,17 @@ function App() {
     const destination = entry.isDirectory ? entry.relativePath : containingFolder(entry.relativePath);
     setSearchQuery(""); setSearchResults([]);
     await openFolder(drive, destination);
+  };
+
+  const openLibraryResult = async (result: LibrarySearchResult) => {
+    const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
+    if (!drive) {
+      setError("That drive catalogue is no longer available.");
+      return;
+    }
+    setLibraryQuery("");
+    setLibraryResults([]);
+    await openSearchResult(drive, result);
   };
 
   const cancelScan = async (persistentIdentifier: string) => {
@@ -309,6 +348,39 @@ function App() {
       </header>
 
       {error && <div className="notice error">{error}</div>}
+
+      {catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading"><h2>Search all drives</h2><span>{catalogued.length}</span></div>
+        <div className="catalogue-search">
+          <input
+            type="search"
+            value={libraryQuery}
+            placeholder="Search every catalogued drive"
+            aria-label="Search all catalogued drives"
+            onChange={(event) => void searchLibrary(event.target.value)}
+          />
+          {libraryQuery.trim() && <span className="search-summary">
+            {librarySearching ? "Searching…" : `${libraryResults.length}${libraryResults.length === 200 ? "+" : ""} result${libraryResults.length === 1 ? "" : "s"}`}
+          </span>}
+        </div>
+
+        {libraryQuery.trim() && <div className="search-results" aria-live="polite">
+          {librarySearching ? <div className="browser-message">Searching all catalogues…</div>
+          : libraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+          : libraryResults.map((result) => <button
+              className="search-result"
+              key={`${result.driveId}:${result.relativePath}`}
+              onClick={() => void openLibraryResult(result)}
+            >
+              <span className="search-result-main">
+                <strong>{result.name}</strong>
+                <span>{result.driveName} / {result.relativePath}</span>
+              </span>
+              <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
+              <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
+            </button>)}
+        </div>}
+      </section>}
 
       <section className="section-block">
         <div className="section-heading"><h2>Connected</h2><span>{connected.length}</span></div>
