@@ -5,7 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
 
@@ -322,11 +322,11 @@ fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>,
 fn scan_directory(
     root: &Path,
     current: &Path,
-    transaction: &rusqlite::Transaction<'_>,
+    insert_statement: &mut rusqlite::Statement<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
     app: &tauri::AppHandle,
-    last_emitted: &mut i64,
+    last_emit_at: &mut Instant,
 ) -> Result<(), String> {
     if scan_is_cancelled(drive_id) {
         return Err(SCAN_CANCELLED.to_string());
@@ -384,22 +384,15 @@ fn scan_directory(
         };
         let modified_at = system_time_unix(metadata.modified());
 
-        transaction
-            .execute(
-                "
-                INSERT INTO files
-                    (drive_id, relative_path, name, is_directory, size_bytes, modified_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params![
-                    drive_id,
-                    relative,
-                    name,
-                    if is_directory { 1 } else { 0 },
-                    size_bytes,
-                    modified_at
-                ],
-            )
+        insert_statement
+            .execute(params![
+                drive_id,
+                relative,
+                name,
+                if is_directory { 1 } else { 0 },
+                size_bytes,
+                modified_at
+            ])
             .map_err(|error| format!("Unable to write catalogue entry: {error}"))?;
 
         if is_directory {
@@ -411,14 +404,13 @@ fn scan_directory(
             counters.3 += 1;
         }
 
-        let processed = counters.0 + counters.1;
-        if processed - *last_emitted >= 25 {
+        if last_emit_at.elapsed() >= Duration::from_millis(150) {
             emit_scan_progress(app, drive_id, counters, &relative);
-            *last_emitted = processed;
+            *last_emit_at = Instant::now();
         }
 
         if is_directory {
-            scan_directory(root, &path, transaction, drive_id, counters, app, last_emitted)?;
+            scan_directory(root, &path, insert_statement, drive_id, counters, app, last_emit_at)?;
         }
     }
 
@@ -438,13 +430,15 @@ async fn scan_drive(
     let database = database_path(&app)?;
     let progress_app = app.clone();
 
+    // Clear stale cancellation before the worker starts.
+    clear_scan_cancel(&persistent_identifier);
+
     tauri::async_runtime::spawn_blocking(move || {
         let drive_id = drive
             .persistent_identifier
             .clone()
             .ok_or_else(|| "This drive does not provide a stable volume identifier.".to_string())?;
         let root = PathBuf::from(&drive.mount_point);
-        clear_scan_cancel(&drive_id);
 
         if !root.is_dir() {
             return Err("The drive mount point is no longer available.".to_string());
@@ -490,10 +484,28 @@ async fn scan_drive(
             .execute("DELETE FROM files WHERE drive_id = ?1", params![drive_id])
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
 
+        let mut insert_statement = transaction
+            .prepare_cached(
+                "
+                INSERT INTO files
+                    (drive_id, relative_path, name, is_directory, size_bytes, modified_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+            )
+            .map_err(|error| format!("Unable to prepare catalogue writer: {error}"))?;
+
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
-        let mut last_emitted = 0_i64;
+        let mut last_emit_at = Instant::now();
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
-        if let Err(error) = scan_directory(&root, &root, &transaction, &drive_id, &mut counters, &progress_app, &mut last_emitted) {
+        if let Err(error) = scan_directory(
+            &root,
+            &root,
+            &mut insert_statement,
+            &drive_id,
+            &mut counters,
+            &progress_app,
+            &mut last_emit_at,
+        ) {
             clear_scan_cancel(&drive_id);
             if error == SCAN_CANCELLED {
                 return Err("Scan cancelled.".to_string());
@@ -502,6 +514,8 @@ async fn scan_drive(
         }
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
         clear_scan_cancel(&drive_id);
+
+        drop(insert_statement);
 
         transaction
             .execute(
