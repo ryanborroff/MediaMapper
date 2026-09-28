@@ -117,6 +117,17 @@ struct LibrarySearchResult {
     modified_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LargestFile {
+    drive_id: String,
+    drive_name: String,
+    relative_path: String,
+    name: String,
+    size_bytes: i64,
+    modified_at: Option<i64>,
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -884,6 +895,46 @@ fn search_all_catalogues(
         .map_err(|error| format!("Unable to read library search result rows: {error}"))
 }
 
+#[tauri::command]
+fn largest_files(
+    app: tauri::AppHandle,
+) -> Result<Vec<LargestFile>, String> {
+    let connection = open_database(&database_path(&app)?)?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT f.drive_id,
+                    d.name,
+                    f.relative_path,
+                    f.name,
+                    f.size_bytes,
+                    f.modified_at
+             FROM files f
+             JOIN drives d ON d.persistent_identifier = f.drive_id
+             WHERE f.is_directory = 0
+               AND f.size_bytes IS NOT NULL
+             ORDER BY f.size_bytes DESC, lower(f.name), lower(d.name)
+             LIMIT 100"
+        )
+        .map_err(|error| format!("Unable to query largest files: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(LargestFile {
+                drive_id: row.get(0)?,
+                drive_name: row.get(1)?,
+                relative_path: row.get(2)?,
+                name: row.get(3)?,
+                size_bytes: row.get(4)?,
+                modified_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("Unable to read largest files: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read largest file rows: {error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -895,7 +946,8 @@ pub fn run() {
             cancel_scan,
             list_catalogue_entries,
             search_catalogue,
-            search_all_catalogues
+            search_all_catalogues,
+            largest_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

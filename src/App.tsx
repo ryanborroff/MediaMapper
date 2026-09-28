@@ -48,6 +48,15 @@ type LibrarySearchResult = CatalogueEntry & {
   driveName: string;
 };
 
+type LargestFile = {
+  driveId: string;
+  driveName: string;
+  relativePath: string;
+  name: string;
+  sizeBytes: number;
+  modifiedAt: number | null;
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -82,6 +91,9 @@ function App() {
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryResults, setLibraryResults] = useState<LibrarySearchResult[]>([]);
   const [librarySearching, setLibrarySearching] = useState(false);
+  const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
+  const [largestFilesLoading, setLargestFilesLoading] = useState(false);
+  const [showLargestFiles, setShowLargestFiles] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -165,6 +177,27 @@ function App() {
     }
   }, []);
 
+  const loadLargestFiles = useCallback(async () => {
+    if (showLargestFiles) {
+      setShowLargestFiles(false);
+      return;
+    }
+
+    setLargestFilesLoading(true);
+    setError(null);
+
+    try {
+      const results = await invoke<LargestFile[]>("largest_files");
+      setLargestFiles(results);
+      setShowLargestFiles(true);
+    } catch (cause) {
+      setError(String(cause));
+      setLargestFiles([]);
+    } finally {
+      setLargestFilesLoading(false);
+    }
+  }, [showLargestFiles]);
+
   const containingFolder = (relativePath: string) => {
     const separator = relativePath.lastIndexOf("/");
     return separator === -1 ? "" : relativePath.slice(0, separator);
@@ -185,6 +218,23 @@ function App() {
     setLibraryQuery("");
     setLibraryResults([]);
     await openSearchResult(drive, result);
+  };
+
+  const openLargestFile = async (file: LargestFile) => {
+    const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
+
+    if (!drive) {
+      setError("That drive catalogue is no longer available.");
+      return;
+    }
+
+    await openSearchResult(drive, {
+      relativePath: file.relativePath,
+      name: file.name,
+      isDirectory: false,
+      sizeBytes: file.sizeBytes,
+      modifiedAt: file.modifiedAt,
+    });
   };
 
   const cancelScan = async (persistentIdentifier: string) => {
@@ -379,6 +429,40 @@ function App() {
               <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
               <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
             </button>)}
+        </div>}
+      </section>}
+
+      {catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <h2>Largest files</h2>
+          <button
+            className="browse-button"
+            onClick={() => void loadLargestFiles()}
+            disabled={largestFilesLoading}
+          >
+            {largestFilesLoading ? "Loading…" : showLargestFiles ? "Hide" : "Show 100 largest"}
+          </button>
+        </div>
+
+        {showLargestFiles && <div className="search-results">
+          {largestFiles.length === 0 ? (
+            <div className="browser-message">No catalogued files with size information.</div>
+          ) : (
+            largestFiles.map((file) => (
+              <button
+                className="search-result"
+                key={`${file.driveId}:${file.relativePath}`}
+                onClick={() => void openLargestFile(file)}
+              >
+                <span className="search-result-main">
+                  <strong>{file.name}</strong>
+                  <span>{file.driveName} / {file.relativePath}</span>
+                </span>
+                <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                <span>{formatBytes(file.sizeBytes)}</span>
+              </button>
+            ))
+          )}
         </div>}
       </section>}
 
