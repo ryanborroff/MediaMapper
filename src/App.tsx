@@ -350,6 +350,13 @@ function App() {
   const [savingPlan, setSavingPlan] = useState(false);
   const [draggedEntry, setDraggedEntry] = useState<CatalogueEntry | null>(null);
   const [dragOverFolderPath, setDragOverFolderPath] = useState<string | null>(null);
+  // Why the last drop onto a folder was refused. Shown on that folder's row,
+  // where the user is looking: the page's error banner can be out of sight.
+  const [dropRefusal, setDropRefusal] = useState<{
+    folderPath: string;
+    itemName: string;
+    message: string;
+  } | null>(null);
 
   const loadLocations = useCallback(async () => {
     try {
@@ -594,6 +601,7 @@ function App() {
     setBrowserPath(path);
     setBrowserLoading(true);
     setError(null);
+    setDropRefusal(null);
     try {
       const [catalogueEntries, plannedEntries] = await Promise.all([
         invoke<CatalogueEntry[]>("list_catalogue_entries", {
@@ -833,7 +841,7 @@ function App() {
       await loadPlannedMoves();
       await openFolder(browserDrive, browserPath);
     } catch (cause) {
-      setError(String(cause));
+      setDropRefusal({ folderPath: destinationFolder, itemName: entry.name, message: String(cause) });
     }
   };
 
@@ -1110,6 +1118,7 @@ function App() {
                     onDragStart={(event) => {
                       setDraggedEntry(entry);
                       setDragOverFolderPath(null);
+                      setDropRefusal(null);
                       event.dataTransfer.effectAllowed = "move";
                       event.dataTransfer.setData("text/plain", entry.relativePath);
                     }}
@@ -1167,6 +1176,11 @@ function App() {
                         <span className="file-name-primary">{entry.name}</span>
                         {entry.unreadable && (
                           <span className="unreadable-note">Couldn't be read during the last scan</span>
+                        )}
+                        {dropRefusal?.folderPath === entry.relativePath && (
+                          <span className="drop-refusal" role="alert">
+                            Couldn't plan {dropRefusal.itemName} here. {dropRefusal.message}
+                          </span>
                         )}
                         {plannedMove && (
                           <PlannedPath
