@@ -671,7 +671,7 @@ function App() {
         )}
       </section>
 
-      <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only. It does not open media contents, rename, move, copy or delete files.</footer>
+      <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only and does not open, rename, move, copy or delete files.</footer>
     </main>
   );
 }
