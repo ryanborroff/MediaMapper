@@ -1518,6 +1518,13 @@ async fn set_drive_label(
     .await
 }
 
+// Returns the connected external drive whose volume contains `path`, if any.
+fn external_drive_containing<'a>(path: &Path, drives: &'a [DriveInfo]) -> Option<&'a DriveInfo> {
+    drives
+        .iter()
+        .find(|drive| path.starts_with(Path::new(&drive.mount_point)))
+}
+
 #[tauri::command]
 async fn add_local_folder_location(
     app: tauri::AppHandle,
@@ -1539,6 +1546,34 @@ async fn add_local_folder_location(
 
         let canonical = fs::canonicalize(&candidate)
             .map_err(|error| format!("Unable to resolve selected folder: {error}"))?;
+
+        // A folder on an external drive must be planned through that drive's
+        // own location, or the same place would have two identities and the
+        // drive's catalogue checks would not apply to it.
+        let drives = external_drives().unwrap_or_default();
+        if let Some(drive) = external_drive_containing(&canonical, &drives) {
+            let connection = open_database(&database_path(&app)?)?;
+            let drive_name = drive
+                .persistent_identifier
+                .as_deref()
+                .and_then(|drive_id| {
+                    connection
+                        .query_row(
+                            "SELECT COALESCE(NULLIF(user_label, ''), display_name)
+                             FROM locations
+                             WHERE drive_id = ?1",
+                            params![drive_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                })
+                .unwrap_or_else(|| drive.name.clone());
+            return Err(format!(
+                "That folder is on the external drive {drive_name}. Scan the drive if you \
+                 haven't, then choose {drive_name} in Move to and enter the folder."
+            ));
+        }
+
         let local_path = canonical.to_string_lossy().into_owned();
 
         let display_name = canonical
@@ -2594,6 +2629,33 @@ mod tests {
         let error = plan("Folder/clip.mp4", "local:test", "exists.mp4").unwrap_err();
         assert!(error.contains("folder on this Mac"), "{error}");
         plan("Folder/clip.mp4", "local:test", "fresh.mp4").unwrap();
+    }
+
+    #[test]
+    fn folders_on_external_drives_are_matched_by_mount_point() {
+        let drive = |name: &str, mount_point: &str| DriveInfo {
+            name: name.to_string(),
+            mount_point: mount_point.to_string(),
+            filesystem: None,
+            total_bytes: None,
+            available_bytes: None,
+            persistent_identifier: None,
+            device_identifier: None,
+        };
+        let drives = [
+            drive("Backup", "/Volumes/Backup"),
+            drive("Mars", "/Volumes/Mars"),
+        ];
+
+        let found = |path: &str| {
+            external_drive_containing(Path::new(path), &drives).map(|drive| drive.name.as_str())
+        };
+        assert_eq!(found("/Volumes/Mars/Video/Archive"), Some("Mars"));
+        assert_eq!(found("/Volumes/Mars"), Some("Mars"));
+        // Whole path components only: a sibling volume with a longer name
+        // is not inside Mars.
+        assert_eq!(found("/Volumes/Mars 2/Video"), None);
+        assert_eq!(found("/Users/me/Movies"), None);
     }
 
     #[test]
