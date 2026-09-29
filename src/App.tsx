@@ -80,6 +80,7 @@ type Location = {
   id: string;
   kind: "external_drive" | "local_folder";
   displayName: string;
+  userLabel: string | null;
   driveId: string | null;
   localPath: string | null;
 };
@@ -140,6 +141,9 @@ function App() {
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
+  const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
+  const [driveLabelDraft, setDriveLabelDraft] = useState("");
+  const [savingDriveLabel, setSavingDriveLabel] = useState(false);
   const [selectedPlanFile, setSelectedPlanFile] = useState<CatalogueEntry | null>(null);
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
@@ -196,6 +200,39 @@ function App() {
     () => new Set(connected.flatMap((drive) => drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
     [connected],
   );
+
+  const locationForDrive = (persistentIdentifier: string | null) =>
+    persistentIdentifier
+      ? locations.find(
+          (location) =>
+            location.kind === "external_drive" &&
+            location.driveId === persistentIdentifier,
+        )
+      : undefined;
+
+  const beginDriveLabelEdit = (persistentIdentifier: string, currentLabel: string | null) => {
+    setEditingDriveLabelId(persistentIdentifier);
+    setDriveLabelDraft(currentLabel ?? "");
+  };
+
+  const saveDriveLabel = async (persistentIdentifier: string) => {
+    setSavingDriveLabel(true);
+    setError(null);
+
+    try {
+      await invoke("set_drive_label", {
+        persistentIdentifier,
+        label: driveLabelDraft,
+      });
+      await loadLocations();
+      setEditingDriveLabelId(null);
+      setDriveLabelDraft("");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setSavingDriveLabel(false);
+    }
+  };
 
   const openFolder = useCallback(async (drive: CataloguedDrive, path: string) => {
     setBrowserDrive(drive);
@@ -386,9 +423,11 @@ function App() {
       });
       await loadPlannedMoves();
 
+      const destination = locations.find(
+        (location) => location.id === planDestinationLocationId,
+      );
       const destinationName =
-        locations.find((location) => location.id === planDestinationLocationId)?.displayName
-        ?? "Destination";
+        destination?.userLabel ?? destination?.displayName ?? "Destination";
 
       setPlanConfirmation(`${destinationName} / ${destinationRelativePath}`);
       setSelectedPlanFile(null);
@@ -622,7 +661,7 @@ function App() {
                     .filter((location) => location.kind === "external_drive")
                     .map((location) => (
                       <option key={location.id} value={location.id}>
-                        {location.displayName}
+                        {location.userLabel ?? location.displayName}
                         {location.driveId && connectedIds.has(location.driveId)
                           ? " · Connected"
                           : " · Offline"}
@@ -665,7 +704,12 @@ function App() {
           <div className="plan-preview">
             <span>Planned</span>
             <strong>
-              {(locations.find((location) => location.id === planDestinationLocationId)?.displayName ?? "Choose a location")}
+              {(() => {
+                const destination = locations.find(
+                  (location) => location.id === planDestinationLocationId,
+                );
+                return destination?.userLabel ?? destination?.displayName ?? "Choose a location";
+              })()}
               {" / "}
               {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
               {selectedPlanFile.name}
@@ -877,7 +921,42 @@ function App() {
             return (
               <article className="drive-card" key={drive.persistentIdentifier ?? drive.mountPoint}>
                 <div className="drive-title-row">
-                  <div><span className="status-dot" /><span className="online-label">CONNECTED</span><h3>{drive.name}</h3></div>
+                  <div className="drive-identity">
+                    <span className="status-dot" /><span className="online-label">CONNECTED</span>
+                    {(() => {
+                      const location = locationForDrive(drive.persistentIdentifier);
+                      const label = location?.userLabel ?? null;
+                      return (
+                        <>
+                          <h3>{label ?? drive.name}</h3>
+                          {label && <div className="drive-volume-name">{drive.name}</div>}
+                          {drive.persistentIdentifier && (
+                            editingDriveLabelId === drive.persistentIdentifier ? (
+                              <div className="drive-label-editor">
+                                <input
+                                  autoFocus
+                                  maxLength={40}
+                                  value={driveLabelDraft}
+                                  placeholder="Drive label"
+                                  onChange={(event) => setDriveLabelDraft(event.target.value)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier!);
+                                    if (event.key === "Escape") setEditingDriveLabelId(null);
+                                  }}
+                                />
+                                <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier!)}>Save</button>
+                                <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                              </div>
+                            ) : (
+                              <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}>
+                                {label ? "Edit label" : "Add label"}
+                              </button>
+                            )
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
                   <div className="drive-actions">
                     <span className="capacity">{formatBytes(drive.totalBytes)}</span>
                     <div className="button-row">
@@ -932,7 +1011,40 @@ function App() {
             {offline.map((drive) => (
               <article className="drive-card offline" key={drive.persistentIdentifier}>
                 <div className="drive-title-row">
-                  <div><span className="status-dot offline-dot" /><span className="offline-label">OFFLINE</span><h3>{drive.name}</h3></div>
+                  <div className="drive-identity">
+                    <span className="status-dot offline-dot" /><span className="offline-label">OFFLINE</span>
+                    {(() => {
+                      const location = locationForDrive(drive.persistentIdentifier);
+                      const label = location?.userLabel ?? null;
+                      return (
+                        <>
+                          <h3>{label ?? drive.name}</h3>
+                          {label && <div className="drive-volume-name">{drive.name}</div>}
+                          {editingDriveLabelId === drive.persistentIdentifier ? (
+                            <div className="drive-label-editor">
+                              <input
+                                autoFocus
+                                maxLength={40}
+                                value={driveLabelDraft}
+                                placeholder="Drive label"
+                                onChange={(event) => setDriveLabelDraft(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier);
+                                  if (event.key === "Escape") setEditingDriveLabelId(null);
+                                }}
+                              />
+                              <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier)}>Save</button>
+                              <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                            </div>
+                          ) : (
+                            <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}>
+                              {label ? "Edit label" : "Add label"}
+                            </button>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
                   <div className="drive-actions">
                     <span className="capacity">{formatBytes(drive.totalBytes)}</span>
                     <div className="button-row">

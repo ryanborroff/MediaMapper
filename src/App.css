@@ -412,3 +412,67 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .plan-add-location:hover {
   color: #111;
 }
+
+
+/* Optional human-readable labels for physical drives. */
+.drive-identity {
+  min-width: 0;
+}
+
+.drive-volume-name {
+  margin-top: 3px;
+  color: #777;
+  font-size: 12px;
+}
+
+.drive-label-button {
+  margin-top: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #777;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.drive-label-button:hover {
+  color: #222;
+}
+
+.drive-label-editor {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.drive-label-editor input {
+  width: 180px;
+  border: 1px solid #d2d2cf;
+  border-radius: 7px;
+  padding: 6px 8px;
+  background: #fff;
+  color: #252525;
+  font: inherit;
+  font-size: 12px;
+}
+
+.drive-label-editor button {
+  border: 0;
+  padding: 4px 2px;
+  background: transparent;
+  color: #666;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.drive-label-editor button:hover {
+  color: #111;
+}
+
+.drive-label-editor button:disabled {
+  color: #aaa;
+  cursor: default;
+}

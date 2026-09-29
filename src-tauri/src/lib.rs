@@ -166,6 +166,7 @@ struct Location {
     id: String,
     kind: String,
     display_name: String,
+    user_label: Option<String>,
     drive_id: Option<String>,
     local_path: Option<String>,
 }
@@ -397,6 +398,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL CHECK(kind IN ('external_drive', 'local_folder')),
                 display_name TEXT NOT NULL,
+                user_label TEXT,
                 drive_id TEXT,
                 local_path TEXT,
                 created_at INTEGER NOT NULL,
@@ -418,6 +420,23 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             ",
         )
         .map_err(|error| format!("Unable to initialise location schema: {error}"))?;
+
+    let location_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(locations)")
+            .map_err(|error| format!("Unable to inspect location schema: {error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("Unable to inspect location columns: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("Unable to read location columns: {error}"))?
+    };
+
+    if !location_columns.contains("user_label") {
+        connection
+            .execute("ALTER TABLE locations ADD COLUMN user_label TEXT", [])
+            .map_err(|error| format!("Unable to add drive labels: {error}"))?;
+    }
 
     // Every catalogued external drive is also a Media Mapper location.
     //
@@ -1308,10 +1327,10 @@ fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
     let connection = open_database(&database_path(&app)?)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, kind, display_name, drive_id, local_path
+            "SELECT id, kind, display_name, user_label, drive_id, local_path
              FROM locations
              ORDER BY CASE kind WHEN 'external_drive' THEN 0 ELSE 1 END,
-                      lower(display_name)",
+                      lower(COALESCE(NULLIF(user_label, ''), display_name))",
         )
         .map_err(|error| format!("Unable to query locations: {error}"))?;
 
@@ -1321,14 +1340,45 @@ fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
                 id: row.get(0)?,
                 kind: row.get(1)?,
                 display_name: row.get(2)?,
-                drive_id: row.get(3)?,
-                local_path: row.get(4)?,
+                user_label: row.get(3)?,
+                drive_id: row.get(4)?,
+                local_path: row.get(5)?,
             })
         })
         .map_err(|error| format!("Unable to read locations: {error}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to read location rows: {error}"))
+}
+
+#[tauri::command]
+fn set_drive_label(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+    label: String,
+) -> Result<(), String> {
+    let trimmed = label.trim();
+
+    if trimmed.chars().count() > 40 {
+        return Err("Drive labels can be up to 40 characters.".to_string());
+    }
+
+    let connection = open_database(&database_path(&app)?)?;
+    let changed = connection
+        .execute(
+            "UPDATE locations
+             SET user_label = CASE WHEN ?1 = '' THEN NULL ELSE ?1 END
+             WHERE kind = 'external_drive'
+               AND drive_id = ?2",
+            params![trimmed, persistent_identifier],
+        )
+        .map_err(|error| format!("Unable to save drive label: {error}"))?;
+
+    if changed == 0 {
+        return Err("That drive is not in the Media Mapper catalogue.".to_string());
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1373,7 +1423,7 @@ fn add_local_folder_location(app: tauri::AppHandle, path: String) -> Result<Loca
 
     connection
         .query_row(
-            "SELECT id, kind, display_name, drive_id, local_path
+            "SELECT id, kind, display_name, user_label, drive_id, local_path
              FROM locations
              WHERE local_path = ?1",
             params![local_path],
@@ -1382,8 +1432,9 @@ fn add_local_folder_location(app: tauri::AppHandle, path: String) -> Result<Loca
                     id: row.get(0)?,
                     kind: row.get(1)?,
                     display_name: row.get(2)?,
-                    drive_id: row.get(3)?,
-                    local_path: row.get(4)?,
+                    user_label: row.get(3)?,
+                    drive_id: row.get(4)?,
+                    local_path: row.get(5)?,
                 })
             },
         )
@@ -1594,6 +1645,7 @@ pub fn run() {
             largest_files,
             probable_duplicates,
             list_locations,
+            set_drive_label,
             add_local_folder_location,
             create_planned_move,
             list_planned_moves,
