@@ -323,6 +323,78 @@ fn update_transfer_status(
     Ok(())
 }
 
+fn execute_transfer_paths(
+    connection: &Connection,
+    planned_move_id: i64,
+    source: &Path,
+    destination: &Path,
+) -> Result<TransferRecord, String> {
+    let transfer = create_transfer_record(connection, planned_move_id)?;
+
+    if let Err(error) = update_transfer_status(connection, transfer.id, "copying", None, None) {
+        return Err(error);
+    }
+
+    let copy_result = copy_file_verified_with_stage(source, destination, |copied_bytes| {
+        let copied_bytes = i64::try_from(copied_bytes)
+            .map_err(|_| "Copied file is too large to record.".to_string())?;
+
+        update_transfer_status(
+            connection,
+            transfer.id,
+            "verifying",
+            Some(copied_bytes),
+            None,
+        )
+    });
+
+    match copy_result {
+        Ok(copied_bytes) => {
+            let copied_bytes = i64::try_from(copied_bytes)
+                .map_err(|_| "Copied file is too large to record.".to_string())?;
+
+            update_transfer_status(
+                connection,
+                transfer.id,
+                "completed",
+                Some(copied_bytes),
+                None,
+            )?;
+        }
+        Err(error) => {
+            // The transfer snapshot survives the failure and records why it
+            // stopped. The copy primitive removes its temporary file and never
+            // deletes the source.
+            let _ = update_transfer_status(connection, transfer.id, "failed", None, Some(&error));
+
+            return Err(error);
+        }
+    }
+
+    connection
+        .query_row(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             WHERE id = ?1",
+            params![transfer.id],
+            read_transfer,
+        )
+        .map_err(|error| format!("Unable to read completed transfer: {error}"))
+}
+
 fn create_transfer_record(
     connection: &Connection,
     planned_move_id: i64,
@@ -471,8 +543,8 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
 
     let mut first_reader = BufReader::new(first_file);
     let mut second_reader = BufReader::new(second_file);
-    let mut first_buffer = [0_u8; 1024 * 1024];
-    let mut second_buffer = [0_u8; 1024 * 1024];
+    let mut first_buffer = vec![0_u8; 1024 * 1024];
+    let mut second_buffer = vec![0_u8; 1024 * 1024];
 
     loop {
         let first_count = first_reader
@@ -496,7 +568,14 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
     }
 }
 
-fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> {
+fn copy_file_verified_with_stage<F>(
+    source: &Path,
+    destination: &Path,
+    mut on_verifying: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64) -> Result<(), String>,
+{
     if destination.exists() {
         return Err(format!(
             "Destination already exists: {}",
@@ -553,6 +632,8 @@ fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> 
 
         drop(writer);
 
+        on_verifying(copied)?;
+
         if !files_are_identical(source, &temporary)? {
             return Err("Copied file failed byte-for-byte verification.".to_string());
         }
@@ -576,6 +657,10 @@ fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> 
     }
 
     result
+}
+
+fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> {
+    copy_file_verified_with_stage(source, destination, |_| Ok(()))
 }
 
 fn now_unix() -> i64 {
@@ -4543,6 +4628,36 @@ mod tests {
     }
 
     #[test]
+    fn verified_copy_reports_verifying_after_full_copy() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-stage-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("destination.bin");
+        let contents = vec![0x31_u8; 1024 * 1024 + 29];
+
+        fs::write(&source, &contents).unwrap();
+
+        let mut verifying_bytes = None;
+
+        let copied = copy_file_verified_with_stage(&source, &destination, |bytes| {
+            verifying_bytes = Some(bytes);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(copied, contents.len() as u64);
+        assert_eq!(verifying_bytes, Some(contents.len() as u64));
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+    }
+
+    #[test]
     fn verified_copy_refuses_existing_destination() {
         let volume = TestVolume(std::env::temp_dir().join(format!(
             "media-mapper-copy-collision-{}-{}",
@@ -4563,6 +4678,131 @@ mod tests {
         assert!(error.contains("Destination already exists"), "{error}");
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn transfer_execution_copies_verifies_and_completes() {
+        let database = TestDatabase::new("execute-transfer");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-execute-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("Archive/film.mov");
+        let contents = vec![0x73_u8; 1024 * 1024 + 41];
+        fs::write(&source, &contents).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, ?1)",
+                params![contents.len() as i64],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = execute_transfer_paths(&connection, move_id, &source, &destination).unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(transfer.copied_bytes, contents.len() as i64);
+        assert_eq!(transfer.error_message, None);
+        assert!(transfer.started_at.is_some());
+        assert!(transfer.completed_at.is_some());
+
+        assert_eq!(fs::read(&source).unwrap(), contents);
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+
+        let history = list_transfer_records(&connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "completed");
+    }
+
+    #[test]
+    fn transfer_execution_records_failure_and_preserves_existing_destination() {
+        let database = TestDatabase::new("execute-transfer-failure");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-execute-failure-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("film.mov");
+
+        fs::write(&source, b"new source").unwrap();
+        fs::write(&destination, b"existing destination").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let error =
+            execute_transfer_paths(&connection, move_id, &source, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+
+        assert_eq!(fs::read(&source).unwrap(), b"new source");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
+
+        let history = list_transfer_records(&connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+        assert!(history[0]
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Destination already exists"));
+        assert!(source.exists());
     }
 
     #[test]
