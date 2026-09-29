@@ -1231,3 +1231,48 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     box-shadow: none;
   }
 }
+
+
+/* Screenshot pass: tighter hierarchy and less card chrome */
+.app-content {
+  padding: 34px 40px 40px;
+}
+
+.app-content .app-header {
+  margin-bottom: 28px;
+}
+
+.app-content .drive-card {
+  border-radius: 12px;
+}
+
+.app-content .drive-title-row {
+  align-items: center;
+}
+
+.app-content .drive-actions {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-content .button-row {
+  margin-top: 0;
+}
+
+.app-content .capacity-bar {
+  height: 5px;
+}
+
+.app-content .drive-details {
+  padding-top: 2px;
+}
+
+.app-content .offline-details {
+  border-top: 0;
+}
+
+.sidebar-item:not(.active):not(:disabled):hover {
+  background: var(--hover);
+  color: var(--text);
+}
