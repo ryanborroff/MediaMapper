@@ -1516,21 +1516,18 @@ async fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String
     .await
 }
 
+// Catalogue paths are `/`-separated and relative to the volume root. Checks
+// the raw segments rather than Path::components, which silently drops `.` in
+// the middle of a path and merges repeated slashes, so `a/./b` or `a//b`
+// would pass but never match a catalogue path.
 fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
-    let candidate = Path::new(path);
     if path.trim().is_empty()
-        || candidate.is_absolute()
-        || candidate.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(
-            "Planned paths must be non-empty relative paths without '..' components.".to_string(),
+            "Planned paths must be relative paths without empty, '.' or '..' folders.".to_string(),
         );
     }
     Ok(())
@@ -2874,6 +2871,33 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn planned_paths_reject_empty_dot_and_parent_segments() {
+        for valid in [
+            "film.mp4",
+            "Video/Archive/film.mp4",
+            "My Films/ spaced .mp4",
+        ] {
+            assert!(validate_catalogue_relative_path(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            " ",
+            "/Video/film.mp4",
+            "Video/",
+            "Video//film.mp4",
+            "./film.mp4",
+            "Video/./film.mp4",
+            "../film.mp4",
+            "Video/../film.mp4",
+        ] {
+            assert!(
+                validate_catalogue_relative_path(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 
     #[test]

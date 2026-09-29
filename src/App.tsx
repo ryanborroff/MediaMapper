@@ -130,6 +130,17 @@ function formatDate(timestamp: number | null) {
 // not start its own full catalogue search. Short enough to feel immediate.
 const SEARCH_DEBOUNCE_MS = 200;
 
+// Cleans a typed folder path: trims each folder name and drops empty and "."
+// parts, so " ./Video//Archive/ " becomes "Video/Archive". ".." is left in
+// place for the backend to reject with an explanation.
+function normaliseFolderInput(folder: string) {
+  return folder
+    .split("/")
+    .map((part) => part.trim())
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
+}
+
 function waitForTypingPause() {
   return new Promise<void>((resolve) => window.setTimeout(resolve, SEARCH_DEBOUNCE_MS));
 }
@@ -559,7 +570,7 @@ function App() {
   const savePlannedMove = async () => {
     if (!browserDrive || !selectedPlanEntry || !planDestinationLocationId) return;
 
-    const folder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const folder = normaliseFolderInput(planDestinationFolder);
     const destinationRelativePath = folder
       ? `${folder}/${selectedPlanEntry.name}`
       : selectedPlanEntry.name;
@@ -714,7 +725,7 @@ function App() {
     const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
     const liveDriveHasLabel = liveDriveName !== liveDrive.name;
 
-    const normalisedPlanFolder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const normalisedPlanFolder = normaliseFolderInput(planDestinationFolder);
     const proposedDestinationPath = selectedPlanEntry
       ? (normalisedPlanFolder
           ? `${normalisedPlanFolder}/${selectedPlanEntry.name}`
@@ -1058,7 +1069,7 @@ function App() {
                 return destination?.userLabel ?? destination?.displayName ?? "Choose a location";
               })()}
               {" / "}
-              {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
+              {normalisedPlanFolder ? `${normalisedPlanFolder}/` : ""}
               {selectedPlanEntry.name}
             </strong>
           </div>
