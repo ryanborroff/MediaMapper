@@ -235,6 +235,9 @@ struct PlanPreflightIssue {
     code: String,
     message: String,
     move_id: Option<i64>,
+    // The destination an issue is about when it is not about one move, such
+    // as a destination without enough free space.
+    location_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -811,6 +814,21 @@ fn recover_transfers_at_startup(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Whether an issue stops one planned move from being copied: issues about that
+// move, issues about its destination (such as free space), and any issue that
+// names neither.
+fn issue_blocks_move(
+    issue: &PlanPreflightIssue,
+    move_id: i64,
+    destination_location_id: &str,
+) -> bool {
+    match (issue.move_id, issue.location_id.as_deref()) {
+        (Some(issue_move_id), _) => issue_move_id == move_id,
+        (None, Some(location_id)) => location_id == destination_location_id,
+        (None, None) => true,
+    }
+}
+
 fn execute_planned_transfer(
     connection: &Connection,
     planned_move_id: i64,
@@ -881,20 +899,24 @@ fn execute_planned_transfer(
         }
     }
 
+    let Some((destination_location_id, _)) = &destination else {
+        return Err("The planned move no longer exists.".to_string());
+    };
+
+    // Only issues that concern this move stop it. A problem with another
+    // planned move, such as its drive being disconnected, does not.
     let validation = validate_plan_live(connection, connected_drives)?;
-
-    if !validation.ready {
-        let relevant_issue = validation
-            .issues
-            .iter()
-            .find(|issue| issue.move_id == Some(planned_move_id))
-            .or_else(|| validation.issues.first());
-
-        let message = relevant_issue
-            .map(|issue| issue.message.clone())
-            .unwrap_or_else(|| "The plan did not pass final validation.".to_string());
-
-        return Err(format!("Transfer blocked by final validation: {message}"));
+    let preflight = plan_preflight(connection)?;
+    if let Some(issue) = validation
+        .issues
+        .iter()
+        .chain(preflight.issues.iter())
+        .find(|issue| issue_blocks_move(issue, planned_move_id, destination_location_id))
+    {
+        return Err(format!(
+            "Transfer blocked by final validation: {}",
+            issue.message
+        ));
     }
 
     let (source, destination) =
@@ -3403,6 +3425,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     planned.id
                 ),
                 move_id: Some(planned.id),
+                location_id: None,
             });
             continue;
         };
@@ -3443,6 +3466,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
+                location_id: None,
             });
             continue;
         };
@@ -3466,6 +3490,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
+                location_id: None,
             });
         }
         source_roots.push((
@@ -3544,6 +3569,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
+                location_id: None,
             });
         }
     }
@@ -3565,6 +3591,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                             "{display_name} does not have enough catalogued free space for the known planned data."
                         ),
                         move_id: None,
+                        location_id: Some(location_id.clone()),
                     });
                 }
                 PlanPreflightDestination {
@@ -3656,6 +3683,7 @@ fn validate_plan_live(
                     source_relative_path
                 ),
                 move_id: Some(move_id),
+                location_id: None,
             }),
             Some(source_drive) => {
                 let source_path = Path::new(&source_drive.mount_point).join(&source_relative_path);
@@ -3669,6 +3697,7 @@ fn validate_plan_live(
                                 source_relative_path
                             ),
                             move_id: Some(move_id),
+                            location_id: None,
                         });
                     }
                     Err(_) => {
@@ -3679,6 +3708,7 @@ fn validate_plan_live(
                                 source_relative_path
                             ),
                             move_id: Some(move_id),
+                            location_id: None,
                         });
                     }
                     Ok(metadata) => {
@@ -3711,6 +3741,7 @@ fn validate_plan_live(
                                         source_relative_path
                                     ),
                                     move_id: Some(move_id),
+                                    location_id: None,
                                 });
                             } else if !catalogued_is_directory {
                                 let live_size = metadata.len().min(i64::MAX as u64) as i64;
@@ -3727,6 +3758,7 @@ fn validate_plan_live(
                                             source_relative_path
                                         ),
                                         move_id: Some(move_id),
+                                        location_id: None,
                                     });
                                 }
                             }
@@ -3770,6 +3802,7 @@ fn validate_plan_live(
                         relative_path
                     ),
                     move_id: Some(move_id),
+                    location_id: None,
                 }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => issues.push(PlanPreflightIssue {
@@ -3779,6 +3812,7 @@ fn validate_plan_live(
                         relative_path
                     ),
                     move_id: Some(move_id),
+                    location_id: None,
                 }),
             }
         }
@@ -3797,6 +3831,7 @@ fn validate_plan_live(
                             destination_location_id
                         ),
                         move_id: Some(move_id),
+                        location_id: None,
                     });
                 }
             }
@@ -3811,12 +3846,14 @@ fn validate_plan_live(
                                 path
                             ),
                             move_id: Some(move_id),
+                            location_id: None,
                         });
                     } else if !destination.is_dir() {
                         issues.push(PlanPreflightIssue {
                             code: "destination_not_folder".to_string(),
                             message: format!("The destination {} is no longer a folder.", path),
                             move_id: Some(move_id),
+                            location_id: None,
                         });
                     }
                 }
@@ -3825,6 +3862,7 @@ fn validate_plan_live(
                     message: "The planned local destination no longer has a folder path."
                         .to_string(),
                     move_id: Some(move_id),
+                    location_id: None,
                 }),
             },
             _ => issues.push(PlanPreflightIssue {
@@ -3834,6 +3872,7 @@ fn validate_plan_live(
                     destination_location_id
                 ),
                 move_id: Some(move_id),
+                location_id: None,
             }),
         }
     }
@@ -3863,6 +3902,7 @@ fn validate_plan_live(
                     destination.display_name
                 ),
                 move_id: None,
+                location_id: Some(destination.location_id.clone()),
             });
         } else if let Some(available) = drive.available_bytes {
             if destination.known_bytes as u64 > available {
@@ -3873,6 +3913,7 @@ fn validate_plan_live(
                         destination.display_name
                     ),
                     move_id: None,
+                    location_id: Some(destination.location_id.clone()),
                 });
             }
         }
@@ -5731,6 +5772,102 @@ mod tests {
             contents
         );
         assert_eq!(fs::read(&source_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn only_issues_about_a_move_or_its_destination_block_it() {
+        let issue = |move_id: Option<i64>, location_id: Option<&str>| PlanPreflightIssue {
+            code: "test".to_string(),
+            message: "test".to_string(),
+            move_id,
+            location_id: location_id.map(str::to_string),
+        };
+
+        // About this move, or another move.
+        assert!(issue_blocks_move(&issue(Some(1), None), 1, "drive:B"));
+        assert!(!issue_blocks_move(&issue(Some(2), None), 1, "drive:B"));
+        // About this move's destination, or another destination.
+        assert!(issue_blocks_move(
+            &issue(None, Some("drive:B")),
+            1,
+            "drive:B"
+        ));
+        assert!(!issue_blocks_move(
+            &issue(None, Some("drive:C")),
+            1,
+            "drive:B"
+        ));
+        // About nothing in particular: blocks everything, to be safe.
+        assert!(issue_blocks_move(&issue(None, None), 1, "drive:B"));
+    }
+
+    #[test]
+    fn a_problem_with_one_planned_move_does_not_block_the_others() {
+        let database = TestDatabase::new("independent-moves");
+        let volume = |name: &str| {
+            TestVolume(std::env::temp_dir().join(format!(
+                "media-mapper-independent-{name}-{}-{}",
+                std::process::id(),
+                now_unix()
+            )))
+        };
+        let source_volume = volume("source");
+        let destination_volume = volume("destination");
+        for folder in [&source_volume.0, &destination_volume.0] {
+            let _ = fs::remove_dir_all(folder);
+            fs::create_dir_all(folder).unwrap();
+        }
+        let source_path = source_volume.0.join("film.mov");
+        fs::write(&source_path, b"film").unwrap();
+        let modified_at = system_time_unix(fs::metadata(&source_path).unwrap().modified());
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        insert_drive(&connection, "UUID-C", "Unplugged");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 4, ?1),
+                        ('UUID-C', 'clip.mov', 'clip.mov', '', 0, 4, ?1)",
+                params![modified_at],
+            )
+            .unwrap();
+        let ready = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+        let unplugged = plan_move(
+            &mut connection,
+            "UUID-C",
+            "clip.mov",
+            "drive:UUID-B",
+            "clip.mov",
+        )
+        .unwrap();
+
+        // The drive holding the second plan's source is not connected.
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source_volume.0, 10_000),
+            test_drive("UUID-B", "Backup", &destination_volume.0, 10_000),
+        ];
+
+        let transfer = execute_planned_transfer(&connection, ready, &drives)
+            .expect("an unrelated offline drive must not block this copy");
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(
+            fs::read(destination_volume.0.join("film.mov")).unwrap(),
+            b"film"
+        );
+
+        let error = execute_planned_transfer(&connection, unplugged, &drives).unwrap_err();
+        assert!(error.contains("clip.mov"), "{error}");
+        assert!(!destination_volume.0.join("clip.mov").exists());
     }
 
     #[test]
