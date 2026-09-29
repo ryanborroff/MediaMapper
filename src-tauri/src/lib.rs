@@ -323,6 +323,99 @@ fn update_transfer_status(
     Ok(())
 }
 
+fn resolve_transfer_paths(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+) -> Result<(PathBuf, PathBuf), String> {
+    let planned: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = connection
+        .query_row(
+            "SELECT
+                    p.source_drive_id,
+                    p.source_relative_path,
+                    p.destination_location_id,
+                    p.destination_relative_path,
+                    l.kind,
+                    l.drive_id,
+                    l.local_path
+                 FROM planned_moves p
+                 LEFT JOIN locations l ON l.id = p.destination_location_id
+                 WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to resolve planned transfer: {error}"))?;
+
+    let Some((
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_relative_path,
+        destination_kind,
+        destination_drive_id,
+        destination_local_path,
+    )) = planned
+    else {
+        return Err("The planned move no longer exists.".to_string());
+    };
+
+    let source_drive = connected_drives
+        .iter()
+        .find(|drive| drive.persistent_identifier.as_deref() == Some(source_drive_id.as_str()))
+        .ok_or_else(|| "The source drive is not connected.".to_string())?;
+
+    let source = PathBuf::from(&source_drive.mount_point).join(&source_relative_path);
+
+    let destination_root = match destination_kind.as_str() {
+        "external_drive" => {
+            let drive_id = destination_drive_id.ok_or_else(|| {
+                format!("Destination location {destination_location_id} has no drive identity.")
+            })?;
+
+            let drive = connected_drives
+                .iter()
+                .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
+                .ok_or_else(|| "The destination drive is not connected.".to_string())?;
+
+            PathBuf::from(&drive.mount_point)
+        }
+        "local_folder" => {
+            let path = destination_local_path.ok_or_else(|| {
+                format!("Destination location {destination_location_id} has no local folder.")
+            })?;
+            PathBuf::from(path)
+        }
+        _ => {
+            return Err(format!(
+                "Destination location {destination_location_id} has an unsupported type."
+            ))
+        }
+    };
+
+    let destination = destination_root.join(&destination_relative_path);
+
+    Ok((source, destination))
+}
+
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
@@ -4678,6 +4771,121 @@ mod tests {
         assert!(error.contains("Destination already exists"), "{error}");
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn transfer_paths_use_current_external_drive_mount_points() {
+        let database = TestDatabase::new("transfer-paths-external");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'Films/source.mov', 'source.mov', 'Films', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "Films/source.mov",
+            "drive:UUID-B",
+            "Archive/source.mov",
+        )
+        .unwrap();
+
+        let drives = [
+            test_drive("UUID-A", "Source", Path::new("/Volumes/Source-New"), 1_000),
+            test_drive("UUID-B", "Backup", Path::new("/Volumes/Backup-New"), 1_000),
+        ];
+
+        let (source, destination) = resolve_transfer_paths(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(
+            source,
+            PathBuf::from("/Volumes/Source-New/Films/source.mov")
+        );
+        assert_eq!(
+            destination,
+            PathBuf::from("/Volumes/Backup-New/Archive/source.mov")
+        );
+    }
+
+    #[test]
+    fn transfer_paths_resolve_local_folder_destination() {
+        let database = TestDatabase::new("transfer-paths-local");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO locations (
+                    id,
+                    kind,
+                    display_name,
+                    local_path,
+                    created_at
+                 ) VALUES (
+                    'local:test',
+                    'local_folder',
+                    'Local Test',
+                    '/Users/test/Media',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "local:test",
+            "Archive/source.mov",
+        )
+        .unwrap();
+
+        let drives = [test_drive(
+            "UUID-A",
+            "Source",
+            Path::new("/Volumes/Source"),
+            1_000,
+        )];
+
+        let (source, destination) = resolve_transfer_paths(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(source, PathBuf::from("/Volumes/Source/source.mov"));
+        assert_eq!(
+            destination,
+            PathBuf::from("/Users/test/Media/Archive/source.mov")
+        );
     }
 
     #[test]
