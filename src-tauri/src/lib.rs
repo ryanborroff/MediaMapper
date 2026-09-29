@@ -2422,16 +2422,126 @@ fn validate_plan_live(
             Some(source_drive) => {
                 let source_path = Path::new(&source_drive.mount_point).join(&source_relative_path);
 
-                if !source_path.exists() {
-                    issues.push(PlanPreflightIssue {
-                        code: "source_missing_on_disk".to_string(),
-                        message: format!(
-                            "{} is in the catalogue but is not currently present on the connected source drive.",
-                            source_relative_path
-                        ),
-                        move_id: Some(move_id),
-                    });
+                match fs::symlink_metadata(&source_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        issues.push(PlanPreflightIssue {
+                            code: "source_missing_on_disk".to_string(),
+                            message: format!(
+                                "{} is in the catalogue but is not currently present on the connected source drive.",
+                                source_relative_path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    }
+                    Err(_) => {
+                        issues.push(PlanPreflightIssue {
+                            code: "source_unreadable_on_disk".to_string(),
+                            message: format!(
+                                "{} cannot currently be checked on the source drive.",
+                                source_relative_path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    }
+                    Ok(metadata) => {
+                        let catalogued: Option<(bool, Option<i64>, Option<i64>)> = connection
+                            .query_row(
+                                "SELECT is_directory, size_bytes, modified_at
+                                 FROM files
+                                 WHERE drive_id = ?1 AND relative_path = ?2",
+                                params![source_drive_id, source_relative_path],
+                                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()
+                            .map_err(|error| {
+                                format!("Unable to compare live source with catalogue: {error}")
+                            })?;
+
+                        if let Some((
+                            catalogued_is_directory,
+                            catalogued_size,
+                            catalogued_modified,
+                        )) = catalogued
+                        {
+                            let live_is_directory = metadata.is_dir();
+
+                            if live_is_directory != catalogued_is_directory {
+                                issues.push(PlanPreflightIssue {
+                                    code: "source_type_changed".to_string(),
+                                    message: format!(
+                                        "{} has changed type since it was catalogued.",
+                                        source_relative_path
+                                    ),
+                                    move_id: Some(move_id),
+                                });
+                            } else if !catalogued_is_directory {
+                                let live_size = metadata.len().min(i64::MAX as u64) as i64;
+                                let live_modified = system_time_unix(metadata.modified());
+
+                                if catalogued_size.is_some_and(|size| size != live_size)
+                                    || (catalogued_modified.is_some()
+                                        && live_modified != catalogued_modified)
+                                {
+                                    issues.push(PlanPreflightIssue {
+                                        code: "source_changed".to_string(),
+                                        message: format!(
+                                            "{} has changed since it was catalogued. Rescan the source drive before transferring.",
+                                            source_relative_path
+                                        ),
+                                        move_id: Some(move_id),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+        }
+
+        let destination_root = match destination_kind.as_deref() {
+            Some("external_drive") => destination_drive_id
+                .as_deref()
+                .and_then(|drive_id| connected_by_id.get(drive_id))
+                .map(|drive| PathBuf::from(&drive.mount_point)),
+            Some("local_folder") => destination_local_path.as_deref().map(PathBuf::from),
+            _ => None,
+        };
+
+        let destination_relative_path: Option<String> = connection
+            .query_row(
+                "SELECT destination_relative_path
+                 FROM planned_moves
+                 WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to read planned destination path: {error}"))?;
+
+        if let (Some(root), Some(relative_path)) = (
+            destination_root.as_ref(),
+            destination_relative_path.as_ref(),
+        ) {
+            let destination_path = root.join(relative_path);
+
+            match fs::symlink_metadata(&destination_path) {
+                Ok(_) => issues.push(PlanPreflightIssue {
+                    code: "destination_exists".to_string(),
+                    message: format!(
+                        "{} already exists at the planned destination.",
+                        relative_path
+                    ),
+                    move_id: Some(move_id),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => issues.push(PlanPreflightIssue {
+                    code: "destination_unreadable".to_string(),
+                    message: format!(
+                        "Media Mapper cannot confirm whether {} is clear at the planned destination.",
+                        relative_path
+                    ),
+                    move_id: Some(move_id),
+                }),
             }
         }
 
@@ -3914,6 +4024,132 @@ mod tests {
         assert!(valid.ready, "{:?}", valid.issues);
 
         fs::remove_dir_all(&local_path).unwrap();
+    }
+
+    #[test]
+    fn live_validation_detects_changed_source_file() {
+        let database = TestDatabase::new("live-source-changed");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-source-changed-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-source-changed-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+        fs::write(source.0.join("film.mov"), b"changed contents").unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path,
+                     is_directory, size_bytes, modified_at)
+                 VALUES
+                    ('UUID-A', 'film.mov', 'film.mov', '', 0, 4, NULL)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 1_000),
+        ];
+
+        let result = validate_plan_live(&connection, &drives).unwrap();
+
+        assert!(!result.ready);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.code == "source_changed"),
+            "{:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn live_validation_detects_existing_destination() {
+        let database = TestDatabase::new("live-destination-exists");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-collision-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-collision-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+
+        fs::write(source.0.join("film.mov"), b"film").unwrap();
+        fs::write(destination.0.join("film.mov"), b"existing").unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path,
+                     is_directory, size_bytes, modified_at)
+                 VALUES
+                    ('UUID-A', 'film.mov', 'film.mov', '', 0, 4, NULL)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 1_000),
+        ];
+
+        let result = validate_plan_live(&connection, &drives).unwrap();
+
+        assert!(!result.ready);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.code == "destination_exists"),
+            "{:?}",
+            result.issues
+        );
     }
 
     #[test]
