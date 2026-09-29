@@ -1630,3 +1630,160 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     flex-direction: column;
   }
 }
+
+
+/* Top-level Transfers */
+.transfer-active-card,
+.transfer-waiting-card,
+.transfer-result-card {
+  margin-bottom: 28px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.transfer-active-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+
+.transfer-active-card h2,
+.transfer-waiting-card h2 {
+  margin: 7px 0 12px;
+  font-size: 20px;
+}
+
+.transfer-active-card .transfer-path {
+  margin-top: 5px;
+}
+
+.transfer-file-progress {
+  height: 5px;
+  margin-top: 18px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--track);
+}
+
+.transfer-file-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--bar);
+}
+
+.transfer-active-card p,
+.transfer-waiting-card p,
+.transfer-result-card p {
+  margin: 10px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.transfer-waiting-card,
+.transfer-result-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.transfer-result-card.completed {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+
+.transfer-result-card.failed {
+  border-color: var(--error-border);
+  background: var(--error-bg);
+}
+
+.transfer-history-section {
+  margin-top: 12px;
+}
+
+.transfer-history-new {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.transfer-history-new-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 90px 150px;
+  gap: 14px;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.transfer-history-new-row:last-child {
+  border-bottom: 0;
+}
+
+.transfer-history-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--track);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.transfer-history-new-row.completed .transfer-history-mark {
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  color: var(--green);
+}
+
+.transfer-history-new-row.failed .transfer-history-mark {
+  background: var(--error-bg);
+  color: var(--danger);
+}
+
+.transfer-history-size {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.transfer-history-empty {
+  padding: 46px 24px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+}
+
+.transfer-history-empty h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.transfer-history-empty p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  .transfer-history-new-row {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+
+  .transfer-history-size,
+  .transfer-history-new-row .transfer-outcome {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .transfer-waiting-card,
+  .transfer-result-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
