@@ -1245,11 +1245,12 @@ function App() {
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} />
                 <dl className="drive-details offline-details">
+                  {catalogue && <div><dt>Files</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
+                  {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
+                  {catalogue && <div><dt>Catalogued</dt><dd>{formatBytes(catalogue.cataloguedBytes)}</dd></div>}
+                  <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
                   <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                   <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
-                  <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
-                  {catalogue && <div><dt>Files catalogued</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
                 </dl>
                 <div className="scan-status-slot" aria-live="polite">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
@@ -1333,6 +1334,7 @@ function App() {
                   <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
                   <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
+                  <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                 </dl>
               </article>
             ))}
