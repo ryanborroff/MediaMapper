@@ -1,8 +1,11 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    ffi::CString,
     fs,
+    io::{BufReader, BufWriter, Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -210,6 +213,627 @@ struct PlannedFolderEntry {
     // A folder that exists only in the plan: some planned destination sits
     // inside it, but it is not in the catalogue. It has no single source move.
     is_new_folder: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflightDestination {
+    location_id: String,
+    display_name: String,
+    kind: String,
+    move_count: i64,
+    known_bytes: i64,
+    unknown_size_count: i64,
+    available_bytes: Option<i64>,
+    projected_available_bytes: Option<i64>,
+    capacity_sufficient: Option<bool>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflightIssue {
+    code: String,
+    message: String,
+    move_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflight {
+    move_count: i64,
+    known_bytes: i64,
+    unknown_size_count: i64,
+    destinations: Vec<PlanPreflightDestination>,
+    issues: Vec<PlanPreflightIssue>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanLiveValidation {
+    ready: bool,
+    issues: Vec<PlanPreflightIssue>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct TransferRecord {
+    id: i64,
+    planned_move_id: Option<i64>,
+    source_drive_id: String,
+    source_relative_path: String,
+    destination_location_id: String,
+    destination_relative_path: String,
+    total_bytes: Option<i64>,
+    copied_bytes: i64,
+    status: String,
+    error_message: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+}
+
+fn read_transfer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRecord> {
+    Ok(TransferRecord {
+        id: row.get(0)?,
+        planned_move_id: row.get(1)?,
+        source_drive_id: row.get(2)?,
+        source_relative_path: row.get(3)?,
+        destination_location_id: row.get(4)?,
+        destination_relative_path: row.get(5)?,
+        total_bytes: row.get(6)?,
+        copied_bytes: row.get(7)?,
+        status: row.get(8)?,
+        error_message: row.get(9)?,
+        created_at: row.get(10)?,
+        started_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+fn update_transfer_status(
+    connection: &Connection,
+    transfer_id: i64,
+    status: &str,
+    copied_bytes: Option<i64>,
+    error_message: Option<&str>,
+) -> Result<(), String> {
+    let now = now_unix();
+
+    let changed = connection
+        .execute(
+            "UPDATE transfers
+             SET status = ?1,
+                 copied_bytes = COALESCE(?2, copied_bytes),
+                 error_message = ?3,
+                 started_at = CASE
+                     WHEN ?1 = 'copying' AND started_at IS NULL THEN ?4
+                     ELSE started_at
+                 END,
+                 completed_at = CASE
+                     WHEN ?1 IN ('completed', 'failed') THEN ?4
+                     ELSE completed_at
+                 END
+             WHERE id = ?5",
+            params![status, copied_bytes, error_message, now, transfer_id],
+        )
+        .map_err(|error| format!("Unable to update transfer status: {error}"))?;
+
+    if changed == 0 {
+        return Err("The transfer record no longer exists.".to_string());
+    }
+
+    Ok(())
+}
+
+fn resolve_transfer_paths(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+) -> Result<(PathBuf, PathBuf), String> {
+    let planned: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = connection
+        .query_row(
+            "SELECT
+                    p.source_drive_id,
+                    p.source_relative_path,
+                    p.destination_location_id,
+                    p.destination_relative_path,
+                    l.kind,
+                    l.drive_id,
+                    l.local_path
+                 FROM planned_moves p
+                 LEFT JOIN locations l ON l.id = p.destination_location_id
+                 WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to resolve planned transfer: {error}"))?;
+
+    let Some((
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_relative_path,
+        destination_kind,
+        destination_drive_id,
+        destination_local_path,
+    )) = planned
+    else {
+        return Err("The planned move no longer exists.".to_string());
+    };
+
+    let source_drive = connected_drives
+        .iter()
+        .find(|drive| drive.persistent_identifier.as_deref() == Some(source_drive_id.as_str()))
+        .ok_or_else(|| "The source drive is not connected.".to_string())?;
+
+    let source = PathBuf::from(&source_drive.mount_point).join(&source_relative_path);
+
+    let destination_root = match destination_kind.as_str() {
+        "external_drive" => {
+            let drive_id = destination_drive_id.ok_or_else(|| {
+                format!("Destination location {destination_location_id} has no drive identity.")
+            })?;
+
+            let drive = connected_drives
+                .iter()
+                .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
+                .ok_or_else(|| "The destination drive is not connected.".to_string())?;
+
+            PathBuf::from(&drive.mount_point)
+        }
+        "local_folder" => {
+            let path = destination_local_path.ok_or_else(|| {
+                format!("Destination location {destination_location_id} has no local folder.")
+            })?;
+            PathBuf::from(path)
+        }
+        _ => {
+            return Err(format!(
+                "Destination location {destination_location_id} has an unsupported type."
+            ))
+        }
+    };
+
+    let destination = destination_root.join(&destination_relative_path);
+
+    Ok((source, destination))
+}
+
+fn execute_planned_transfer(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+) -> Result<TransferRecord, String> {
+    let validation = validate_plan_live(connection, connected_drives)?;
+
+    if !validation.ready {
+        let relevant_issue = validation
+            .issues
+            .iter()
+            .find(|issue| issue.move_id == Some(planned_move_id))
+            .or_else(|| validation.issues.first());
+
+        let message = relevant_issue
+            .map(|issue| issue.message.clone())
+            .unwrap_or_else(|| "The plan did not pass final validation.".to_string());
+
+        return Err(format!("Transfer blocked by final validation: {message}"));
+    }
+
+    let (source, destination) =
+        resolve_transfer_paths(connection, planned_move_id, connected_drives)?;
+
+    execute_transfer_paths(connection, planned_move_id, &source, &destination)
+}
+
+fn execute_transfer_paths(
+    connection: &Connection,
+    planned_move_id: i64,
+    source: &Path,
+    destination: &Path,
+) -> Result<TransferRecord, String> {
+    let transfer = create_transfer_record(connection, planned_move_id)?;
+
+    if let Err(error) = update_transfer_status(connection, transfer.id, "copying", None, None) {
+        return Err(error);
+    }
+
+    let copy_result = copy_file_verified_with_stage(source, destination, |copied_bytes| {
+        let copied_bytes = i64::try_from(copied_bytes)
+            .map_err(|_| "Copied file is too large to record.".to_string())?;
+
+        update_transfer_status(
+            connection,
+            transfer.id,
+            "verifying",
+            Some(copied_bytes),
+            None,
+        )
+    });
+
+    match copy_result {
+        Ok(copied_bytes) => {
+            let copied_bytes = i64::try_from(copied_bytes)
+                .map_err(|_| "Copied file is too large to record.".to_string())?;
+
+            update_transfer_status(
+                connection,
+                transfer.id,
+                "completed",
+                Some(copied_bytes),
+                None,
+            )?;
+
+            // A verified transfer is no longer an active plan item. The
+            // transfer record contains its own source/destination snapshot,
+            // so removing the plan does not remove execution history.
+            connection
+                .execute(
+                    "DELETE FROM planned_moves WHERE id = ?1",
+                    params![planned_move_id],
+                )
+                .map_err(|error| {
+                    format!("Transfer completed, but the plan could not be cleared: {error}")
+                })?;
+        }
+        Err(error) => {
+            // The transfer snapshot survives the failure and records why it
+            // stopped. The copy primitive removes its temporary file and never
+            // deletes the source.
+            let _ = update_transfer_status(connection, transfer.id, "failed", None, Some(&error));
+
+            return Err(error);
+        }
+    }
+
+    connection
+        .query_row(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             WHERE id = ?1",
+            params![transfer.id],
+            read_transfer,
+        )
+        .map_err(|error| format!("Unable to read completed transfer: {error}"))
+}
+
+fn create_transfer_record(
+    connection: &Connection,
+    planned_move_id: i64,
+) -> Result<TransferRecord, String> {
+    let planned: Option<(String, String, String, String, Option<i64>)> = connection
+        .query_row(
+            "SELECT
+                p.source_drive_id,
+                p.source_relative_path,
+                p.destination_location_id,
+                p.destination_relative_path,
+                f.size_bytes
+             FROM planned_moves p
+             LEFT JOIN files f
+               ON f.drive_id = p.source_drive_id
+              AND f.relative_path = p.source_relative_path
+             WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read planned move for transfer: {error}"))?;
+
+    let Some((
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_relative_path,
+        total_bytes,
+    )) = planned
+    else {
+        return Err("The planned move no longer exists.".to_string());
+    };
+
+    let created_at = now_unix();
+
+    connection
+        .execute(
+            "INSERT INTO transfers (
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'pending', ?7)",
+            params![
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                created_at
+            ],
+        )
+        .map_err(|error| format!("Unable to create transfer record: {error}"))?;
+
+    let id = connection.last_insert_rowid();
+
+    connection
+        .query_row(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             WHERE id = ?1",
+            params![id],
+            read_transfer,
+        )
+        .map_err(|error| format!("Unable to read created transfer: {error}"))
+}
+
+fn list_transfer_records(connection: &Connection) -> Result<Vec<TransferRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             ORDER BY created_at DESC, id DESC",
+        )
+        .map_err(|error| format!("Unable to query transfers: {error}"))?;
+
+    let rows = statement
+        .query_map([], read_transfer)
+        .map_err(|error| format!("Unable to read transfers: {error}"))?;
+
+    let transfers = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read transfer rows: {error}"))?;
+
+    Ok(transfers)
+}
+
+fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
+    let first_file = fs::File::open(first)
+        .map_err(|error| format!("Unable to open source for verification: {error}"))?;
+    let second_file = fs::File::open(second)
+        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?;
+
+    if first_file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len()
+        != second_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+    {
+        return Ok(false);
+    }
+
+    let mut first_reader = BufReader::new(first_file);
+    let mut second_reader = BufReader::new(second_file);
+    let mut first_buffer = vec![0_u8; 1024 * 1024];
+    let mut second_buffer = vec![0_u8; 1024 * 1024];
+
+    loop {
+        let first_count = first_reader
+            .read(&mut first_buffer)
+            .map_err(|error| format!("Unable to verify source file: {error}"))?;
+        let second_count = second_reader
+            .read(&mut second_buffer)
+            .map_err(|error| format!("Unable to verify copied file: {error}"))?;
+
+        if first_count != second_count {
+            return Ok(false);
+        }
+
+        if first_count == 0 {
+            return Ok(true);
+        }
+
+        if first_buffer[..first_count] != second_buffer[..second_count] {
+            return Ok(false);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(source: &Path, destination: &Path) -> Result<(), String> {
+    // Darwin's RENAME_EXCL flag. renamex_np returns EEXIST rather than
+    // replacing an existing destination. If the filesystem does not support
+    // exclusive rename, the operation fails safely instead of falling back
+    // to overwrite semantics.
+    const RENAME_EXCL: u32 = 0x00000004;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::os::raw::c_char,
+            to: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> std::os::raw::c_int;
+    }
+
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "Temporary path contains an invalid null byte.".to_string())?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| "Destination path contains an invalid null byte.".to_string())?;
+
+    let result = unsafe { renamex_np(source_c.as_ptr(), destination_c.as_ptr(), RENAME_EXCL) };
+
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(format!(
+            "Destination already exists: {}",
+            destination.display()
+        ));
+    }
+
+    Err(format!(
+        "Unable to finalise copied file without overwrite: {error}"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_exclusive(_source: &Path, _destination: &Path) -> Result<(), String> {
+    Err("Exclusive transfer finalisation is not supported on this platform.".to_string())
+}
+
+fn copy_file_verified_with_stage<F>(
+    source: &Path,
+    destination: &Path,
+    mut on_verifying: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64) -> Result<(), String>,
+{
+    if destination.exists() {
+        return Err(format!(
+            "Destination already exists: {}",
+            destination.display()
+        ));
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Destination has no parent folder.".to_string())?;
+
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to create destination folder: {error}"))?;
+
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| "Destination has no file name.".to_string())?
+        .to_string_lossy();
+
+    let temporary = parent.join(format!(
+        ".mediamapper-{}-{}.partial",
+        std::process::id(),
+        file_name
+    ));
+
+    if temporary.exists() {
+        fs::remove_file(&temporary)
+            .map_err(|error| format!("Unable to remove stale temporary file: {error}"))?;
+    }
+
+    let result = (|| -> Result<u64, String> {
+        let source_file = fs::File::open(source)
+            .map_err(|error| format!("Unable to open source file: {error}"))?;
+        let mut reader = BufReader::new(source_file);
+
+        let temporary_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Unable to create temporary destination file: {error}"))?;
+        let mut writer = BufWriter::new(temporary_file);
+
+        let copied = std::io::copy(&mut reader, &mut writer)
+            .map_err(|error| format!("Unable to copy file: {error}"))?;
+
+        writer
+            .flush()
+            .map_err(|error| format!("Unable to flush copied file: {error}"))?;
+
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("Unable to sync copied file: {error}"))?;
+
+        drop(writer);
+
+        on_verifying(copied)?;
+
+        if !files_are_identical(source, &temporary)? {
+            return Err("Copied file failed byte-for-byte verification.".to_string());
+        }
+
+        // Finalise with no-overwrite semantics. A destination created after
+        // preflight or during the copy must never be replaced.
+        rename_exclusive(&temporary, destination)?;
+
+        Ok(copied)
+    })();
+
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    result
+}
+
+fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> {
+    copy_file_verified_with_stage(source, destination, |_| Ok(()))
 }
 
 fn now_unix() -> i64 {
@@ -654,6 +1278,45 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| format!("Unable to commit planned move migration: {error}"))?;
         }
     }
+
+    // Transfers are an execution record, not part of the plan itself.
+    // Source and destination values are snapshotted so transfer history remains
+    // meaningful even if the corresponding planned move is later changed or
+    // removed.
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                planned_move_id INTEGER,
+                source_drive_id TEXT NOT NULL,
+                source_relative_path TEXT NOT NULL,
+                destination_location_id TEXT NOT NULL,
+                destination_relative_path TEXT NOT NULL,
+                total_bytes INTEGER,
+                copied_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL
+                    CHECK(status IN (
+                        'pending',
+                        'copying',
+                        'verifying',
+                        'completed',
+                        'failed'
+                    )),
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transfers_status
+                ON transfers(status);
+
+            CREATE INDEX IF NOT EXISTS idx_transfers_created
+                ON transfers(created_at);
+            ",
+        )
+        .map_err(|error| format!("Unable to initialise transfer schema: {error}"))?;
 
     Ok(())
 }
@@ -2060,6 +2723,598 @@ async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, S
     .await
 }
 
+#[derive(Debug)]
+struct PreflightMove {
+    id: i64,
+    source_drive_id: String,
+    source_relative_path: String,
+    destination_location_id: String,
+    destination_display_name: Option<String>,
+    destination_kind: Option<String>,
+    destination_available_bytes: Option<i64>,
+}
+
+fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
+    let moves = {
+        let mut statement = connection
+            .prepare(
+                "SELECT p.id,
+                        p.source_drive_id,
+                        p.source_relative_path,
+                        p.destination_location_id,
+                        COALESCE(NULLIF(l.user_label, ''), l.display_name),
+                        l.kind,
+                        CASE WHEN l.kind = 'external_drive' THEN d.available_bytes ELSE NULL END
+                 FROM planned_moves p
+                 LEFT JOIN locations l ON l.id = p.destination_location_id
+                 LEFT JOIN drives d ON d.persistent_identifier = l.drive_id
+                 ORDER BY p.id",
+            )
+            .map_err(|error| format!("Unable to query plan preflight: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PreflightMove {
+                    id: row.get(0)?,
+                    source_drive_id: row.get(1)?,
+                    source_relative_path: row.get(2)?,
+                    destination_location_id: row.get(3)?,
+                    destination_display_name: row.get(4)?,
+                    destination_kind: row.get(5)?,
+                    destination_available_bytes: row.get(6)?,
+                })
+            })
+            .map_err(|error| format!("Unable to read plan preflight: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read plan preflight rows: {error}"))?
+    };
+
+    let mut issues = Vec::new();
+    let mut counted_files: HashSet<(String, String)> = HashSet::new();
+    let mut counted_files_by_destination: HashMap<String, HashSet<(String, String)>> =
+        HashMap::new();
+    let mut known_bytes = 0_i64;
+    let mut unknown_size_count = 0_i64;
+    let mut destination_totals: HashMap<String, (String, String, i64, i64, i64, Option<i64>)> =
+        HashMap::new();
+    let mut source_roots: Vec<(i64, String, String, bool)> = Vec::new();
+
+    for planned in &moves {
+        let Some(destination_name) = planned.destination_display_name.clone() else {
+            issues.push(PlanPreflightIssue {
+                code: "missing_destination".to_string(),
+                message: format!(
+                    "The destination for planned move {} is no longer available.",
+                    planned.id
+                ),
+                move_id: Some(planned.id),
+            });
+            continue;
+        };
+        let destination_kind = planned
+            .destination_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let destination = destination_totals
+            .entry(planned.destination_location_id.clone())
+            .or_insert_with(|| {
+                (
+                    destination_name,
+                    destination_kind,
+                    0,
+                    0,
+                    0,
+                    planned.destination_available_bytes,
+                )
+            });
+        destination.2 += 1;
+
+        let source: Option<(bool, Option<i64>)> = connection
+            .query_row(
+                "SELECT is_directory, size_bytes
+                 FROM files
+                 WHERE drive_id = ?1 AND relative_path = ?2",
+                params![planned.source_drive_id, planned.source_relative_path],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to validate preflight source: {error}"))?;
+
+        let Some((source_is_directory, source_size)) = source else {
+            issues.push(PlanPreflightIssue {
+                code: "missing_source".to_string(),
+                message: format!(
+                    "{} is no longer present in the catalogue.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+            continue;
+        };
+
+        let source_lower = planned.source_relative_path.to_lowercase();
+        let overlaps = source_roots
+            .iter()
+            .any(|(_, drive_id, path, is_directory)| {
+                if drive_id != &planned.source_drive_id {
+                    return false;
+                }
+                let path_lower = path.to_lowercase();
+                (*is_directory && source_lower.starts_with(&format!("{path_lower}/")))
+                    || (source_is_directory && path_lower.starts_with(&format!("{source_lower}/")))
+            });
+        if overlaps {
+            issues.push(PlanPreflightIssue {
+                code: "overlapping_source".to_string(),
+                message: format!(
+                    "{} overlaps another planned source. Its files are counted only once.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+        }
+        source_roots.push((
+            planned.id,
+            planned.source_drive_id.clone(),
+            planned.source_relative_path.clone(),
+            source_is_directory,
+        ));
+
+        let source_files: Vec<(String, Option<i64>)> = if source_is_directory {
+            let mut statement = connection
+                .prepare(
+                    "SELECT relative_path, size_bytes
+                     FROM files
+                     WHERE drive_id = ?1
+                       AND is_directory = 0
+                       AND substr(relative_path, 1, length(?2) + 1) = ?2 || '/'",
+                )
+                .map_err(|error| format!("Unable to calculate planned folder size: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![planned.source_drive_id, planned.source_relative_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| format!("Unable to read planned folder size: {error}"))?;
+
+            let files = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read planned folder rows: {error}"))?;
+
+            files
+        } else {
+            vec![(planned.source_relative_path.clone(), source_size)]
+        };
+
+        let mut has_unknown_size = false;
+        let destination_files = counted_files_by_destination
+            .entry(planned.destination_location_id.clone())
+            .or_default();
+
+        for (relative_path, size) in source_files {
+            let key = (planned.source_drive_id.clone(), relative_path);
+
+            if size.is_none() {
+                has_unknown_size = true;
+            }
+
+            if counted_files.insert(key.clone()) {
+                match size {
+                    Some(bytes) => {
+                        known_bytes = known_bytes.saturating_add(bytes);
+                    }
+                    None => {
+                        unknown_size_count += 1;
+                    }
+                }
+            }
+
+            if destination_files.insert(key) {
+                match size {
+                    Some(bytes) => {
+                        destination.3 = destination.3.saturating_add(bytes);
+                    }
+                    None => {
+                        destination.4 += 1;
+                    }
+                }
+            }
+        }
+
+        if has_unknown_size {
+            issues.push(PlanPreflightIssue {
+                code: "unknown_source_size".to_string(),
+                message: format!(
+                    "{} contains files whose size is unknown.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+        }
+    }
+
+    let mut destinations: Vec<PlanPreflightDestination> = destination_totals
+        .into_iter()
+        .map(
+            |(location_id, (display_name, kind, move_count, bytes, unknown, available))| {
+                let projected = available.map(|free| free.saturating_sub(bytes).max(0));
+                let sufficient = if unknown > 0 {
+                    None
+                } else {
+                    available.map(|free| bytes <= free)
+                };
+                if available.is_some_and(|free| bytes > free) {
+                    issues.push(PlanPreflightIssue {
+                        code: "insufficient_capacity".to_string(),
+                        message: format!(
+                            "{display_name} does not have enough catalogued free space for the known planned data."
+                        ),
+                        move_id: None,
+                    });
+                }
+                PlanPreflightDestination {
+                    location_id,
+                    display_name,
+                    kind,
+                    move_count,
+                    known_bytes: bytes,
+                    unknown_size_count: unknown,
+                    available_bytes: available,
+                    projected_available_bytes: projected,
+                    capacity_sufficient: sufficient,
+                }
+            },
+        )
+        .collect();
+    destinations.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+    });
+
+    Ok(PlanPreflight {
+        move_count: moves.len() as i64,
+        known_bytes,
+        unknown_size_count,
+        destinations,
+        issues,
+    })
+}
+
+fn validate_plan_live(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+) -> Result<PlanLiveValidation, String> {
+    let mut issues = Vec::new();
+
+    let connected_by_id: HashMap<&str, &DriveInfo> = connected_drives
+        .iter()
+        .filter_map(|drive| drive.persistent_identifier.as_deref().map(|id| (id, drive)))
+        .collect();
+
+    let mut statement = connection
+        .prepare(
+            "SELECT p.id,
+                    p.source_drive_id,
+                    p.source_relative_path,
+                    p.destination_location_id,
+                    l.kind,
+                    l.drive_id,
+                    l.local_path
+             FROM planned_moves p
+             LEFT JOIN locations l ON l.id = p.destination_location_id
+             ORDER BY p.id",
+        )
+        .map_err(|error| format!("Unable to prepare live plan validation: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to validate live plan: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read live plan validation: {error}"))?;
+
+    for (
+        move_id,
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_kind,
+        destination_drive_id,
+        destination_local_path,
+    ) in rows
+    {
+        match connected_by_id.get(source_drive_id.as_str()) {
+            None => issues.push(PlanPreflightIssue {
+                code: "source_drive_offline".to_string(),
+                message: format!(
+                    "The source drive for {} is not connected.",
+                    source_relative_path
+                ),
+                move_id: Some(move_id),
+            }),
+            Some(source_drive) => {
+                let source_path = Path::new(&source_drive.mount_point).join(&source_relative_path);
+
+                match fs::symlink_metadata(&source_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        issues.push(PlanPreflightIssue {
+                            code: "source_missing_on_disk".to_string(),
+                            message: format!(
+                                "{} is in the catalogue but is not currently present on the connected source drive.",
+                                source_relative_path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    }
+                    Err(_) => {
+                        issues.push(PlanPreflightIssue {
+                            code: "source_unreadable_on_disk".to_string(),
+                            message: format!(
+                                "{} cannot currently be checked on the source drive.",
+                                source_relative_path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    }
+                    Ok(metadata) => {
+                        let catalogued: Option<(bool, Option<i64>, Option<i64>)> = connection
+                            .query_row(
+                                "SELECT is_directory, size_bytes, modified_at
+                                 FROM files
+                                 WHERE drive_id = ?1 AND relative_path = ?2",
+                                params![source_drive_id, source_relative_path],
+                                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()
+                            .map_err(|error| {
+                                format!("Unable to compare live source with catalogue: {error}")
+                            })?;
+
+                        if let Some((
+                            catalogued_is_directory,
+                            catalogued_size,
+                            catalogued_modified,
+                        )) = catalogued
+                        {
+                            let live_is_directory = metadata.is_dir();
+
+                            if live_is_directory != catalogued_is_directory {
+                                issues.push(PlanPreflightIssue {
+                                    code: "source_type_changed".to_string(),
+                                    message: format!(
+                                        "{} has changed type since it was catalogued.",
+                                        source_relative_path
+                                    ),
+                                    move_id: Some(move_id),
+                                });
+                            } else if !catalogued_is_directory {
+                                let live_size = metadata.len().min(i64::MAX as u64) as i64;
+                                let live_modified = system_time_unix(metadata.modified());
+
+                                if catalogued_size.is_some_and(|size| size != live_size)
+                                    || (catalogued_modified.is_some()
+                                        && live_modified != catalogued_modified)
+                                {
+                                    issues.push(PlanPreflightIssue {
+                                        code: "source_changed".to_string(),
+                                        message: format!(
+                                            "{} has changed since it was catalogued. Rescan the source drive before transferring.",
+                                            source_relative_path
+                                        ),
+                                        move_id: Some(move_id),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let destination_root = match destination_kind.as_deref() {
+            Some("external_drive") => destination_drive_id
+                .as_deref()
+                .and_then(|drive_id| connected_by_id.get(drive_id))
+                .map(|drive| PathBuf::from(&drive.mount_point)),
+            Some("local_folder") => destination_local_path.as_deref().map(PathBuf::from),
+            _ => None,
+        };
+
+        let destination_relative_path: Option<String> = connection
+            .query_row(
+                "SELECT destination_relative_path
+                 FROM planned_moves
+                 WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to read planned destination path: {error}"))?;
+
+        if let (Some(root), Some(relative_path)) = (
+            destination_root.as_ref(),
+            destination_relative_path.as_ref(),
+        ) {
+            let destination_path = root.join(relative_path);
+
+            match fs::symlink_metadata(&destination_path) {
+                Ok(_) => issues.push(PlanPreflightIssue {
+                    code: "destination_exists".to_string(),
+                    message: format!(
+                        "{} already exists at the planned destination.",
+                        relative_path
+                    ),
+                    move_id: Some(move_id),
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => issues.push(PlanPreflightIssue {
+                    code: "destination_unreadable".to_string(),
+                    message: format!(
+                        "Media Mapper cannot confirm whether {} is clear at the planned destination.",
+                        relative_path
+                    ),
+                    move_id: Some(move_id),
+                }),
+            }
+        }
+
+        match destination_kind.as_deref() {
+            Some("external_drive") => {
+                let connected = destination_drive_id
+                    .as_deref()
+                    .and_then(|drive_id| connected_by_id.get(drive_id));
+
+                if connected.is_none() {
+                    issues.push(PlanPreflightIssue {
+                        code: "destination_drive_offline".to_string(),
+                        message: format!(
+                            "Destination {} is not currently connected.",
+                            destination_location_id
+                        ),
+                        move_id: Some(move_id),
+                    });
+                }
+            }
+            Some("local_folder") => match destination_local_path.as_deref() {
+                Some(path) => {
+                    let destination = Path::new(path);
+                    if !destination.exists() {
+                        issues.push(PlanPreflightIssue {
+                            code: "destination_folder_missing".to_string(),
+                            message: format!(
+                                "The destination folder {} is no longer available.",
+                                path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    } else if !destination.is_dir() {
+                        issues.push(PlanPreflightIssue {
+                            code: "destination_not_folder".to_string(),
+                            message: format!("The destination {} is no longer a folder.", path),
+                            move_id: Some(move_id),
+                        });
+                    }
+                }
+                None => issues.push(PlanPreflightIssue {
+                    code: "destination_folder_missing".to_string(),
+                    message: "The planned local destination no longer has a folder path."
+                        .to_string(),
+                    move_id: Some(move_id),
+                }),
+            },
+            _ => issues.push(PlanPreflightIssue {
+                code: "destination_missing".to_string(),
+                message: format!(
+                    "Destination {} is no longer available.",
+                    destination_location_id
+                ),
+                move_id: Some(move_id),
+            }),
+        }
+    }
+
+    // Capacity is checked once per external destination using current diskutil
+    // free space, rather than the value stored at the last catalogue scan.
+    let preflight = plan_preflight(connection)?;
+    for destination in &preflight.destinations {
+        if destination.kind != "external_drive" {
+            continue;
+        }
+
+        let drive_id = destination
+            .location_id
+            .strip_prefix("drive:")
+            .unwrap_or(&destination.location_id);
+
+        let Some(drive) = connected_by_id.get(drive_id) else {
+            continue;
+        };
+
+        if destination.unknown_size_count > 0 {
+            issues.push(PlanPreflightIssue {
+                code: "live_capacity_unknown".to_string(),
+                message: format!(
+                    "{} contains planned files with unknown sizes, so current free-space requirements cannot be confirmed.",
+                    destination.display_name
+                ),
+                move_id: None,
+            });
+        } else if let Some(available) = drive.available_bytes {
+            if destination.known_bytes as u64 > available {
+                issues.push(PlanPreflightIssue {
+                    code: "live_insufficient_capacity".to_string(),
+                    message: format!(
+                        "{} does not currently have enough free space for the planned data.",
+                        destination.display_name
+                    ),
+                    move_id: None,
+                });
+            }
+        }
+    }
+
+    Ok(PlanLiveValidation {
+        ready: issues.is_empty(),
+        issues,
+    })
+}
+
+#[tauri::command]
+async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, String> {
+    run_blocking(move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        validate_plan_live(&connection, &drives)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        list_transfer_records(&connection)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn execute_planned_move(
+    app: tauri::AppHandle,
+    planned_move_id: i64,
+) -> Result<TransferRecord, String> {
+    run_blocking(move || {
+        // Discover the physical drives immediately before execution. This is
+        // deliberately inside the blocking worker because diskutil and file
+        // verification must never block the window thread.
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+
+        execute_planned_transfer(&connection, planned_move_id, &drives)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        plan_preflight(&connection)
+    })
+    .await
+}
+
 // Planned destinations can sit inside folders that do not exist yet, such as
 // `New Folder/film.mp4` planned from the drive root. Returns the next folder
 // below `parent_path` on the way to each such destination, so the planned view
@@ -2308,6 +3563,11 @@ pub fn run() {
             if let Err(error) = initialise_database(app.handle()) {
                 eprintln!("Media Mapper database initialisation failed: {error}");
             }
+
+            if let Some(window) = app.get_webview_window("main") {
+                window.show()?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2325,6 +3585,10 @@ pub fn run() {
             add_local_folder_location,
             create_planned_move,
             list_planned_moves,
+            get_plan_preflight,
+            validate_plan,
+            execute_planned_move,
+            list_transfers,
             list_planned_folder_entries,
             remove_planned_move
         ])
@@ -2997,6 +4261,1438 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn preflight_counts_folder_contents_and_deduplicates_overlapping_sources() {
+        let database = TestDatabase::new("preflight-folder-overlap");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        connection
+            .execute(
+                "UPDATE drives SET available_bytes = 150 WHERE persistent_identifier = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES
+                    ('UUID-A', 'Folder', 'Folder', '', 1, NULL),
+                    ('UUID-A', 'Folder/a.mov', 'a.mov', 'Folder', 0, 100),
+                    ('UUID-A', 'Folder/b.mov', 'b.mov', 'Folder', 0, NULL);",
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder",
+            "drive:UUID-B",
+            "Archive/Folder",
+        )
+        .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder/a.mov",
+            "drive:UUID-B",
+            "Singles/a.mov",
+        )
+        .unwrap();
+
+        let result = plan_preflight(&connection).unwrap();
+        assert_eq!(result.move_count, 2);
+        assert_eq!(result.known_bytes, 100);
+        assert_eq!(result.unknown_size_count, 1);
+        assert_eq!(result.destinations.len(), 1);
+
+        let destination = &result.destinations[0];
+        assert_eq!(destination.location_id, "drive:UUID-B");
+        assert_eq!(destination.move_count, 2);
+        assert_eq!(destination.known_bytes, 100);
+        assert_eq!(destination.unknown_size_count, 1);
+        assert_eq!(destination.available_bytes, Some(150));
+        assert_eq!(destination.projected_available_bytes, Some(50));
+        assert_eq!(destination.capacity_sufficient, None);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "overlapping_source"));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unknown_source_size"));
+    }
+
+    #[test]
+    fn preflight_counts_overlapping_sources_per_destination_without_double_counting_headline() {
+        let database = TestDatabase::new("preflight-overlap-destinations");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        insert_drive(&connection, "UUID-C", "Archive");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES
+                    ('UUID-A', 'Folder', 'Folder', '', 1, NULL),
+                    ('UUID-A', 'Folder/a.mov', 'a.mov', 'Folder', 0, 100);",
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder",
+            "drive:UUID-B",
+            "Folder",
+        )
+        .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder/a.mov",
+            "drive:UUID-C",
+            "a.mov",
+        )
+        .unwrap();
+
+        let result = plan_preflight(&connection).unwrap();
+
+        assert_eq!(result.move_count, 2);
+        assert_eq!(result.known_bytes, 100);
+        assert_eq!(result.unknown_size_count, 0);
+
+        let backup = result
+            .destinations
+            .iter()
+            .find(|destination| destination.location_id == "drive:UUID-B")
+            .unwrap();
+        let archive = result
+            .destinations
+            .iter()
+            .find(|destination| destination.location_id == "drive:UUID-C")
+            .unwrap();
+
+        assert_eq!(backup.known_bytes, 100);
+        assert_eq!(archive.known_bytes, 100);
+        assert_eq!(backup.move_count, 1);
+        assert_eq!(archive.move_count, 1);
+    }
+
+    #[test]
+    fn preflight_reports_insufficient_capacity_and_missing_sources() {
+        let database = TestDatabase::new("preflight-issues");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        connection
+            .execute(
+                "UPDATE drives SET available_bytes = 50 WHERE persistent_identifier = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+        connection
+            .execute(
+                "DELETE FROM files WHERE drive_id = 'UUID-A' AND relative_path = 'film.mov'",
+                [],
+            )
+            .unwrap();
+
+        let stale = plan_preflight(&connection).unwrap();
+        assert_eq!(stale.move_count, 1);
+        assert_eq!(stale.known_bytes, 0);
+        assert!(stale
+            .issues
+            .iter()
+            .any(|issue| issue.code == "missing_source"));
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+        let capacity = plan_preflight(&connection).unwrap();
+        assert_eq!(capacity.known_bytes, 100);
+        assert_eq!(capacity.destinations[0].capacity_sufficient, Some(false));
+        assert_eq!(capacity.destinations[0].projected_available_bytes, Some(0));
+        assert!(capacity
+            .issues
+            .iter()
+            .any(|issue| issue.code == "insufficient_capacity"));
+    }
+
+    #[test]
+    fn preflight_handles_empty_plan_and_unknown_local_capacity() {
+        let database = TestDatabase::new("preflight-empty-local");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        let empty = plan_preflight(&connection).unwrap();
+        assert_eq!(empty.move_count, 0);
+        assert_eq!(empty.known_bytes, 0);
+        assert!(empty.destinations.is_empty());
+        assert!(empty.issues.is_empty());
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 25);
+                 INSERT INTO locations
+                    (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Movies', NULL, '/tmp', 0);",
+            )
+            .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "local:test",
+            "media-mapper-preflight-film.mov",
+        )
+        .unwrap();
+
+        let local = plan_preflight(&connection).unwrap();
+        assert_eq!(local.known_bytes, 25);
+        assert_eq!(local.destinations[0].available_bytes, None);
+        assert_eq!(local.destinations[0].projected_available_bytes, None);
+        assert_eq!(local.destinations[0].capacity_sufficient, None);
+    }
+
+    fn test_drive(id: &str, name: &str, mount_point: &Path, available: u64) -> DriveInfo {
+        DriveInfo {
+            name: name.to_string(),
+            mount_point: mount_point.to_string_lossy().into_owned(),
+            filesystem: Some("APFS".to_string()),
+            total_bytes: Some(1_000),
+            available_bytes: Some(available),
+            persistent_identifier: Some(id.to_string()),
+            device_identifier: None,
+        }
+    }
+
+    #[test]
+    fn live_validation_reports_offline_source_and_destination() {
+        let database = TestDatabase::new("live-offline");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let result = validate_plan_live(&connection, &[]).unwrap();
+
+        assert!(!result.ready);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_drive_offline"));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "destination_drive_offline"));
+    }
+
+    #[test]
+    fn live_validation_checks_source_disk_and_current_capacity() {
+        let database = TestDatabase::new("live-disk-capacity");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 50),
+        ];
+
+        let missing = validate_plan_live(&connection, &drives).unwrap();
+        assert!(!missing.ready);
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_missing_on_disk"));
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "live_insufficient_capacity"));
+
+        fs::write(source.0.join("film.mov"), vec![0_u8; 100]).unwrap();
+
+        let enough_space = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 500),
+        ];
+
+        let valid = validate_plan_live(&connection, &enough_space).unwrap();
+        assert!(valid.ready, "{:?}", valid.issues);
+        assert!(valid.issues.is_empty());
+    }
+
+    #[test]
+    fn live_validation_checks_local_destination_folder() {
+        let database = TestDatabase::new("live-local-folder");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-local-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&source.0).unwrap();
+        fs::write(source.0.join("film.mov"), b"film").unwrap();
+
+        let local_path = std::env::temp_dir().join(format!(
+            "media-mapper-live-local-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = fs::remove_dir_all(&local_path);
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 4);",
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO locations
+                    (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES ('local:test-live', 'local_folder', 'Local', NULL, ?1, 0)",
+                params![local_path.to_string_lossy()],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "local:test-live",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![test_drive("UUID-A", "Source", &source.0, 1_000)];
+
+        let missing = validate_plan_live(&connection, &drives).unwrap();
+        assert!(!missing.ready);
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "destination_folder_missing"));
+
+        fs::create_dir_all(&local_path).unwrap();
+
+        let valid = validate_plan_live(&connection, &drives).unwrap();
+        assert!(valid.ready, "{:?}", valid.issues);
+
+        fs::remove_dir_all(&local_path).unwrap();
+    }
+
+    #[test]
+    fn live_validation_detects_changed_source_file() {
+        let database = TestDatabase::new("live-source-changed");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-source-changed-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-source-changed-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+        fs::write(source.0.join("film.mov"), b"changed contents").unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path,
+                     is_directory, size_bytes, modified_at)
+                 VALUES
+                    ('UUID-A', 'film.mov', 'film.mov', '', 0, 4, NULL)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 1_000),
+        ];
+
+        let result = validate_plan_live(&connection, &drives).unwrap();
+
+        assert!(!result.ready);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.code == "source_changed"),
+            "{:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn live_validation_detects_existing_destination() {
+        let database = TestDatabase::new("live-destination-exists");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-collision-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-collision-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+
+        fs::write(source.0.join("film.mov"), b"film").unwrap();
+        fs::write(destination.0.join("film.mov"), b"existing").unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path,
+                     is_directory, size_bytes, modified_at)
+                 VALUES
+                    ('UUID-A', 'film.mov', 'film.mov', '', 0, 4, NULL)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 1_000),
+        ];
+
+        let result = validate_plan_live(&connection, &drives).unwrap();
+
+        assert!(!result.ready);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.code == "destination_exists"),
+            "{:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn verified_copy_creates_identical_destination_and_preserves_source() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("nested/destination.bin");
+        let contents = vec![0x5a_u8; 2 * 1024 * 1024 + 17];
+
+        fs::write(&source, &contents).unwrap();
+
+        let copied = copy_file_verified(&source, &destination).unwrap();
+
+        assert_eq!(copied, contents.len() as u64);
+        assert_eq!(fs::read(&source).unwrap(), contents);
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn verified_copy_reports_verifying_after_full_copy() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-stage-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("destination.bin");
+        let contents = vec![0x31_u8; 1024 * 1024 + 29];
+
+        fs::write(&source, &contents).unwrap();
+
+        let mut verifying_bytes = None;
+
+        let copied = copy_file_verified_with_stage(&source, &destination, |bytes| {
+            verifying_bytes = Some(bytes);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(copied, contents.len() as u64);
+        assert_eq!(verifying_bytes, Some(contents.len() as u64));
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn exclusive_rename_never_replaces_existing_destination() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-exclusive-rename-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let temporary = volume.0.join("temporary.partial");
+        let destination = volume.0.join("destination.mov");
+
+        fs::write(&temporary, b"new contents").unwrap();
+        fs::write(&destination, b"existing contents").unwrap();
+
+        let error = rename_exclusive(&temporary, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing contents");
+        assert_eq!(fs::read(&temporary).unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn verified_copy_refuses_existing_destination() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-collision-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("destination.bin");
+
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+
+        let error = copy_file_verified(&source, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn planned_transfer_executes_only_after_final_live_validation() {
+        let database = TestDatabase::new("planned-transfer-valid");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        let _ = fs::remove_dir_all(&destination_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+        fs::create_dir_all(&destination_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        let contents = b"verified transfer contents";
+        fs::write(&source_path, contents).unwrap();
+
+        let metadata = fs::metadata(&source_path).unwrap();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64);
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, ?1, ?2)",
+                params![contents.len() as i64, modified_at],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source_volume.0, 10_000),
+            test_drive("UUID-B", "Backup", &destination_volume.0, 10_000),
+        ];
+
+        let transfer = execute_planned_transfer(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(
+            fs::read(destination_volume.0.join("Archive/film.mov")).unwrap(),
+            contents
+        );
+        assert_eq!(fs::read(&source_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn planned_transfer_refuses_offline_destination_before_creating_record() {
+        let database = TestDatabase::new("planned-transfer-offline");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-offline-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        fs::write(&source_path, b"source").unwrap();
+
+        let metadata = fs::metadata(&source_path).unwrap();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64);
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 6, ?1)",
+                params![modified_at],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![test_drive("UUID-A", "Source", &source_volume.0, 10_000)];
+
+        let error = execute_planned_transfer(&connection, move_id, &drives).unwrap_err();
+
+        assert!(error.contains("final validation"), "{error}");
+
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+        assert_eq!(fs::read(&source_path).unwrap(), b"source");
+    }
+
+    #[test]
+    fn planned_transfer_refuses_changed_source_before_creating_record() {
+        let database = TestDatabase::new("planned-transfer-changed");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-changed-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-changed-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        let _ = fs::remove_dir_all(&destination_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+        fs::create_dir_all(&destination_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        fs::write(&source_path, b"changed contents").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        // Deliberately stale catalogue size. The live file is larger.
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 3, NULL)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source_volume.0, 10_000),
+            test_drive("UUID-B", "Backup", &destination_volume.0, 10_000),
+        ];
+
+        let error = execute_planned_transfer(&connection, move_id, &drives).unwrap_err();
+
+        assert!(error.contains("final validation"), "{error}");
+
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+        assert!(!destination_volume.0.join("film.mov").exists());
+        assert_eq!(fs::read(&source_path).unwrap(), b"changed contents");
+    }
+
+    #[test]
+    fn transfer_paths_use_current_external_drive_mount_points() {
+        let database = TestDatabase::new("transfer-paths-external");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'Films/source.mov', 'source.mov', 'Films', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "Films/source.mov",
+            "drive:UUID-B",
+            "Archive/source.mov",
+        )
+        .unwrap();
+
+        let drives = [
+            test_drive("UUID-A", "Source", Path::new("/Volumes/Source-New"), 1_000),
+            test_drive("UUID-B", "Backup", Path::new("/Volumes/Backup-New"), 1_000),
+        ];
+
+        let (source, destination) = resolve_transfer_paths(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(
+            source,
+            PathBuf::from("/Volumes/Source-New/Films/source.mov")
+        );
+        assert_eq!(
+            destination,
+            PathBuf::from("/Volumes/Backup-New/Archive/source.mov")
+        );
+    }
+
+    #[test]
+    fn transfer_paths_resolve_local_folder_destination() {
+        let database = TestDatabase::new("transfer-paths-local");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO locations (
+                    id,
+                    kind,
+                    display_name,
+                    local_path,
+                    created_at
+                 ) VALUES (
+                    'local:test',
+                    'local_folder',
+                    'Local Test',
+                    '/Users/test/Media',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "local:test",
+            "Archive/source.mov",
+        )
+        .unwrap();
+
+        let drives = [test_drive(
+            "UUID-A",
+            "Source",
+            Path::new("/Volumes/Source"),
+            1_000,
+        )];
+
+        let (source, destination) = resolve_transfer_paths(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(source, PathBuf::from("/Volumes/Source/source.mov"));
+        assert_eq!(
+            destination,
+            PathBuf::from("/Users/test/Media/Archive/source.mov")
+        );
+    }
+
+    #[test]
+    fn transfer_execution_copies_verifies_and_completes() {
+        let database = TestDatabase::new("execute-transfer");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-execute-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("Archive/film.mov");
+        let contents = vec![0x73_u8; 1024 * 1024 + 41];
+        fs::write(&source, &contents).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, ?1)",
+                params![contents.len() as i64],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = execute_transfer_paths(&connection, move_id, &source, &destination).unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(transfer.copied_bytes, contents.len() as i64);
+        assert_eq!(transfer.error_message, None);
+        assert!(transfer.started_at.is_some());
+        assert!(transfer.completed_at.is_some());
+
+        assert_eq!(fs::read(&source).unwrap(), contents);
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+
+        let history = list_transfer_records(&connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "completed");
+
+        let planned_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM planned_moves WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            planned_count, 0,
+            "a completed verified transfer must leave the active plan"
+        );
+    }
+
+    #[test]
+    fn transfer_execution_records_failure_and_preserves_existing_destination() {
+        let database = TestDatabase::new("execute-transfer-failure");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-execute-failure-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("film.mov");
+
+        fs::write(&source, b"new source").unwrap();
+        fs::write(&destination, b"existing destination").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 10)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let error =
+            execute_transfer_paths(&connection, move_id, &source, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+
+        assert_eq!(fs::read(&source).unwrap(), b"new source");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
+
+        let history = list_transfer_records(&connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+
+        let planned_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM planned_moves WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            planned_count, 1,
+            "a failed transfer must remain in the active plan"
+        );
+
+        assert!(history[0]
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Destination already exists"));
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn transfer_status_tracks_execution_lifecycle() {
+        let database = TestDatabase::new("transfer-lifecycle");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    status,
+                    created_at
+                 ) VALUES (
+                    'UUID-A',
+                    'film.mov',
+                    'drive:UUID-B',
+                    'film.mov',
+                    100,
+                    'pending',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let id = connection.last_insert_rowid();
+
+        update_transfer_status(&connection, id, "copying", Some(40), None).unwrap();
+
+        let copying: (String, i64, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT status, copied_bytes, started_at, completed_at
+                 FROM transfers WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(copying.0, "copying");
+        assert_eq!(copying.1, 40);
+        assert!(copying.2.is_some());
+        assert!(copying.3.is_none());
+
+        update_transfer_status(&connection, id, "verifying", Some(100), None).unwrap();
+        update_transfer_status(&connection, id, "completed", Some(100), None).unwrap();
+
+        let completed: (String, i64, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT status, copied_bytes, error_message, completed_at
+                 FROM transfers WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(completed.0, "completed");
+        assert_eq!(completed.1, 100);
+        assert_eq!(completed.2, None);
+        assert!(completed.3.is_some());
+    }
+
+    #[test]
+    fn failed_transfer_records_error_without_removing_snapshot() {
+        let database = TestDatabase::new("transfer-failure");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    status,
+                    created_at
+                 ) VALUES (
+                    'UUID-A',
+                    'film.mov',
+                    'drive:UUID-B',
+                    'film.mov',
+                    'pending',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let id = connection.last_insert_rowid();
+
+        update_transfer_status(&connection, id, "copying", None, None).unwrap();
+        update_transfer_status(
+            &connection,
+            id,
+            "failed",
+            None,
+            Some("Destination disconnected."),
+        )
+        .unwrap();
+
+        let transfer = list_transfer_records(&connection).unwrap().remove(0);
+
+        assert_eq!(transfer.id, id);
+        assert_eq!(transfer.status, "failed");
+        assert_eq!(
+            transfer.error_message.as_deref(),
+            Some("Destination disconnected.")
+        );
+        assert_eq!(transfer.source_relative_path, "film.mov");
+        assert!(transfer.started_at.is_some());
+        assert!(transfer.completed_at.is_some());
+    }
+
+    #[test]
+    fn creates_transfer_from_planned_move_snapshot() {
+        let database = TestDatabase::new("create-transfer");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 987)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = create_transfer_record(&connection, move_id).unwrap();
+
+        assert_eq!(transfer.planned_move_id, Some(move_id));
+        assert_eq!(transfer.source_drive_id, "UUID-A");
+        assert_eq!(transfer.source_relative_path, "film.mov");
+        assert_eq!(transfer.destination_location_id, "drive:UUID-B");
+        assert_eq!(transfer.destination_relative_path, "Archive/film.mov");
+        assert_eq!(transfer.total_bytes, Some(987));
+        assert_eq!(transfer.copied_bytes, 0);
+        assert_eq!(transfer.status, "pending");
+        assert_eq!(transfer.error_message, None);
+    }
+
+    #[test]
+    fn transfer_snapshot_survives_plan_removal() {
+        let database = TestDatabase::new("transfer-snapshot");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 123)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = create_transfer_record(&connection, move_id).unwrap();
+
+        connection
+            .execute("DELETE FROM planned_moves WHERE id = ?1", params![move_id])
+            .unwrap();
+
+        let records = list_transfer_records(&connection).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, transfer.id);
+        assert_eq!(records[0].source_relative_path, "film.mov");
+        assert_eq!(records[0].destination_relative_path, "Archive/film.mov");
+        assert_eq!(records[0].status, "pending");
+    }
+
+    #[test]
+    fn creating_transfer_requires_existing_planned_move() {
+        let database = TestDatabase::new("missing-transfer-plan");
+        let connection = open_database(&database.0).unwrap();
+
+        let error = create_transfer_record(&connection, 999).unwrap_err();
+
+        assert!(error.contains("planned move no longer exists"), "{error}");
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transfer_schema_persists_execution_snapshot() {
+        let database = TestDatabase::new("transfer-schema");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    planned_move_id,
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    copied_bytes,
+                    status,
+                    created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    42_i64,
+                    "UUID-A",
+                    "Films/film.mov",
+                    "drive:UUID-B",
+                    "Archive/film.mov",
+                    1234_i64,
+                    0_i64,
+                    "pending",
+                    100_i64
+                ],
+            )
+            .unwrap();
+
+        let transfer = connection
+            .query_row(
+                "SELECT
+                    id,
+                    planned_move_id,
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    copied_bytes,
+                    status,
+                    error_message,
+                    created_at,
+                    started_at,
+                    completed_at
+                 FROM transfers",
+                [],
+                |row| {
+                    Ok(TransferRecord {
+                        id: row.get(0)?,
+                        planned_move_id: row.get(1)?,
+                        source_drive_id: row.get(2)?,
+                        source_relative_path: row.get(3)?,
+                        destination_location_id: row.get(4)?,
+                        destination_relative_path: row.get(5)?,
+                        total_bytes: row.get(6)?,
+                        copied_bytes: row.get(7)?,
+                        status: row.get(8)?,
+                        error_message: row.get(9)?,
+                        created_at: row.get(10)?,
+                        started_at: row.get(11)?,
+                        completed_at: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap();
+
+        assert_eq!(transfer.planned_move_id, Some(42));
+        assert_eq!(transfer.source_drive_id, "UUID-A");
+        assert_eq!(transfer.source_relative_path, "Films/film.mov");
+        assert_eq!(transfer.destination_location_id, "drive:UUID-B");
+        assert_eq!(transfer.destination_relative_path, "Archive/film.mov");
+        assert_eq!(transfer.total_bytes, Some(1234));
+        assert_eq!(transfer.copied_bytes, 0);
+        assert_eq!(transfer.status, "pending");
+        assert_eq!(transfer.error_message, None);
+        assert_eq!(transfer.created_at, 100);
+        assert_eq!(transfer.started_at, None);
+        assert_eq!(transfer.completed_at, None);
+    }
+
+    #[test]
+    fn transfer_schema_rejects_invalid_status() {
+        let database = TestDatabase::new("transfer-status");
+        let connection = open_database(&database.0).unwrap();
+
+        let result = connection.execute(
+            "INSERT INTO transfers (
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                status,
+                created_at
+             ) VALUES ('UUID-A', 'film.mov', 'drive:UUID-B', 'film.mov', 'deleted', 100)",
+            [],
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
