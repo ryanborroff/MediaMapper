@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "media-mapper",
+  "productName": "Media Mapper",
   "version": "0.1.0",
   "identifier": "com.mediamapper.app",
   "build": {
@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "media-mapper",
-        "width": 800,
-        "height": 600
+        "title": "Media Mapper",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 520
       }
     ],
     "security": {

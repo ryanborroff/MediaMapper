@@ -1,8 +1,8 @@
 [package]
 name = "media-mapper"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Catalogue external drives and plan where files should live"
+authors = ["ryanborroff"]
 edition = "2021"
 
 [lib]
