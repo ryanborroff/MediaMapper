@@ -1688,7 +1688,42 @@ function App() {
 
       {error && <div className="notice error">{error}</div>}
 
-      
+      {false && catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading"><h2>Search all drives</h2></div>
+        <div className="catalogue-search">
+          <input
+            type="search"
+            value={libraryQuery}
+            placeholder="Search every catalogued drive"
+            aria-label="Search all catalogued drives"
+            onChange={(event) => void searchLibrary(event.target.value)}
+          />
+          {libraryQuery.trim() && <span className="search-summary">
+            {librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} result${visibleLibraryResults.length === 1 ? "" : "s"}`}
+          </span>}
+          <label className="hidden-items-toggle">
+            <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
+            Show hidden items
+          </label>
+        </div>
+
+        {libraryQuery.trim() && <div className="search-results" aria-live="polite">
+          {librarySearching ? <div className="browser-message">Searching all catalogues…</div>
+          : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+          : visibleLibraryResults.map((result) => <button
+              className="search-result"
+              key={`${result.driveId}:${result.relativePath}`}
+              onClick={() => void openLibraryResult(result)}
+            >
+              <span className="search-result-main">
+                <strong>{result.name}</strong>
+                <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), parentFolder(result.relativePath))}</span>
+              </span>
+              <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
+              <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
+            </button>)}
+        </div>}
+      </section>}
 
       <section className="section-block">
         <div className="section-heading"><h2>Connected</h2>{connected.length > 0 && <span className="count-badge">{connected.length}</span>}</div>
@@ -1850,8 +1885,359 @@ function App() {
         )}
       </section>
 
-      
+      {false && executionProgress && (() => {
+        const { moves, completed } = executionProgress;
+        const current = moves[Math.min(completed, moves.length - 1)];
+        const paths = plannedMovePaths(current);
 
-      
+        return (
+          <section className="section-block" aria-live="polite">
+            <div className="section-heading"><h2>In progress</h2></div>
+            <div className="transfer-progress">
+              <strong>
+                Copying {Math.min(completed + 1, moves.length).toLocaleString()} of{" "}
+                {moves.length.toLocaleString()} {moves.length === 1 ? "file" : "files"}
+              </strong>
+              <div className="transfer-item">
+                <strong>{current.sourceName}</strong>
+                <TransferPaths from={paths.from} to={paths.to} />
+              </div>
+              <p>Each file is copied and verified before the next one starts. Originals stay in place.</p>
+            </div>
+          </section>
+        );
+      })()}
 
-      
+      {false && !executionProgress && executionResult && <section className="section-block">
+        <div className="section-heading">
+          <h2>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</h2>
+          <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+        </div>
+        <p className={`transfer-result${executionResult.stopped ? " failed" : ""}`} role="status">
+          {executionResult.message}
+        </p>
+      </section>}
+
+      {false && showTransfers && <section className="section-block">
+        <div className="section-heading">
+          <h2>Waiting to transfer</h2>
+          <span>{plannedMoves.length}</span>
+        </div>
+        {plannedMoves.length === 0 ? (
+          <p className="section-empty">Nothing is waiting. Plan a move from a drive's catalogue to add it here.</p>
+        ) : <>
+          <p className="section-description">Planned only. Nothing is copied until you choose Copy and verify.</p>
+
+          {planPreflight && <div className="plan-summary" aria-live="polite">
+            {planValidation && (
+              <div className={`plan-validation ${planValidation.ready ? "ready" : "blocked"}`}>
+                <strong>{planValidation.ready ? "Current checks passed" : "Plan needs attention"}</strong>
+                <span>
+                  {planValidation.ready
+                    ? "Connected sources and destinations have passed the current checks."
+                    : `${planValidation.issues.length.toLocaleString()} ${planValidation.issues.length === 1 ? "live issue needs" : "live issues need"} attention.`}
+                </span>
+                {!planValidation.ready && (
+                  <ul>
+                    {planValidation.issues.map((issue, index) => (
+                      <li key={`live:${issue.code}:${issue.moveId ?? "plan"}:${index}`}>
+                        {issue.message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            <div className="plan-summary-total">
+              <strong>
+                {planPreflight.moveCount.toLocaleString()} {planPreflight.moveCount === 1 ? "move" : "moves"}
+                {" · "}
+                {planPreflight.unknownSizeCount > 0 ? "at least " : ""}
+                {formatBytes(planPreflight.knownBytes)}
+              </strong>
+              {planPreflight.unknownSizeCount > 0 && (
+                <span>
+                  {planPreflight.unknownSizeCount.toLocaleString()} {planPreflight.unknownSizeCount === 1 ? "file has" : "files have"} unknown size
+                </span>
+              )}
+            </div>
+
+            <div className="plan-destinations">
+              {planPreflight.destinations.map((destination) => (
+                <div className="plan-destination" key={destination.locationId}>
+                  <strong>{destination.displayName}</strong>
+                  <span>
+                    {destination.unknownSizeCount > 0 ? "At least " : ""}
+                    {formatBytes(destination.knownBytes)} planned
+                    {destination.projectedAvailableBytes !== null
+                      ? ` · ${formatBytes(destination.projectedAvailableBytes)} free after`
+                      : " · capacity unknown"}
+                  </span>
+                  {destination.capacitySufficient === false && (
+                    <span className="plan-summary-warning">Not enough catalogued free space</span>
+                  )}
+                  {destination.capacitySufficient === null && destination.availableBytes !== null && (
+                    <span className="plan-summary-note">Final capacity cannot be confirmed while some file sizes are unknown.</span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {planPreflight.issues.length > 0 && (
+              <div className="plan-issues">
+                <strong>
+                  {planPreflight.issues.length.toLocaleString()} {planPreflight.issues.length === 1 ? "issue needs" : "issues need"} attention
+                </strong>
+                <ul>
+                  {planPreflight.issues.map((issue, index) => (
+                    <li key={`${issue.code}:${issue.moveId ?? "plan"}:${index}`}>{issue.message}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>}
+
+          {(() => {
+            const fileMoveCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
+            const folderMoveCount = plannedMoves.length - fileMoveCount;
+            const planReady =
+              planValidation?.ready === true &&
+              (planPreflight?.issues.length ?? 0) === 0;
+            const canCopy = planReady && fileMoveCount > 0 && !executingPlan;
+
+            return (
+              <div className="plan-copy">
+                {!showCopyConfirmation ? (
+                  <div className="plan-copy-row">
+                    <div>
+                      <strong>Copy planned files</strong>
+                      <span>
+                        Copies are verified before completion. Originals stay in place.
+                      </span>
+                      {folderMoveCount > 0 && (
+                        <span>
+                          {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      className="section-action"
+                      disabled={!canCopy}
+                      onClick={() => {
+                        setExecutionResult(null);
+                        setShowCopyConfirmation(true);
+                      }}
+                    >
+                      Review copy
+                    </button>
+                  </div>
+                ) : (
+                  <div className="plan-copy-confirmation">
+                    <div>
+                      <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
+                      <span>
+                        Media Mapper will run final checks again, copy each file, verify it byte for byte, and leave every original untouched.
+                      </span>
+                    </div>
+                    <div className="plan-copy-actions">
+                      <button
+                        className="secondary-button"
+                        disabled={executingPlan}
+                        onClick={() => setShowCopyConfirmation(false)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="section-action"
+                        disabled={!canCopy}
+                        onClick={() => void copyPlannedFiles()}
+                      >
+                        {executingPlan ? "Copying…" : "Copy and verify"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            );
+          })()}
+
+          <div className="planned-move-list">
+            {plannedMoves.map((move) => {
+              const paths = plannedMovePaths(move);
+              const runIndex = executionProgress?.moves.findIndex((item) => item.id === move.id) ?? -1;
+              const runState =
+                !executionProgress || runIndex === -1 ? ""
+                  : runIndex < executionProgress.completed ? "Copied"
+                    : runIndex === executionProgress.completed ? "Copying…"
+                      : "Waiting";
+
+              return (
+                <div className="planned-move-row" key={move.id}>
+                  <div className="transfer-item">
+                    <strong>{move.sourceName}</strong>
+                    <TransferPaths from={paths.from} to={paths.to} />
+                  </div>
+                  <span>{formatBytes(move.sourceSizeBytes)}</span>
+                  {executingPlan ? (
+                    <span className="transfer-run-state">{runState}</span>
+                  ) : (
+                    <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>}
+      </section>}
+
+      {false && showTransfers && <section className="section-block">
+        <div className="section-heading">
+          <h2>Transfer history</h2>
+          {transfers.length > 0 && <span>{transfers.length}</span>}
+        </div>
+        {transfers.length === 0 ? (
+          <p className="section-empty">No transfers yet. Copied files will be listed here.</p>
+        ) : <>
+          <p className="section-description">Most recent first. Original files are left untouched.</p>
+
+          <div className="transfer-history">
+            {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
+              const outcome = transferOutcome(transfer.status);
+              const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
+              const location = locations.find((item) => item.id === transfer.destinationLocationId);
+
+              return (
+                <div className={`transfer-history-row ${outcome.tone}`} key={transfer.id}>
+                  <div className="transfer-item">
+                    <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                    <TransferPaths
+                      from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
+                      to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
+                    />
+                    {transfer.status === "failed" && transfer.errorMessage && (
+                      <p className="transfer-error">{transfer.errorMessage}</p>
+                    )}
+                  </div>
+                  <span>{size === null ? "" : formatBytes(size)}</span>
+                  <div className="transfer-outcome">
+                    <span className="transfer-status">{outcome.label}</span>
+                    <span>{formatDate(transfer.completedAt ?? transfer.startedAt ?? transfer.createdAt)}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {transfers.length > RECENT_TRANSFER_COUNT && (
+            <button className="transfer-more-button" onClick={() => setShowAllTransfers((showAll) => !showAll)}>
+              {showAllTransfers ? "Show recent only" : `Show all ${transfers.length.toLocaleString()}`}
+            </button>
+          )}
+        </>}
+      </section>}
+
+      {false && catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading"><h2>Tools</h2></div>
+        <div className="tool-row">
+          <div>
+            <h3>Probable duplicates</h3>
+            <p>Same filename and exact file size. Contents have not been compared.</p>
+          </div>
+          <button
+            className="section-action"
+            onClick={() => void loadDuplicates()}
+            disabled={duplicatesLoading}
+          >
+            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
+          </button>
+        </div>
+
+        {showDuplicates && <div className="search-results">
+          {duplicateGroups.length === 0 ? (
+            <div className="browser-message">No probable duplicates found.</div>
+          ) : (
+            duplicateGroups.map((group) => {
+              const key = `${group.name}:${group.sizeBytes}`;
+              const expanded = expandedDuplicate === key;
+
+              return (
+                <div className="duplicate-group" key={key}>
+                  <button
+                    className="search-result"
+                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
+                  >
+                    <span className="search-result-main">
+                      <strong>{group.name}</strong>
+                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
+                    </span>
+                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
+                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
+                  </button>
+
+                  {expanded && <div className="duplicate-files">
+                    {group.files.map((file) => (
+                      <button
+                        className="search-result"
+                        key={`${file.driveId}:${file.relativePath}`}
+                        onClick={() => void openDuplicateFile(file)}
+                      >
+                        <span className="search-result-main">
+                          <strong>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</strong>
+                        </span>
+                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                        <span>{formatBytes(file.sizeBytes)}</span>
+                      </button>
+                    ))}
+                  </div>}
+                </div>
+              );
+            })
+          )}
+        </div>}
+
+        <div className="tool-row">
+          <div>
+            <h3>Largest files</h3>
+            <p>The 100 biggest files across every catalogued drive.</p>
+          </div>
+          <button
+            className="section-action"
+            onClick={() => void loadLargestFiles()}
+            disabled={largestFilesLoading}
+          >
+            {largestFilesLoading ? "Loading…" : showLargestFiles ? "Hide" : "Show 100 largest"}
+          </button>
+        </div>
+
+        {showLargestFiles && <div className="search-results">
+          {largestFiles.length === 0 ? (
+            <div className="browser-message">No catalogued files with size information.</div>
+          ) : (
+            largestFiles.map((file) => (
+              <button
+                className="search-result"
+                key={`${file.driveId}:${file.relativePath}`}
+                onClick={() => void openLargestFile(file)}
+              >
+                <span className="search-result-main">
+                  <strong>{file.name}</strong>
+                  <span>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</span>
+                </span>
+                <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                <span>{formatBytes(file.sizeBytes)}</span>
+              </button>
+            ))
+          )}
+        </div>}
+      </section>}
+
+      </div>
+    </main>
+  );
+}
+
+export default App;
