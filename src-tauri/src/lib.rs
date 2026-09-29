@@ -825,12 +825,36 @@ async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedD
     .await
 }
 
+// Folders that macOS and Windows create at the root of a volume for Spotlight
+// indexing, the trash, filesystem event logs, temporary files and document
+// versions. They are not user content, can hold thousands of entries
+// (including deleted files in the trash), and are often unreadable, which
+// would abort the scan. They are only skipped at the volume root, so a user
+// folder with the same name deeper in the drive is still catalogued.
+const VOLUME_SYSTEM_FOLDERS: &[&str] = &[
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+];
+
+fn is_volume_system_folder(name: &str) -> bool {
+    // FAT and exFAT volumes are case-insensitive, and Windows versions have
+    // written `$RECYCLE.BIN` and `$Recycle.Bin`.
+    VOLUME_SYSTEM_FOLDERS
+        .iter()
+        .any(|system_folder| system_folder.eq_ignore_ascii_case(name))
+}
+
 fn scan_directory(
     root: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
-    app: &tauri::AppHandle,
+    report_progress: &dyn Fn(&(i64, i64, i64, i64), &str),
     last_emit_at: &mut Instant,
 ) -> Result<(), String> {
     // Keep directory traversal on the heap rather than the call stack. This
@@ -875,6 +899,10 @@ fn scan_directory(
             // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
             // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
             if name.starts_with("._") || name == ".DS_Store" {
+                continue;
+            }
+
+            if current == root && is_volume_system_folder(&name) {
                 continue;
             }
 
@@ -939,7 +967,7 @@ fn scan_directory(
             }
 
             if last_emit_at.elapsed() >= Duration::from_millis(150) {
-                emit_scan_progress(app, drive_id, counters, &relative);
+                report_progress(counters, &relative);
                 *last_emit_at = Instant::now();
             }
         }
@@ -1038,7 +1066,9 @@ async fn scan_drive(
             &mut insert_statement,
             &drive_id,
             &mut counters,
-            &progress_app,
+            &|counters, current_path| {
+                emit_scan_progress(&progress_app, &drive_id, counters, current_path)
+            },
             &mut last_emit_at,
         ) {
             clear_scan_cancel(&drive_id);
@@ -2281,5 +2311,90 @@ mod tests {
         }
 
         assert_planned_moves_migrated(&database.0);
+    }
+
+    // A temporary folder standing in for a mounted volume.
+    struct TestVolume(PathBuf);
+
+    impl Drop for TestVolume {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_volume_system_folders_only_at_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database = TestDatabase::new("system-folders");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-volume-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+
+        for folder in [
+            ".Trashes/501",
+            ".Spotlight-V100/Store-V2",
+            ".fseventsd",
+            "$Recycle.Bin/S-1-5-21",
+            "System Volume Information",
+            "Video/.Trashes",
+        ] {
+            fs::create_dir_all(volume.0.join(folder)).unwrap();
+        }
+        fs::write(volume.0.join(".Trashes/501/deleted.mp4"), b"deleted").unwrap();
+        fs::write(volume.0.join("Video/film.mp4"), b"film").unwrap();
+        fs::write(volume.0.join("Video/.Trashes/kept.txt"), b"kept").unwrap();
+
+        // Spotlight's store is usually unreadable. It must not abort the scan.
+        let spotlight = volume.0.join(".Spotlight-V100");
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-SCAN", "Test");
+        let transaction = connection.transaction().unwrap();
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
+
+        let result = scan_directory(
+            &volume.0,
+            &mut insert,
+            "UUID-SCAN",
+            &mut counters,
+            &|_, _| {},
+            &mut Instant::now(),
+        );
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o755)).unwrap();
+        result.expect("system folders must not abort the scan");
+        drop(insert);
+
+        let paths: Vec<String> = transaction
+            .prepare("SELECT relative_path FROM files ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            [
+                "Video",
+                "Video/.Trashes",
+                "Video/.Trashes/kept.txt",
+                "Video/film.mp4"
+            ]
+        );
+
+        // Two files of 4 bytes, two folders, and nothing counted as skipped.
+        assert_eq!(counters, (2, 2, 8, 0));
     }
 }
