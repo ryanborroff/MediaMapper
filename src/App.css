@@ -684,12 +684,6 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   font-size: 13px;
   white-space: nowrap;
   cursor: pointer;
-  opacity: 0;
-}
-
-.file-row:hover .row-action button,
-.file-row:focus-within .row-action button,
-.row-action button:focus-visible {
   opacity: 1;
 }
 
@@ -2159,3 +2153,107 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 .transfer-file-progress .capacity-bar {
   margin-top: 0;
 }
+
+/* Compact add-to-plan composer */
+.compact-plan-panel {
+  margin-top: 18px;
+  padding: 18px 20px;
+}
+
+.compact-plan-panel .plan-move-heading {
+  align-items: flex-start;
+}
+
+.plan-file-summary {
+  max-width: 720px;
+  margin: 5px 0 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-plan-fields {
+  grid-template-columns: 1fr;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.compact-plan-fields label {
+  min-width: 0;
+}
+
+.compact-plan-fields select,
+.compact-plan-fields .folder-picker-button,
+.compact-plan-fields .folder-picker-readonly {
+  width: 100%;
+}
+
+.folder-picker-button {
+  min-width: 0;
+}
+
+.folder-picker-path {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-picker-choose {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
+.plan-destination-preview {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  font-size: 12px;
+}
+
+.plan-destination-preview > span {
+  color: var(--text-muted);
+}
+
+.plan-destination-preview > strong {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-plan-actions {
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.compact-plan-actions > span {
+  max-width: 70%;
+}
+
+@media (max-width: 760px) {
+  .plan-destination-preview {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .compact-plan-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .compact-plan-actions > span {
+    max-width: none;
+  }
+}
+
