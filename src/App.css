@@ -1160,3 +1160,74 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     padding: 24px 18px;
   }
 }
+
+
+/* Drives view: quiet, storage-first presentation */
+.app-navigation-shell {
+  min-height: calc(100vh - 32px);
+  margin: 16px auto;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .06);
+}
+
+.app-content .app-header {
+  margin-bottom: 32px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.app-content .section-block {
+  margin-top: 26px;
+}
+
+.app-content .drive-list {
+  gap: 10px;
+}
+
+.app-content .drive-card {
+  padding: 20px 22px;
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.app-content .drive-card.offline {
+  background: var(--surface-subtle);
+}
+
+.app-content .drive-title-row h3 {
+  margin-top: 6px;
+  font-size: 19px;
+}
+
+.app-content .drive-volume-name {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.app-content .capacity-summary {
+  margin-top: 16px;
+}
+
+.app-content .offline-details {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--divider);
+}
+
+.app-content .drive-label-button {
+  margin-top: 6px;
+}
+
+.app-content .section-empty {
+  padding: 18px 0;
+  color: var(--text-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-navigation-shell {
+    box-shadow: none;
+  }
+}
