@@ -1468,7 +1468,7 @@ function App() {
                   <div className="drive-actions">
                     <div className="button-row">
                       {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse catalogue</button>}
-                      <button className="scan-button" disabled={scanningId !== null || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
+                      <button className="scan-button" disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
                         {scanning ? "Scanning…" : catalogue ? "Rescan drive" : "Scan drive"}
                       </button>
                     </div>
@@ -1699,7 +1699,9 @@ function App() {
             const planReady =
               planValidation?.ready === true &&
               (planPreflight?.issues.length ?? 0) === 0;
-            const canCopy = planReady && fileMoveCount > 0 && !executingPlan;
+            // Copying and scanning never overlap: a scan holds the catalogue's
+            // write lock, so a copy could not record its own completion.
+            const canCopy = planReady && fileMoveCount > 0 && !executingPlan && scanningId === null;
 
             return (
               <div className="plan-copy">
@@ -1714,6 +1716,9 @@ function App() {
                         <span>
                           {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
                         </span>
+                      )}
+                      {scanningId !== null && (
+                        <span>Copying is available when the current scan finishes.</span>
                       )}
                     </div>
                     <button

@@ -418,10 +418,12 @@ fn resolve_transfer_paths(
     Ok((source, destination))
 }
 
-// Only one transfer runs at a time, across threads and across a second copy of
-// the app. The lock is an exclusive OS file lock on a file beside the
-// database. Closing the file releases it, and so does the process ending, so
-// a crash never leaves it held.
+// Only one transfer or drive scan runs at a time, across threads and across a
+// second copy of the app. A scan holds the database's write lock for its whole
+// run, so a transfer during a scan could copy and finalise a file but then fail
+// to record it, leaving a finished copy recorded as interrupted. The lock is an
+// exclusive OS file lock on a file beside the database. Closing the file
+// releases it, and so does the process ending, so a crash never leaves it held.
 struct TransferLock {
     _file: fs::File,
 }
@@ -600,7 +602,7 @@ fn execute_planned_transfer(
 ) -> Result<TransferRecord, String> {
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
-            "Another transfer is already running. Wait for it to finish, then try again."
+            "Another transfer or a drive scan is running. Wait for it to finish, then try again."
                 .to_string(),
         );
     };
@@ -649,12 +651,22 @@ fn execute_planned_transfer(
     execute_transfer_paths(connection, planned_move_id, &source, &destination)
 }
 
+// How long transfer bookkeeping waits for the database. Once a copy has been
+// finalised it must be recorded, so waiting out brief contention is far
+// better than failing. Transfers run on a background thread, so the wait
+// never freezes the window.
+const TRANSFER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
     source: &Path,
     destination: &Path,
 ) -> Result<TransferRecord, String> {
+    connection
+        .busy_timeout(TRANSFER_BUSY_TIMEOUT)
+        .map_err(|error| format!("Unable to configure transfer database: {error}"))?;
+
     let transfer = create_transfer_record(connection, planned_move_id)?;
 
     let temporary = match transfer_temporary_path(destination, transfer.id, transfer.created_at) {
@@ -688,18 +700,21 @@ fn execute_transfer_paths(
             let copied_bytes = i64::try_from(copied_bytes)
                 .map_err(|_| "Copied file is too large to record.".to_string())?;
 
+            // Recording the completion and clearing the plan happen together,
+            // so a finished copy never keeps an active plan item. The transfer
+            // record contains its own source/destination snapshot, so removing
+            // the plan does not remove execution history.
+            let completion = connection
+                .unchecked_transaction()
+                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
             update_transfer_status(
-                connection,
+                &completion,
                 transfer.id,
                 "completed",
                 Some(copied_bytes),
                 None,
             )?;
-
-            // A verified transfer is no longer an active plan item. The
-            // transfer record contains its own source/destination snapshot,
-            // so removing the plan does not remove execution history.
-            connection
+            completion
                 .execute(
                     "DELETE FROM planned_moves WHERE id = ?1",
                     params![planned_move_id],
@@ -707,6 +722,9 @@ fn execute_transfer_paths(
                 .map_err(|error| {
                     format!("Transfer completed, but the plan could not be cleared: {error}")
                 })?;
+            completion
+                .commit()
+                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
         }
         Err(error) => {
             // The transfer snapshot survives the failure and records why it
@@ -1989,6 +2007,12 @@ async fn scan_drive(
         }
 
         let mut connection = open_database(&database)?;
+        // Held for the whole scan, so no transfer can run until it finishes.
+        let Some(_transfer_lock) = try_lock_transfers(&connection)? else {
+            return Err(
+                "A transfer is running. Wait for it to finish, then scan the drive.".to_string(),
+            );
+        };
         let transaction = connection
             .transaction()
             .map_err(|error| format!("Unable to start catalogue transaction: {error}"))?;
@@ -5462,6 +5486,65 @@ mod tests {
     }
 
     #[test]
+    fn transfer_records_its_completion_despite_brief_database_contention() {
+        let database = TestDatabase::new("transfer-contention");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-contention-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("Archive/film.mov");
+        fs::write(&source, b"contents").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 8)",
+                [],
+            )
+            .unwrap();
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        // Another connection holds the write lock for longer than the normal
+        // two-second wait, as a short write elsewhere might.
+        let (locked, wait_for_lock) = std::sync::mpsc::channel();
+        let path = database.0.clone();
+        let holder = std::thread::spawn(move || {
+            let other = Connection::open(&path).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        wait_for_lock.recv().unwrap();
+
+        let transfer = execute_transfer_paths(&connection, move_id, &source, &destination)
+            .expect("the transfer waits out the contention instead of failing");
+        holder.join().unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        let planned: i64 = connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(planned, 0);
+    }
+
+    #[test]
     fn transfer_execution_copies_verifies_and_completes() {
         let database = TestDatabase::new("execute-transfer");
         let volume = TestVolume(std::env::temp_dir().join(format!(
@@ -6468,7 +6551,7 @@ mod tests {
         let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
             .unwrap_err();
         assert!(
-            error.contains("Another transfer is already running"),
+            error.contains("Another transfer or a drive scan is running"),
             "{error}"
         );
         assert!(list_transfer_records(&fixture.connection)
