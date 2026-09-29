@@ -1756,7 +1756,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 /* Keep transfer outcome text on deliberate lines. The previous 150px column
    caused words such as "verified" and the date to run together visually. */
 .transfer-history-new-row {
-  grid-template-columns: 26px minmax(0, 1fr) 80px 192px;
+  grid-template-columns: 26px minmax(0, 1fr) 80px 176px;
   column-gap: 16px;
 }
 
@@ -1769,6 +1769,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   justify-self: stretch;
   width: auto;
   padding-left: 22px;
+  padding-right: 0;
   border-left: 1px solid var(--divider);
 }
 
