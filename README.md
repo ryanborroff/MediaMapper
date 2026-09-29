@@ -24,4 +24,6 @@ npm run build                          # TypeScript check and frontend build
 cd src-tauri && cargo test --lib       # Rust tests
 ```
 
+CI runs these, plus `cargo fmt --check`, on every pull request and push to `main` ([workflow](.github/workflows/ci.yml)).
+
 The catalogue is a SQLite database at `~/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`.
