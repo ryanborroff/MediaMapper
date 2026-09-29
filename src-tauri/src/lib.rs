@@ -662,36 +662,52 @@ fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
     sync_drive_locations(&connection)
 }
 
+// Parses `diskutil info` output into its `Key: Value` pairs.
+fn parse_diskutil_info(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
+}
+
+fn parse_diskutil_bytes(value: Option<&String>) -> Option<u64> {
+    let value = value?;
+    if let Some((_, remainder)) = value.split_once('(') {
+        let digits: String = remainder
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+    }
+    value
+        .split_whitespace()
+        .next()?
+        .replace(',', "")
+        .parse()
+        .ok()
+}
+
+// Returns (total, available) bytes for a volume. "Disk Size" is the size of
+// the volume's partition, or of its container on APFS. APFS volumes share
+// their container's free space and report it only as "Container Free Space";
+// other filesystems report "Volume Free Space".
+fn diskutil_capacity(
+    info: &std::collections::HashMap<String, String>,
+) -> (Option<u64>, Option<u64>) {
+    (
+        parse_diskutil_bytes(info.get("Disk Size")),
+        parse_diskutil_bytes(
+            info.get("Volume Free Space")
+                .or_else(|| info.get("Container Free Space")),
+        ),
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn external_drives() -> Result<Vec<DriveInfo>, String> {
-    use std::collections::HashMap;
     use std::process::Command;
-
-    fn parse_info(text: &str) -> HashMap<String, String> {
-        text.lines()
-            .filter_map(|line| line.split_once(':'))
-            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-            .collect()
-    }
-
-    fn parse_bytes(value: Option<&String>) -> Option<u64> {
-        let value = value?;
-        if let Some((_, remainder)) = value.split_once('(') {
-            let digits: String = remainder
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if !digits.is_empty() {
-                return digits.parse().ok();
-            }
-        }
-        value
-            .split_whitespace()
-            .next()?
-            .replace(',', "")
-            .parse()
-            .ok()
-    }
 
     let volumes = Path::new("/Volumes");
     let entries =
@@ -713,7 +729,8 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
             _ => continue,
         };
 
-        let info = parse_info(&String::from_utf8_lossy(&output.stdout));
+        let info = parse_diskutil_info(&String::from_utf8_lossy(&output.stdout));
+        let (total_bytes, available_bytes) = diskutil_capacity(&info);
         if info.get("Device Location").map(String::as_str) == Some("Internal") {
             continue;
         }
@@ -745,8 +762,8 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
                 .get("File System Personality")
                 .or_else(|| info.get("Type (Bundle)"))
                 .cloned(),
-            total_bytes: parse_bytes(info.get("Disk Size")),
-            available_bytes: parse_bytes(info.get("Volume Free Space")),
+            total_bytes,
+            available_bytes,
             persistent_identifier: info
                 .get("Volume UUID")
                 .or_else(|| info.get("Disk / Partition UUID"))
@@ -2750,6 +2767,33 @@ mod tests {
         assert!(matches("émile.mov"));
         assert!(matches("CAFÉ_émile"));
         assert!(!matches("cafe emil x"));
+    }
+
+    #[test]
+    fn capacity_is_read_for_apfs_and_other_volumes() {
+        // Trimmed `diskutil info` output from real volumes.
+        let exfat = parse_diskutil_info(
+            "   File System Personality:   ExFAT
+   Disk Size:                 500.1 GB (500106788864 Bytes) (exactly 976771072 512-Byte-Units)
+   Volume Used Space:         94.4 GB (94447075328 Bytes) (exactly 184466944 512-Byte-Units) (18.9%)
+   Volume Free Space:         405.6 GB (405643067392 Bytes) (exactly 792271616 512-Byte-Units) (81.1%)",
+        );
+        assert_eq!(
+            diskutil_capacity(&exfat),
+            (Some(500_106_788_864), Some(405_643_067_392))
+        );
+
+        let apfs = parse_diskutil_info(
+            "   File System Personality:   APFS
+   Disk Size:                 494.4 GB (494384795648 Bytes) (exactly 965595304 512-Byte-Units)
+   Volume Used Space:         13.7 GB (13658537984 Bytes) (exactly 26676832 512-Byte-Units)
+   Container Total Space:     494.4 GB (494384795648 Bytes) (exactly 965595304 512-Byte-Units)
+   Container Free Space:      273.5 GB (273512333312 Bytes) (exactly 534203776 512-Byte-Units)",
+        );
+        assert_eq!(
+            diskutil_capacity(&apfs),
+            (Some(494_384_795_648), Some(273_512_333_312))
+        );
     }
 
     #[test]
