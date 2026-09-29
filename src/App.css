@@ -1450,3 +1450,183 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     color: var(--surface);
   }
 }
+
+
+/* Top-level Plan */
+.plan-empty {
+  padding: 52px 28px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+}
+
+.plan-empty h2 {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+
+.plan-empty p {
+  margin: 0 0 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.plan-overview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  margin-bottom: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--border);
+}
+
+.plan-overview > div {
+  display: grid;
+  gap: 5px;
+  padding: 16px 18px;
+  background: var(--surface);
+}
+
+.plan-overview span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.plan-overview strong {
+  font-size: 15px;
+}
+
+.plan-ready-text {
+  color: var(--green);
+}
+
+.plan-waiting-text {
+  color: var(--text);
+}
+
+.connect-instruction {
+  margin-bottom: 18px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.connect-instruction.ready {
+  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
+}
+
+.connect-instruction-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+
+.connect-instruction h2 {
+  margin: 7px 0 6px;
+  font-size: 20px;
+  letter-spacing: -.02em;
+}
+
+.connect-instruction p {
+  max-width: 660px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.plan-attention {
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--error-border);
+  border-radius: 12px;
+  background: var(--error-bg);
+  color: var(--error-text);
+  font-size: 13px;
+}
+
+.plan-attention ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.plan-file-list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.plan-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 100px 70px;
+  gap: 18px;
+  align-items: center;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.plan-file-row:last-child {
+  border-bottom: 0;
+}
+
+.plan-file-row > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.plan-review {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 18px;
+  padding: 18px 0;
+}
+
+.plan-review > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.plan-review span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.plan-confirmation-note {
+  margin: -8px 0 0;
+  padding: 12px 14px;
+  border-radius: 9px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 760px) {
+  .plan-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-file-row {
+    grid-template-columns: minmax(0, 1fr) 70px;
+  }
+
+  .plan-file-row .plan-remove-button {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+
+  .plan-review {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
