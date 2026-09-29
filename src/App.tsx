@@ -1318,7 +1318,7 @@ function App() {
       <section className="section-block">
         <div className="section-heading"><h2>Offline catalogue</h2><span>{offline.length}</span></div>
         {offline.length === 0 ? (
-          <div className="empty-state compact"><h3>No offline drives yet</h3><p>Scan a connected drive, then disconnect it. Its catalogue will remain here.</p></div>
+          <p className="section-empty">Scanned drives appear here when disconnected, and stay browsable.</p>
         ) : (
           <div className="drive-list">
             {offline.map((drive) => (
@@ -1413,8 +1413,12 @@ function App() {
       </section>}
 
       {catalogued.length > 0 && <section className="section-block">
-        <div className="section-heading">
-          <h2>Probable duplicates</h2>
+        <div className="section-heading"><h2>Tools</h2></div>
+        <div className="tool-row">
+          <div>
+            <h3>Probable duplicates</h3>
+            <p>Same filename and exact file size. Contents have not been compared.</p>
+          </div>
           <button
             className="section-action"
             onClick={() => void loadDuplicates()}
@@ -1423,7 +1427,6 @@ function App() {
             {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
           </button>
         </div>
-        <p className="section-description">Same filename and exact file size. Contents have not been compared.</p>
 
         {showDuplicates && <div className="search-results">
           {duplicateGroups.length === 0 ? (
@@ -1467,11 +1470,12 @@ function App() {
             })
           )}
         </div>}
-      </section>}
 
-      {catalogued.length > 0 && <section className="section-block">
-        <div className="section-heading">
-          <h2>Largest files</h2>
+        <div className="tool-row">
+          <div>
+            <h3>Largest files</h3>
+            <p>The 100 biggest files across every catalogued drive.</p>
+          </div>
           <button
             className="section-action"
             onClick={() => void loadLargestFiles()}
