@@ -180,10 +180,22 @@ struct PlannedMove {
     source_relative_path: String,
     source_name: String,
     source_size_bytes: Option<i64>,
-    destination_drive_id: String,
-    destination_drive_name: String,
+    destination_location_id: String,
+    destination_location_name: String,
     destination_relative_path: String,
     created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlannedFolderEntry {
+    move_id: i64,
+    source_drive_id: String,
+    source_drive_name: String,
+    source_relative_path: String,
+    name: String,
+    size_bytes: Option<i64>,
+    destination_relative_path: String,
 }
 
 fn now_unix() -> i64 {
@@ -1576,8 +1588,8 @@ fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String>
                 p.source_relative_path,
                 sf.name,
                 sf.size_bytes,
-                COALESCE(dl.drive_id, ''),
-                dl.display_name,
+                dl.id,
+                COALESCE(NULLIF(dl.user_label, ''), dl.display_name),
                 p.destination_relative_path,
                 p.created_at
          FROM planned_moves p
@@ -1605,8 +1617,8 @@ fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String>
                 source_relative_path,
                 source_name: row.get::<_, Option<String>>(4)?.unwrap_or(fallback_name),
                 source_size_bytes: row.get(5)?,
-                destination_drive_id: row.get(6)?,
-                destination_drive_name: row.get(7)?,
+                destination_location_id: row.get(6)?,
+                destination_location_name: row.get(7)?,
                 destination_relative_path: row.get(8)?,
                 created_at: row.get(9)?,
             })
@@ -1615,6 +1627,84 @@ fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String>
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to read planned move rows: {error}"))
+}
+
+#[tauri::command]
+fn list_planned_folder_entries(
+    app: tauri::AppHandle,
+    destination_location_id: String,
+    parent_path: String,
+) -> Result<Vec<PlannedFolderEntry>, String> {
+    if !parent_path.is_empty() {
+        validate_catalogue_relative_path(&parent_path)?;
+    }
+
+    let connection = open_database(&database_path(&app)?)?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                p.id,
+                p.source_drive_id,
+                sd.name,
+                p.source_relative_path,
+                sf.name,
+                sf.size_bytes,
+                p.destination_relative_path
+             FROM planned_moves p
+             JOIN drives sd
+               ON sd.persistent_identifier = p.source_drive_id
+             LEFT JOIN files sf
+               ON sf.drive_id = p.source_drive_id
+              AND sf.relative_path = p.source_relative_path
+             WHERE p.destination_location_id = ?1
+             ORDER BY lower(p.destination_relative_path)",
+        )
+        .map_err(|error| format!("Unable to query planned folder: {error}"))?;
+
+    let rows = statement
+        .query_map(params![destination_location_id], |row| {
+            let destination_relative_path: String = row.get(6)?;
+            let source_relative_path: String = row.get(3)?;
+            let stored_name: Option<String> = row.get(4)?;
+
+            let name = stored_name.unwrap_or_else(|| {
+                Path::new(&source_relative_path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&source_relative_path)
+                    .to_owned()
+            });
+
+            Ok(PlannedFolderEntry {
+                move_id: row.get(0)?,
+                source_drive_id: row.get(1)?,
+                source_drive_name: row.get(2)?,
+                source_relative_path,
+                name,
+                size_bytes: row.get(5)?,
+                destination_relative_path,
+            })
+        })
+        .map_err(|error| format!("Unable to read planned folder: {error}"))?;
+
+    let mut entries = Vec::new();
+
+    for row in rows {
+        let entry = row.map_err(|error| format!("Unable to read planned folder row: {error}"))?;
+
+        let destination_parent = Path::new(&entry.destination_relative_path)
+            .parent()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .replace('\\', "/");
+
+        if destination_parent == parent_path {
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -1649,6 +1739,7 @@ pub fn run() {
             add_local_folder_location,
             create_planned_move,
             list_planned_moves,
+            list_planned_folder_entries,
             remove_planned_move
         ])
         .run(tauri::generate_context!())

@@ -476,3 +476,50 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   color: #aaa;
   cursor: default;
 }
+
+/* M3 virtual organisation states. */
+.file-name {
+  display: flex;
+  align-items: flex-start;
+}
+
+.file-kind {
+  flex: 0 0 18px;
+  width: 18px;
+}
+
+.file-name-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.file-name-primary {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.planned-row-status {
+  display: block;
+  margin-top: 3px;
+  color: #9a6a16;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.moving-out-row {
+  background: #fffdf7;
+}
+
+.planned-arrival-row {
+  background: #fffaf0;
+  color: #555;
+}
+
+.planned-arrival-row .file-name {
+  font-weight: 500;
+}

@@ -92,10 +92,20 @@ type PlannedMove = {
   sourceRelativePath: string;
   sourceName: string;
   sourceSizeBytes: number | null;
-  destinationDriveId: string;
-  destinationDriveName: string;
+  destinationLocationId: string;
+  destinationLocationName: string;
   destinationRelativePath: string;
   createdAt: number;
+};
+
+type PlannedFolderEntry = {
+  moveId: number;
+  sourceDriveId: string;
+  sourceDriveName: string;
+  sourceRelativePath: string;
+  name: string;
+  sizeBytes: number | null;
+  destinationRelativePath: string;
 };
 
 function formatBytes(bytes: number | null) {
@@ -140,6 +150,7 @@ function App() {
   const [showDuplicates, setShowDuplicates] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
+  const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
   const [driveLabelDraft, setDriveLabelDraft] = useState("");
@@ -148,7 +159,6 @@ function App() {
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
   const [savingPlan, setSavingPlan] = useState(false);
-  const [planConfirmation, setPlanConfirmation] = useState<string | null>(null);
 
   const loadLocations = useCallback(async () => {
     try {
@@ -268,10 +278,18 @@ function App() {
     setBrowserLoading(true);
     setError(null);
     try {
-      setEntries(await invoke<CatalogueEntry[]>("list_catalogue_entries", {
-        persistentIdentifier: drive.persistentIdentifier,
-        parentPath: path,
-      }));
+      const [catalogueEntries, plannedEntries] = await Promise.all([
+        invoke<CatalogueEntry[]>("list_catalogue_entries", {
+          persistentIdentifier: drive.persistentIdentifier,
+          parentPath: path,
+        }),
+        invoke<PlannedFolderEntry[]>("list_planned_folder_entries", {
+          destinationLocationId: `drive:${drive.persistentIdentifier}`,
+          parentPath: path,
+        }),
+      ]);
+      setEntries(catalogueEntries);
+      setPlannedFolderEntries(plannedEntries);
     } catch (cause) {
       setError(String(cause));
       setEntries([]);
@@ -414,7 +432,6 @@ function App() {
 
   const beginPlanMove = (entry: CatalogueEntry) => {
     if (entry.isDirectory) return;
-    setPlanConfirmation(null);
     setSelectedPlanFile(entry);
     setPlanDestinationLocationId(
       browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
@@ -450,14 +467,8 @@ function App() {
         destinationRelativePath,
       });
       await loadPlannedMoves();
+      await openFolder(browserDrive, browserPath);
 
-      const destination = locations.find(
-        (location) => location.id === planDestinationLocationId,
-      );
-      const destinationName =
-        destination?.userLabel ?? destination?.displayName ?? "Destination";
-
-      setPlanConfirmation(`${destinationName} / ${destinationRelativePath}`);
       setSelectedPlanFile(null);
       setPlanDestinationFolder("");
     } catch (cause) {
@@ -575,10 +586,16 @@ function App() {
       planDestinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
       proposedDestinationPath === selectedPlanFile.relativePath;
 
+    const plannedMoveBySourcePath = new Map(
+      plannedMoves
+        .filter((move) => move.sourceDriveId === liveDrive.persistentIdentifier)
+        .map((move) => [move.sourceRelativePath, move]),
+    );
+
     return (
       <main className="app-shell browser-shell">
         <header className="browser-header">
-          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setSearchQuery(""); setSearchResults([]); }}>
+          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>
             Back to drives
           </button>
           <div className="browser-title-row">
@@ -613,12 +630,6 @@ function App() {
         </header>
 
         {error && <div className="notice error">{error}</div>}
-        {planConfirmation && (
-          <div className="notice" role="status">
-            Move planned → {planConfirmation}
-          </div>
-        )}
-
         {searchQuery.trim() && <section className="search-results" aria-live="polite">
           {searching ? <div className="browser-message">Searching catalogue…</div>
           : searchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
@@ -636,25 +647,61 @@ function App() {
           </div>
           {browserLoading ? (
             <div className="browser-message">Loading catalogue…</div>
-          ) : entries.length === 0 ? (
-            <div className="browser-message">This folder is empty in the catalogue.</div>
+          ) : entries.length === 0 && plannedFolderEntries.length === 0 ? (
+            <div className="browser-message">This folder is empty in the catalogue and plan.</div>
           ) : (
-            entries.map((entry) => (
-              <button
-                className={`file-row ${entry.isDirectory ? "folder-row" : "plannable-file-row"}`}
-                key={entry.relativePath}
-                onClick={() => entry.isDirectory
-                  ? void openFolder(liveDrive, entry.relativePath)
-                  : beginPlanMove(entry)}
-              >
-                <span className="file-name">
-                  <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
-                  {entry.name}
-                </span>
-                <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
-                <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
-              </button>
-            ))
+            <>
+              {entries.map((entry) => {
+                const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
+
+                return (
+                  <button
+                    className={`file-row ${entry.isDirectory ? "folder-row" : "plannable-file-row"} ${plannedMove ? "moving-out-row" : ""}`}
+                    key={entry.relativePath}
+                    onClick={() => entry.isDirectory
+                      ? void openFolder(liveDrive, entry.relativePath)
+                      : beginPlanMove(entry)}
+                  >
+                    <span className="file-name">
+                      <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+                      <span className="file-name-text">
+                        <span className="file-name-primary">{entry.name}</span>
+                        {plannedMove && (
+                          <span className="planned-row-status">
+                            Moving to {plannedMove.destinationLocationName}
+                          </span>
+                        )}
+                      </span>
+                    </span>
+                    <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
+                    <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
+                  </button>
+                );
+              })}
+
+              {plannedFolderEntries
+                .filter((planned) =>
+                  !entries.some((entry) => entry.relativePath === planned.destinationRelativePath),
+                )
+                .map((planned) => (
+                  <div
+                    className="file-row planned-arrival-row"
+                    key={`planned:${planned.moveId}`}
+                  >
+                    <span className="file-name">
+                      <span className="file-kind" aria-hidden="true" />
+                      <span className="file-name-text">
+                        <span className="file-name-primary">{planned.name}</span>
+                        <span className="planned-row-status">
+                          Moving here from {planned.sourceDriveName}
+                        </span>
+                      </span>
+                    </span>
+                    <span>Planned</span>
+                    <span>{formatBytes(planned.sizeBytes)}</span>
+                  </div>
+                ))}
+            </>
           )}
         </section>}
 
@@ -925,7 +972,7 @@ function App() {
                 <strong>{move.sourceName}</strong>
                 <span>{move.sourceDriveName} / {move.sourceRelativePath}</span>
                 <span className="planned-destination">
-                  Planned → {move.destinationDriveName} / {move.destinationRelativePath}
+                  Planned → {move.destinationLocationName} / {move.destinationRelativePath}
                 </span>
               </div>
               <span>{formatBytes(move.sourceSizeBytes)}</span>
