@@ -132,6 +132,34 @@ function waitForTypingPause() {
   return new Promise<void>((resolve) => window.setTimeout(resolve, SEARCH_DEBOUNCE_MS));
 }
 
+// Dot-files are system metadata (.Trashes, .Spotlight-V100, …) and are hidden
+// unless the user asks to see them.
+function isHiddenName(name: string) {
+  return name.startsWith(".");
+}
+
+function isHiddenPath(relativePath: string) {
+  return relativePath.split("/").some(isHiddenName);
+}
+
+function CapacitySummary({ totalBytes, availableBytes, atLastScan }: {
+  totalBytes: number | null;
+  availableBytes: number | null;
+  atLastScan?: boolean;
+}) {
+  if (totalBytes === null || availableBytes === null || totalBytes <= 0) return null;
+  const usedPercent = Math.min(100, Math.max(0, ((totalBytes - availableBytes) / totalBytes) * 100));
+  return (
+    <div className="capacity-summary">
+      <div className="capacity-text">
+        <strong>{formatBytes(availableBytes)} free</strong> of {formatBytes(totalBytes)}
+        {atLastScan && <span> at last scan</span>}
+      </div>
+      <div className="capacity-bar" aria-hidden="true"><span style={{ width: `${usedPercent}%` }} /></div>
+    </div>
+  );
+}
+
 function parentFolder(relativePath: string) {
   const separator = relativePath.lastIndexOf("/");
   return separator === -1 ? "" : relativePath.slice(0, separator);
@@ -176,6 +204,10 @@ function App() {
   const [searching, setSearching] = useState(false);
   const [libraryQuery, setLibraryQuery] = useState("");
   const [libraryResults, setLibraryResults] = useState<LibrarySearchResult[]>([]);
+  const [showHiddenItems, setShowHiddenItems] = useState(false);
+  const visibleLibraryResults = showHiddenItems
+    ? libraryResults
+    : libraryResults.filter((result) => !isHiddenPath(result.relativePath));
   const [librarySearching, setLibrarySearching] = useState(false);
   const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
   const [largestFilesLoading, setLargestFilesLoading] = useState(false);
@@ -706,21 +738,29 @@ function App() {
       );
     };
 
+    const visibleEntries = showHiddenItems
+      ? entries
+      : entries.filter((entry) => !isHiddenName(entry.name));
+    const visiblePlannedFolderEntries = showHiddenItems
+      ? plannedFolderEntries
+      : plannedFolderEntries.filter((planned) => !isHiddenName(planned.name));
+    const visibleSearchResults = showHiddenItems
+      ? searchResults
+      : searchResults.filter((entry) => !isHiddenPath(entry.relativePath));
+
     return (
       <main className="app-shell browser-shell">
         <header className="browser-header">
           <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>
             Back to drives
           </button>
-          <div className="browser-title-row">
-            <div>
-              <p className="eyebrow">{online ? "CONNECTED CATALOGUE" : "OFFLINE CATALOGUE"}</p>
-              <h1>{liveDriveName}</h1>
-              {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
+          <div className="browser-title">
+            <div className="browser-status">
+              <span className={online ? "status-dot" : "status-dot offline-dot"} />
+              <span className={online ? "online-label" : "offline-label"}>{online ? "CONNECTED" : "OFFLINE"}</span>
             </div>
-            <span className={online ? "browser-status online-label" : "browser-status offline-label"}>
-              {online ? "CONNECTED" : "OFFLINE"}
-            </span>
+            <h1>{liveDriveName}</h1>
+            {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
           </div>
           <nav className="breadcrumbs" aria-label="Folder path">
             <button onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
@@ -739,16 +779,20 @@ function App() {
               aria-label={`Search ${liveDriveName} catalogue`}
               onChange={(event) => void searchCatalogue(liveDrive, event.target.value)} />
             {searchQuery.trim() && <span className="search-summary">
-              {searching ? "Searching…" : `${searchResults.length}${searchResults.length === 200 ? "+" : ""} result${searchResults.length === 1 ? "" : "s"}`}
+              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} result${visibleSearchResults.length === 1 ? "" : "s"}`}
             </span>}
+            <label className="hidden-items-toggle">
+              <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
+              Show hidden items
+            </label>
           </div>
         </header>
 
         {error && <div className="notice error">{error}</div>}
         {searchQuery.trim() && <section className="search-results" aria-live="polite">
           {searching ? <div className="browser-message">Searching catalogue…</div>
-          : searchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-          : searchResults.map((entry) => <button className="search-result" key={entry.relativePath}
+          : visibleSearchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+          : visibleSearchResults.map((entry) => <button className="search-result" key={entry.relativePath}
               onClick={() => void openSearchResult(liveDrive, entry)}>
               <span className="search-result-main"><strong>{entry.name}</strong><span>{entry.relativePath}</span></span>
               <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
@@ -762,11 +806,11 @@ function App() {
           </div>
           {browserLoading ? (
             <div className="browser-message">Loading catalogue…</div>
-          ) : entries.length === 0 && plannedFolderEntries.length === 0 ? (
+          ) : visibleEntries.length === 0 && visiblePlannedFolderEntries.length === 0 ? (
             <div className="browser-message">This folder is empty in the catalogue and plan.</div>
           ) : (
             <>
-              {entries.map((entry) => {
+              {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
 
                 const openOrPlan = () => {
@@ -883,7 +927,7 @@ function App() {
                 );
               })}
 
-              {plannedFolderEntries
+              {visiblePlannedFolderEntries
                 .filter((planned) =>
                   !entries.some((entry) => entry.relativePath === planned.destinationRelativePath),
                 )
@@ -1051,21 +1095,25 @@ function App() {
             onChange={(event) => void searchLibrary(event.target.value)}
           />
           {libraryQuery.trim() && <span className="search-summary">
-            {librarySearching ? "Searching…" : `${libraryResults.length}${libraryResults.length === 200 ? "+" : ""} result${libraryResults.length === 1 ? "" : "s"}`}
+            {librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} result${visibleLibraryResults.length === 1 ? "" : "s"}`}
           </span>}
+          <label className="hidden-items-toggle">
+            <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
+            Show hidden items
+          </label>
         </div>
 
         {libraryQuery.trim() && <div className="search-results" aria-live="polite">
           {librarySearching ? <div className="browser-message">Searching all catalogues…</div>
-          : libraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-          : libraryResults.map((result) => <button
+          : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+          : visibleLibraryResults.map((result) => <button
               className="search-result"
               key={`${result.driveId}:${result.relativePath}`}
               onClick={() => void openLibraryResult(result)}
             >
               <span className="search-result-main">
                 <strong>{result.name}</strong>
-                <span>{result.driveName} / {result.relativePath}</span>
+                <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), result.relativePath)}</span>
               </span>
               <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
               <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
@@ -1122,7 +1170,6 @@ function App() {
                     })()}
                   </div>
                   <div className="drive-actions">
-                    <span className="capacity">{formatBytes(drive.totalBytes)}</span>
                     <div className="button-row">
                       {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse catalogue</button>}
                       <button className="scan-button" disabled={scanningId !== null || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
@@ -1131,8 +1178,8 @@ function App() {
                     </div>
                   </div>
                 </div>
+                <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} />
                 <dl className="drive-details offline-details">
-                  <div><dt>Available</dt><dd>{formatBytes(drive.availableBytes)}</dd></div>
                   <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                   <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
@@ -1210,12 +1257,12 @@ function App() {
                     })()}
                   </div>
                   <div className="drive-actions">
-                    <span className="capacity">{formatBytes(drive.totalBytes)}</span>
                     <div className="button-row">
                       <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
                     </div>
                   </div>
                 </div>
+                <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
                 <dl className="drive-details offline-details">
                   <div><dt>Files</dt><dd>{drive.fileCount.toLocaleString()}</dd></div>
                   <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
@@ -1304,7 +1351,7 @@ function App() {
                         onClick={() => void openDuplicateFile(file)}
                       >
                         <span className="search-result-main">
-                          <strong>{file.driveName}</strong>
+                          <strong>{driveDisplayName(file.driveId, file.driveName)}</strong>
                           <span>{file.relativePath}</span>
                         </span>
                         <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
@@ -1343,7 +1390,7 @@ function App() {
               >
                 <span className="search-result-main">
                   <strong>{file.name}</strong>
-                  <span>{file.driveName} / {file.relativePath}</span>
+                  <span>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), file.relativePath)}</span>
                 </span>
                 <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
                 <span>{formatBytes(file.sizeBytes)}</span>
