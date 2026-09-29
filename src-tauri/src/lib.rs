@@ -3779,6 +3779,35 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
     })
 }
 
+// Space kept free when copying into a folder on this Mac, so a copy can never
+// fill the startup disk, which can leave macOS unstable.
+const LOCAL_FOLDER_FREE_SPACE_RESERVE: u64 = 1024 * 1024 * 1024;
+
+// Free bytes on the volume holding `path`, as `df` reports them.
+fn free_bytes_at(path: &Path) -> Result<u64, String> {
+    let output = std::process::Command::new("/bin/df")
+        .args(["-k", "-P"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Unable to check free space: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Unable to check free space at {}.", path.display()));
+    }
+    parse_df_available(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| format!("Unable to read free space at {}.", path.display()))
+}
+
+// Reads the available space from `df -k -P` output. The value sits just
+// before the capacity percentage; counting from there copes with filesystem
+// names that contain spaces.
+fn parse_df_available(text: &str) -> Option<u64> {
+    let line = text.lines().nth(1)?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let capacity = fields.iter().position(|field| field.ends_with('%'))?;
+    let kilobytes: u64 = fields.get(capacity.checked_sub(1)?)?.parse().ok()?;
+    kilobytes.checked_mul(1024)
+}
+
 fn validate_plan_live(
     connection: &Connection,
     connected_drives: &[DriveInfo],
@@ -4033,21 +4062,42 @@ fn validate_plan_live(
         }
     }
 
-    // Capacity is checked once per external destination using current diskutil
-    // free space, rather than the value stored at the last catalogue scan.
+    // Capacity is checked once per destination using current free space,
+    // rather than the value stored at the last catalogue scan: diskutil for
+    // external drives, df for folders on this Mac.
     let preflight = plan_preflight(connection)?;
     for destination in &preflight.destinations {
-        if destination.kind != "external_drive" {
-            continue;
-        }
-
-        let drive_id = destination
-            .location_id
-            .strip_prefix("drive:")
-            .unwrap_or(&destination.location_id);
-
-        let Some(drive) = connected_by_id.get(drive_id) else {
-            continue;
+        let local_folder = destination.kind == "local_folder";
+        let available = match destination.kind.as_str() {
+            "external_drive" => {
+                let drive_id = destination
+                    .location_id
+                    .strip_prefix("drive:")
+                    .unwrap_or(&destination.location_id);
+                let Some(drive) = connected_by_id.get(drive_id) else {
+                    continue;
+                };
+                drive.available_bytes
+            }
+            "local_folder" => {
+                let local_path: Option<String> = connection
+                    .query_row(
+                        "SELECT local_path FROM locations WHERE id = ?1",
+                        params![destination.location_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Unable to read destination folder: {error}"))?
+                    .flatten();
+                // A missing folder is reported by its own check above.
+                let Some(local_path) = local_path else {
+                    continue;
+                };
+                free_bytes_at(Path::new(&local_path))
+                    .ok()
+                    .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
+            }
+            _ => continue,
         };
 
         if destination.unknown_size_count > 0 {
@@ -4060,14 +4110,21 @@ fn validate_plan_live(
                 move_id: None,
                 location_id: Some(destination.location_id.clone()),
             });
-        } else if let Some(available) = drive.available_bytes {
+        } else if let Some(available) = available {
             if destination.known_bytes as u64 > available {
                 issues.push(PlanPreflightIssue {
                     code: "live_insufficient_capacity".to_string(),
-                    message: format!(
-                        "{} does not currently have enough free space for the planned data.",
-                        destination.display_name
-                    ),
+                    message: if local_folder {
+                        format!(
+                            "{} does not currently have enough free space for the planned data while keeping 1 GB free on this Mac.",
+                            destination.display_name
+                        )
+                    } else {
+                        format!(
+                            "{} does not currently have enough free space for the planned data.",
+                            destination.display_name
+                        )
+                    },
                     move_id: None,
                     location_id: Some(destination.location_id.clone()),
                 });
@@ -6468,6 +6525,103 @@ mod tests {
             .unwrap();
         assert_eq!(planned, 1, "a cancelled copy stays planned");
         let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn df_available_space_is_read_from_before_the_capacity_column() {
+        let apfs = "Filesystem   1024-blocks      Used Available Capacity  Mounted on
+/dev/disk3s5   482797652 196612856 260423516    44%    /System/Volumes/Data";
+        assert_eq!(parse_df_available(apfs), Some(260_423_516 * 1024));
+
+        // A filesystem name with spaces does not shift the columns read.
+        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on
+map auto_home 0 0 0 100% /System/Volumes/Data/home";
+        assert_eq!(parse_df_available(spaced), Some(0));
+
+        assert_eq!(parse_df_available("Filesystem\nnot a df line"), None);
+
+        assert!(free_bytes_at(&std::env::temp_dir()).unwrap() > 0);
+    }
+
+    #[test]
+    fn copies_into_a_folder_on_this_mac_check_its_free_space() {
+        let database = TestDatabase::new("local-space");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-space-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let folder = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-space-folder-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        for path in [&source_volume.0, &folder.0] {
+            let _ = fs::remove_dir_all(path);
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source_volume.0.join("small.mov"), b"small").unwrap();
+        let modified_at = system_time_unix(
+            fs::metadata(source_volume.0.join("small.mov"))
+                .unwrap()
+                .modified(),
+        );
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Media', ?1, 0)",
+                params![folder.0.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES ('UUID-A', 'small.mov', 'small.mov', '', 0, 5, ?1),
+                        ('UUID-A', 'huge.mov', 'huge.mov', '', 0, 1000000000000000000, ?1)",
+                params![modified_at],
+            )
+            .unwrap();
+        let drives = vec![test_drive("UUID-A", "Source", &source_volume.0, 10_000)];
+        let capacity_issues = |connection: &Connection| {
+            validate_plan_live(connection, &drives)
+                .unwrap()
+                .issues
+                .into_iter()
+                .filter(|issue| issue.code == "live_insufficient_capacity")
+                .collect::<Vec<_>>()
+        };
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "small.mov",
+            "local:test",
+            "small.mov",
+        )
+        .unwrap();
+        assert!(capacity_issues(&connection).is_empty());
+
+        // An exabyte cannot fit on this Mac.
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "huge.mov",
+            "local:test",
+            "huge.mov",
+        )
+        .unwrap();
+        let issues = capacity_issues(&connection);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].location_id.as_deref(), Some("local:test"));
+        assert!(
+            issues[0].message.contains("keeping 1 GB free"),
+            "{}",
+            issues[0].message
+        );
     }
 
     #[test]
