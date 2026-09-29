@@ -613,17 +613,28 @@ function App() {
     };
 
     const movingFromLabel = (planned: PlannedFolderEntry) => {
-      const sourceFolder = parentFolder(planned.sourceRelativePath);
+      // Projected children of a planned folder move should describe the
+      // original location of the moved folder, not repeat each child's
+      // increasingly long source path.
+      const rootMove = plannedMoves.find((move) => move.id === planned.moveId);
+      const sourceRelativePath =
+        rootMove?.sourceRelativePath ?? planned.sourceRelativePath;
+      const sourceDriveId =
+        rootMove?.sourceDriveId ?? planned.sourceDriveId;
+      const sourceDriveName =
+        rootMove?.sourceDriveName ?? planned.sourceDriveName;
+
+      const sourceFolder = parentFolder(sourceRelativePath);
       const sameLocation =
-        planned.sourceDriveId === liveDrive.persistentIdentifier;
+        sourceDriveId === liveDrive.persistentIdentifier;
 
       if (sameLocation) {
         return sourceFolder || liveDrive.name;
       }
 
       return sourceFolder
-        ? `${planned.sourceDriveName} / ${sourceFolder}`
-        : planned.sourceDriveName;
+        ? `${sourceDriveName} / ${sourceFolder}`
+        : sourceDriveName;
     };
 
     return (
