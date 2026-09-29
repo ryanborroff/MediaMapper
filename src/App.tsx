@@ -1301,48 +1301,61 @@ function App() {
       : searchResults.filter((entry) => !isHiddenPath(entry.relativePath));
 
     return (
-      <main className="app-shell browser-shell">
-        <header className="browser-header">
-          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>
-            Back to drives
-          </button>
-          <div className="browser-title">
-            <div className="browser-status">
-              <span className={online ? "status-dot" : "status-dot offline-dot"} />
-              <span className={online ? "online-label" : "offline-label"}>{online ? "CONNECTED" : "OFFLINE"}</span>
+      <main className="app-navigation-shell">
+        <aside className="app-sidebar">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("browse"); }}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content browse-detail">
+          <header className="app-header browse-detail-header">
+            <div>
+              <p className="eyebrow">BROWSE</p>
+              <nav className="browse-detail-breadcrumb" aria-label="Browse path">
+                <button type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>All files</button>
+                <span>/</span>
+                <button type="button" className={pathParts.length === 0 ? "current" : undefined} onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
+                {pathParts.map((part, index) => {
+                  const path = pathParts.slice(0, index + 1).join("/");
+                  const current = index === pathParts.length - 1;
+                  return (
+                    <span className="browse-detail-crumb" key={path}>
+                      <span>/</span>
+                      {current
+                        ? <span className="current">{part}</span>
+                        : <button type="button" onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
+                    </span>
+                  );
+                })}
+              </nav>
+              <h1>{pathParts.length > 0 ? pathParts[pathParts.length - 1] : liveDriveName}</h1>
+              {pathParts.length === 0 && liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
             </div>
-            <h1>{liveDriveName}</h1>
-            {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
-          </div>
-          {/* At the drive root the breadcrumb would only repeat the title. */}
-          {pathParts.length > 0 && <nav className="breadcrumbs" aria-label="Folder path">
-            <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, ""); }}>{liveDriveName}</button>
-            {pathParts.map((part, index) => {
-              const path = pathParts.slice(0, index + 1).join("/");
-              const current = index === pathParts.length - 1;
-              return (
-                <span key={path}>
-                  <span className="crumb-separator">/</span>
-                  {current
-                    ? <span className="crumb-current" aria-current="page">{part}</span>
-                    : <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, path); }}>{part}</button>}
-                </span>
-              );
-            })}
-          </nav>}
-          <div className="catalogue-search">
-            <input type="search" value={searchQuery} placeholder={`Search ${liveDriveName}`}
-              aria-label={`Search ${liveDriveName} catalogue`}
-              onChange={(event) => void searchCatalogue(liveDrive, event.target.value)} />
-            {searchQuery.trim() && <span className="search-summary">
-              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} result${visibleSearchResults.length === 1 ? "" : "s"}`}
-            </span>}
+          </header>
+
+          <section className="browse-search-block browse-detail-search">
+            <input
+              className="browse-global-search"
+              type="search"
+              value={searchQuery}
+              placeholder={`Search ${liveDriveName}`}
+              aria-label={`Search ${liveDriveName}`}
+              onChange={(event) => void searchCatalogue(liveDrive, event.target.value)}
+            />
             <label className="hidden-items-toggle">
               <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
               Show hidden items
             </label>
-          </div>
-        </header>
+          </section>
+          {searchQuery.trim() && (
+            <div className="browse-results-heading">
+              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} results`}
+            </div>
+          )}
 
         {error && <div className="notice error">{error}</div>}
         {searchQuery.trim() && <section className="file-browser" aria-live="polite">
@@ -1652,9 +1665,7 @@ function App() {
           </div>
         </section>}
 
-        <footer className="safety-note">
-          This view comes from Media Mapper's local catalogue. Search and browsing do not read the drive.
-        </footer>
+        </div>
       </main>
     );
   }
