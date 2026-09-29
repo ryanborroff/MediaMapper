@@ -1371,92 +1371,106 @@ async fn search_all_catalogues(
     .await
 }
 
+// Groups files with the same name (ignoring case) and exact size, largest
+// potential saving first, and lists every copy.
+//
+// This used to run one query per group, and each of those read the whole
+// files table because lower(name) cannot use an index: 101 full scans. Here
+// the top groups are found once, then matched against the files in a single
+// pass. CROSS JOIN makes SQLite scan files once and look each row up in the
+// small groups table, instead of scanning files once per group.
+fn find_probable_duplicates(connection: &Connection) -> Result<Vec<DuplicateGroup>, String> {
+    let mut statement = connection
+        .prepare(
+            "WITH duplicate_groups AS MATERIALIZED (
+                SELECT lower(name) AS name_key,
+                       size_bytes,
+                       MIN(name) AS display_name,
+                       COUNT(*) AS copies
+                FROM files
+                WHERE is_directory = 0
+                  AND size_bytes IS NOT NULL
+                  AND size_bytes > 0
+                GROUP BY lower(name), size_bytes
+                HAVING COUNT(*) > 1
+                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
+                         size_bytes DESC,
+                         lower(MIN(name))
+                LIMIT 100
+             )
+             SELECT g.name_key,
+                    g.size_bytes,
+                    g.display_name,
+                    g.copies,
+                    f.drive_id,
+                    d.name,
+                    f.relative_path,
+                    f.name,
+                    f.modified_at
+             FROM files f
+             CROSS JOIN duplicate_groups g
+             JOIN drives d ON d.persistent_identifier = f.drive_id
+             WHERE f.is_directory = 0
+               AND f.size_bytes = g.size_bytes
+               AND lower(f.name) = g.name_key
+             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
+                      g.size_bytes DESC,
+                      lower(g.display_name),
+                      g.name_key,
+                      lower(d.name),
+                      lower(f.relative_path)",
+        )
+        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                DuplicateFile {
+                    drive_id: row.get(4)?,
+                    drive_name: row.get(5)?,
+                    relative_path: row.get(6)?,
+                    name: row.get(7)?,
+                    size_bytes: row.get(1)?,
+                    modified_at: row.get(8)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("Unable to read probable duplicates: {error}"))?;
+
+    // Rows arrive grouped and in display order, so each group is a run.
+    let mut results: Vec<DuplicateGroup> = Vec::new();
+    let mut current_key: Option<(String, i64)> = None;
+    for row in rows {
+        let (name_key, size_bytes, display_name, copies, file) =
+            row.map_err(|error| format!("Unable to read probable duplicate rows: {error}"))?;
+        let key = (name_key, size_bytes);
+        if current_key.as_ref() != Some(&key) {
+            results.push(DuplicateGroup {
+                name: display_name,
+                size_bytes,
+                copies,
+                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+                files: Vec::new(),
+            });
+            current_key = Some(key);
+        }
+        if let Some(group) = results.last_mut() {
+            group.files.push(file);
+        }
+    }
+
+    Ok(results)
+}
+
 #[tauri::command]
 async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
     run_blocking(move || {
         let connection = open_database(&database_path(&app)?)?;
-
-        let mut groups_statement = connection
-            .prepare(
-                "SELECT MIN(f.name) AS display_name,
-                        f.size_bytes,
-                        COUNT(*) AS copies
-                 FROM files f
-                 WHERE f.is_directory = 0
-                   AND f.size_bytes IS NOT NULL
-                   AND f.size_bytes > 0
-                 GROUP BY lower(f.name), f.size_bytes
-                 HAVING COUNT(*) > 1
-                 ORDER BY (f.size_bytes * (COUNT(*) - 1)) DESC,
-                          f.size_bytes DESC,
-                          lower(MIN(f.name))
-                 LIMIT 100",
-            )
-            .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
-
-        let group_rows = groups_statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|error| format!("Unable to read probable duplicate groups: {error}"))?;
-
-        let groups = group_rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read probable duplicate group rows: {error}"))?;
-
-        let mut file_statement = connection
-            .prepare(
-                "SELECT f.drive_id,
-                        d.name,
-                        f.relative_path,
-                        f.name,
-                        f.size_bytes,
-                        f.modified_at
-                 FROM files f
-                 JOIN drives d ON d.persistent_identifier = f.drive_id
-                 WHERE f.is_directory = 0
-                   AND lower(f.name) = lower(?1)
-                   AND f.size_bytes = ?2
-                 ORDER BY lower(d.name), lower(f.relative_path)",
-            )
-            .map_err(|error| {
-                format!("Unable to prepare probable duplicate files query: {error}")
-            })?;
-
-        let mut results = Vec::with_capacity(groups.len());
-
-        for (name, size_bytes, copies) in groups {
-            let file_rows = file_statement
-                .query_map(params![&name, size_bytes], |row| {
-                    Ok(DuplicateFile {
-                        drive_id: row.get(0)?,
-                        drive_name: row.get(1)?,
-                        relative_path: row.get(2)?,
-                        name: row.get(3)?,
-                        size_bytes: row.get(4)?,
-                        modified_at: row.get(5)?,
-                    })
-                })
-                .map_err(|error| format!("Unable to read probable duplicate files: {error}"))?;
-
-            let files = file_rows
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Unable to read probable duplicate file rows: {error}"))?;
-
-            results.push(DuplicateGroup {
-                name,
-                size_bytes,
-                copies,
-                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
-                files,
-            });
-        }
-
-        Ok(results)
+        find_probable_duplicates(&connection)
     })
     .await
 }
@@ -2793,6 +2807,72 @@ mod tests {
         assert_eq!(
             diskutil_capacity(&apfs),
             (Some(494_384_795_648), Some(273_512_333_312))
+        );
+    }
+
+    #[test]
+    fn probable_duplicates_are_grouped_by_name_ignoring_case_and_size() {
+        let database = TestDatabase::new("duplicates");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-B', 'x/film.MP4', 'film.MP4', 'x', 0, 100),
+                        ('UUID-A', 'Film.mp4', 'Film.mp4', '', 0, 100),
+                        ('UUID-B', 'Film.mp4', 'Film.mp4', '', 0, 50),
+                        ('UUID-A', 'clip.mov', 'clip.mov', '', 0, 10),
+                        ('UUID-A', 'sub/clip.mov', 'clip.mov', 'sub', 0, 10),
+                        ('UUID-A', 'sub/clip2.mov', 'clip2.mov', 'sub', 0, 10),
+                        ('UUID-A', 'empty.txt', 'empty.txt', '', 0, 0),
+                        ('UUID-B', 'empty.txt', 'empty.txt', '', 0, 0),
+                        ('UUID-A', 'sub', 'sub', '', 1, NULL),
+                        ('UUID-B', 'sub', 'sub', '', 1, NULL);",
+            )
+            .unwrap();
+
+        let groups = find_probable_duplicates(&connection).unwrap();
+        let summary: Vec<(String, i64, i64, i64, Vec<String>)> = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name.clone(),
+                    group.size_bytes,
+                    group.copies,
+                    group.potential_wasted_bytes,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        // Largest saving first; each group lists copies by drive, then path.
+        // Different sizes, empty files and folders are never duplicates.
+        assert_eq!(
+            summary,
+            [
+                (
+                    "Film.mp4".to_string(),
+                    100,
+                    2,
+                    100,
+                    vec!["Alpha:Film.mp4".to_string(), "Beta:x/film.MP4".to_string()]
+                ),
+                (
+                    "clip.mov".to_string(),
+                    10,
+                    2,
+                    10,
+                    vec![
+                        "Alpha:clip.mov".to_string(),
+                        "Alpha:sub/clip.mov".to_string()
+                    ]
+                ),
+            ]
         );
     }
 
