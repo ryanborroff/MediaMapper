@@ -2082,10 +2082,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   padding: 12px 14px;
 }
 .folder-picker-header { border-bottom: 1px solid var(--divider); }
-.folder-picker-header > div { display: flex; flex-direction: column; gap: 2px; }
 .folder-picker-header strong { font-size: 13px; font-weight: 650; }
-.folder-picker-header span,
-.folder-picker-footer > span { color: var(--text-muted); font-size: 12px; }
 .folder-picker-header > button {
   border: 0;
   background: transparent;
@@ -2112,7 +2109,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   font: inherit;
   cursor: pointer;
 }
-.folder-picker-list { max-height: 190px; overflow-y: auto; }
+.folder-picker-list { max-height: 132px; overflow-y: auto; }
 .folder-picker-list > button {
   display: flex;
   width: 100%;
@@ -2135,12 +2132,9 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   font-size: 13px;
   text-align: center;
 }
-.folder-picker-footer { border-top: 1px solid var(--divider); }
-.folder-picker-footer > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.folder-picker-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--divider);
 }
 
 /* The file being copied: bytes done and a bar, first for copying and then
