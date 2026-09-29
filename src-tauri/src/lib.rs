@@ -251,6 +251,170 @@ struct PlanLiveValidation {
     issues: Vec<PlanPreflightIssue>,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct TransferRecord {
+    id: i64,
+    planned_move_id: Option<i64>,
+    source_drive_id: String,
+    source_relative_path: String,
+    destination_location_id: String,
+    destination_relative_path: String,
+    total_bytes: Option<i64>,
+    copied_bytes: i64,
+    status: String,
+    error_message: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+}
+
+fn read_transfer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRecord> {
+    Ok(TransferRecord {
+        id: row.get(0)?,
+        planned_move_id: row.get(1)?,
+        source_drive_id: row.get(2)?,
+        source_relative_path: row.get(3)?,
+        destination_location_id: row.get(4)?,
+        destination_relative_path: row.get(5)?,
+        total_bytes: row.get(6)?,
+        copied_bytes: row.get(7)?,
+        status: row.get(8)?,
+        error_message: row.get(9)?,
+        created_at: row.get(10)?,
+        started_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+fn create_transfer_record(
+    connection: &Connection,
+    planned_move_id: i64,
+) -> Result<TransferRecord, String> {
+    let planned: Option<(String, String, String, String, Option<i64>)> = connection
+        .query_row(
+            "SELECT
+                p.source_drive_id,
+                p.source_relative_path,
+                p.destination_location_id,
+                p.destination_relative_path,
+                f.size_bytes
+             FROM planned_moves p
+             LEFT JOIN files f
+               ON f.drive_id = p.source_drive_id
+              AND f.relative_path = p.source_relative_path
+             WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read planned move for transfer: {error}"))?;
+
+    let Some((
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_relative_path,
+        total_bytes,
+    )) = planned
+    else {
+        return Err("The planned move no longer exists.".to_string());
+    };
+
+    let created_at = now_unix();
+
+    connection
+        .execute(
+            "INSERT INTO transfers (
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'pending', ?7)",
+            params![
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                created_at
+            ],
+        )
+        .map_err(|error| format!("Unable to create transfer record: {error}"))?;
+
+    let id = connection.last_insert_rowid();
+
+    connection
+        .query_row(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             WHERE id = ?1",
+            params![id],
+            read_transfer,
+        )
+        .map_err(|error| format!("Unable to read created transfer: {error}"))
+}
+
+fn list_transfer_records(connection: &Connection) -> Result<Vec<TransferRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                id,
+                planned_move_id,
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                total_bytes,
+                copied_bytes,
+                status,
+                error_message,
+                created_at,
+                started_at,
+                completed_at
+             FROM transfers
+             ORDER BY created_at DESC, id DESC",
+        )
+        .map_err(|error| format!("Unable to query transfers: {error}"))?;
+
+    let rows = statement
+        .query_map([], read_transfer)
+        .map_err(|error| format!("Unable to read transfers: {error}"))?;
+
+    let transfers = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read transfer rows: {error}"))?;
+
+    Ok(transfers)
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -693,6 +857,45 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| format!("Unable to commit planned move migration: {error}"))?;
         }
     }
+
+    // Transfers are an execution record, not part of the plan itself.
+    // Source and destination values are snapshotted so transfer history remains
+    // meaningful even if the corresponding planned move is later changed or
+    // removed.
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                planned_move_id INTEGER,
+                source_drive_id TEXT NOT NULL,
+                source_relative_path TEXT NOT NULL,
+                destination_location_id TEXT NOT NULL,
+                destination_relative_path TEXT NOT NULL,
+                total_bytes INTEGER,
+                copied_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL
+                    CHECK(status IN (
+                        'pending',
+                        'copying',
+                        'verifying',
+                        'completed',
+                        'failed'
+                    )),
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transfers_status
+                ON transfers(status);
+
+            CREATE INDEX IF NOT EXISTS idx_transfers_created
+                ON transfers(created_at);
+            ",
+        )
+        .map_err(|error| format!("Unable to initialise transfer schema: {error}"))?;
 
     Ok(())
 }
@@ -4150,6 +4353,213 @@ mod tests {
             "{:?}",
             result.issues
         );
+    }
+
+    #[test]
+    fn creates_transfer_from_planned_move_snapshot() {
+        let database = TestDatabase::new("create-transfer");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 987)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = create_transfer_record(&connection, move_id).unwrap();
+
+        assert_eq!(transfer.planned_move_id, Some(move_id));
+        assert_eq!(transfer.source_drive_id, "UUID-A");
+        assert_eq!(transfer.source_relative_path, "film.mov");
+        assert_eq!(transfer.destination_location_id, "drive:UUID-B");
+        assert_eq!(transfer.destination_relative_path, "Archive/film.mov");
+        assert_eq!(transfer.total_bytes, Some(987));
+        assert_eq!(transfer.copied_bytes, 0);
+        assert_eq!(transfer.status, "pending");
+        assert_eq!(transfer.error_message, None);
+    }
+
+    #[test]
+    fn transfer_snapshot_survives_plan_removal() {
+        let database = TestDatabase::new("transfer-snapshot");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 123)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let transfer = create_transfer_record(&connection, move_id).unwrap();
+
+        connection
+            .execute("DELETE FROM planned_moves WHERE id = ?1", params![move_id])
+            .unwrap();
+
+        let records = list_transfer_records(&connection).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, transfer.id);
+        assert_eq!(records[0].source_relative_path, "film.mov");
+        assert_eq!(records[0].destination_relative_path, "Archive/film.mov");
+        assert_eq!(records[0].status, "pending");
+    }
+
+    #[test]
+    fn creating_transfer_requires_existing_planned_move() {
+        let database = TestDatabase::new("missing-transfer-plan");
+        let connection = open_database(&database.0).unwrap();
+
+        let error = create_transfer_record(&connection, 999).unwrap_err();
+
+        assert!(error.contains("planned move no longer exists"), "{error}");
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn transfer_schema_persists_execution_snapshot() {
+        let database = TestDatabase::new("transfer-schema");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    planned_move_id,
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    copied_bytes,
+                    status,
+                    created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    42_i64,
+                    "UUID-A",
+                    "Films/film.mov",
+                    "drive:UUID-B",
+                    "Archive/film.mov",
+                    1234_i64,
+                    0_i64,
+                    "pending",
+                    100_i64
+                ],
+            )
+            .unwrap();
+
+        let transfer = connection
+            .query_row(
+                "SELECT
+                    id,
+                    planned_move_id,
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    copied_bytes,
+                    status,
+                    error_message,
+                    created_at,
+                    started_at,
+                    completed_at
+                 FROM transfers",
+                [],
+                |row| {
+                    Ok(TransferRecord {
+                        id: row.get(0)?,
+                        planned_move_id: row.get(1)?,
+                        source_drive_id: row.get(2)?,
+                        source_relative_path: row.get(3)?,
+                        destination_location_id: row.get(4)?,
+                        destination_relative_path: row.get(5)?,
+                        total_bytes: row.get(6)?,
+                        copied_bytes: row.get(7)?,
+                        status: row.get(8)?,
+                        error_message: row.get(9)?,
+                        created_at: row.get(10)?,
+                        started_at: row.get(11)?,
+                        completed_at: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap();
+
+        assert_eq!(transfer.planned_move_id, Some(42));
+        assert_eq!(transfer.source_drive_id, "UUID-A");
+        assert_eq!(transfer.source_relative_path, "Films/film.mov");
+        assert_eq!(transfer.destination_location_id, "drive:UUID-B");
+        assert_eq!(transfer.destination_relative_path, "Archive/film.mov");
+        assert_eq!(transfer.total_bytes, Some(1234));
+        assert_eq!(transfer.copied_bytes, 0);
+        assert_eq!(transfer.status, "pending");
+        assert_eq!(transfer.error_message, None);
+        assert_eq!(transfer.created_at, 100);
+        assert_eq!(transfer.started_at, None);
+        assert_eq!(transfer.completed_at, None);
+    }
+
+    #[test]
+    fn transfer_schema_rejects_invalid_status() {
+        let database = TestDatabase::new("transfer-status");
+        let connection = open_database(&database.0).unwrap();
+
+        let result = connection.execute(
+            "INSERT INTO transfers (
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                status,
+                created_at
+             ) VALUES ('UUID-A', 'film.mov', 'drive:UUID-B', 'film.mov', 'deleted', 100)",
+            [],
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
