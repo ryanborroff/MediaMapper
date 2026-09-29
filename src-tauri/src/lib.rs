@@ -1,7 +1,7 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -210,6 +210,38 @@ struct PlannedFolderEntry {
     // A folder that exists only in the plan: some planned destination sits
     // inside it, but it is not in the catalogue. It has no single source move.
     is_new_folder: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflightDestination {
+    location_id: String,
+    display_name: String,
+    kind: String,
+    move_count: i64,
+    known_bytes: i64,
+    unknown_size_count: i64,
+    available_bytes: Option<i64>,
+    projected_available_bytes: Option<i64>,
+    capacity_sufficient: Option<bool>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflightIssue {
+    code: String,
+    message: String,
+    move_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanPreflight {
+    move_count: i64,
+    known_bytes: i64,
+    unknown_size_count: i64,
+    destinations: Vec<PlanPreflightDestination>,
+    issues: Vec<PlanPreflightIssue>,
 }
 
 fn now_unix() -> i64 {
@@ -2060,6 +2092,257 @@ async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, S
     .await
 }
 
+#[derive(Debug)]
+struct PreflightMove {
+    id: i64,
+    source_drive_id: String,
+    source_relative_path: String,
+    destination_location_id: String,
+    destination_display_name: Option<String>,
+    destination_kind: Option<String>,
+    destination_available_bytes: Option<i64>,
+}
+
+fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
+    let moves = {
+        let mut statement = connection
+            .prepare(
+                "SELECT p.id,
+                        p.source_drive_id,
+                        p.source_relative_path,
+                        p.destination_location_id,
+                        COALESCE(NULLIF(l.user_label, ''), l.display_name),
+                        l.kind,
+                        CASE WHEN l.kind = 'external_drive' THEN d.available_bytes ELSE NULL END
+                 FROM planned_moves p
+                 LEFT JOIN locations l ON l.id = p.destination_location_id
+                 LEFT JOIN drives d ON d.persistent_identifier = l.drive_id
+                 ORDER BY p.id",
+            )
+            .map_err(|error| format!("Unable to query plan preflight: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PreflightMove {
+                    id: row.get(0)?,
+                    source_drive_id: row.get(1)?,
+                    source_relative_path: row.get(2)?,
+                    destination_location_id: row.get(3)?,
+                    destination_display_name: row.get(4)?,
+                    destination_kind: row.get(5)?,
+                    destination_available_bytes: row.get(6)?,
+                })
+            })
+            .map_err(|error| format!("Unable to read plan preflight: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read plan preflight rows: {error}"))?
+    };
+
+    let mut issues = Vec::new();
+    let mut counted_files: HashSet<(String, String)> = HashSet::new();
+    let mut known_bytes = 0_i64;
+    let mut unknown_size_count = 0_i64;
+    let mut destination_totals: HashMap<String, (String, String, i64, i64, i64, Option<i64>)> =
+        HashMap::new();
+    let mut source_roots: Vec<(i64, String, String, bool)> = Vec::new();
+
+    for planned in &moves {
+        let Some(destination_name) = planned.destination_display_name.clone() else {
+            issues.push(PlanPreflightIssue {
+                code: "missing_destination".to_string(),
+                message: format!(
+                    "The destination for planned move {} is no longer available.",
+                    planned.id
+                ),
+                move_id: Some(planned.id),
+            });
+            continue;
+        };
+        let destination_kind = planned
+            .destination_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let destination = destination_totals
+            .entry(planned.destination_location_id.clone())
+            .or_insert_with(|| {
+                (
+                    destination_name,
+                    destination_kind,
+                    0,
+                    0,
+                    0,
+                    planned.destination_available_bytes,
+                )
+            });
+        destination.2 += 1;
+
+        let source: Option<(bool, Option<i64>)> = connection
+            .query_row(
+                "SELECT is_directory, size_bytes
+                 FROM files
+                 WHERE drive_id = ?1 AND relative_path = ?2",
+                params![planned.source_drive_id, planned.source_relative_path],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to validate preflight source: {error}"))?;
+
+        let Some((source_is_directory, source_size)) = source else {
+            issues.push(PlanPreflightIssue {
+                code: "missing_source".to_string(),
+                message: format!(
+                    "{} is no longer present in the catalogue.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+            continue;
+        };
+
+        let source_lower = planned.source_relative_path.to_lowercase();
+        let overlaps = source_roots
+            .iter()
+            .any(|(_, drive_id, path, is_directory)| {
+                if drive_id != &planned.source_drive_id {
+                    return false;
+                }
+                let path_lower = path.to_lowercase();
+                (*is_directory && source_lower.starts_with(&format!("{path_lower}/")))
+                    || (source_is_directory && path_lower.starts_with(&format!("{source_lower}/")))
+            });
+        if overlaps {
+            issues.push(PlanPreflightIssue {
+                code: "overlapping_source".to_string(),
+                message: format!(
+                    "{} overlaps another planned source. Its files are counted only once.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+        }
+        source_roots.push((
+            planned.id,
+            planned.source_drive_id.clone(),
+            planned.source_relative_path.clone(),
+            source_is_directory,
+        ));
+
+        let source_files: Vec<(String, Option<i64>)> = if source_is_directory {
+            let mut statement = connection
+                .prepare(
+                    "SELECT relative_path, size_bytes
+                     FROM files
+                     WHERE drive_id = ?1
+                       AND is_directory = 0
+                       AND substr(relative_path, 1, length(?2) + 1) = ?2 || '/'",
+                )
+                .map_err(|error| format!("Unable to calculate planned folder size: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![planned.source_drive_id, planned.source_relative_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| format!("Unable to read planned folder size: {error}"))?;
+
+            let files = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read planned folder rows: {error}"))?;
+
+            files
+        } else {
+            vec![(planned.source_relative_path.clone(), source_size)]
+        };
+
+        let mut has_unknown_size = false;
+
+        for (relative_path, size) in source_files {
+            let key = (planned.source_drive_id.clone(), relative_path);
+            if !counted_files.insert(key) {
+                continue;
+            }
+            match size {
+                Some(bytes) => {
+                    known_bytes = known_bytes.saturating_add(bytes);
+                    destination.3 = destination.3.saturating_add(bytes);
+                }
+                None => {
+                    unknown_size_count += 1;
+                    destination.4 += 1;
+                    has_unknown_size = true;
+                }
+            }
+        }
+
+        if has_unknown_size {
+            issues.push(PlanPreflightIssue {
+                code: "unknown_source_size".to_string(),
+                message: format!(
+                    "{} contains files whose size is unknown.",
+                    planned.source_relative_path
+                ),
+                move_id: Some(planned.id),
+            });
+        }
+    }
+
+    let mut destinations: Vec<PlanPreflightDestination> = destination_totals
+        .into_iter()
+        .map(
+            |(location_id, (display_name, kind, move_count, bytes, unknown, available))| {
+                let projected = available.map(|free| free.saturating_sub(bytes).max(0));
+                let sufficient = if unknown > 0 {
+                    None
+                } else {
+                    available.map(|free| bytes <= free)
+                };
+                if available.is_some_and(|free| bytes > free) {
+                    issues.push(PlanPreflightIssue {
+                        code: "insufficient_capacity".to_string(),
+                        message: format!(
+                            "{display_name} does not have enough catalogued free space for the known planned data."
+                        ),
+                        move_id: None,
+                    });
+                }
+                PlanPreflightDestination {
+                    location_id,
+                    display_name,
+                    kind,
+                    move_count,
+                    known_bytes: bytes,
+                    unknown_size_count: unknown,
+                    available_bytes: available,
+                    projected_available_bytes: projected,
+                    capacity_sufficient: sufficient,
+                }
+            },
+        )
+        .collect();
+    destinations.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+    });
+
+    Ok(PlanPreflight {
+        move_count: moves.len() as i64,
+        known_bytes,
+        unknown_size_count,
+        destinations,
+        issues,
+    })
+}
+
+#[tauri::command]
+async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        plan_preflight(&connection)
+    })
+    .await
+}
+
 // Planned destinations can sit inside folders that do not exist yet, such as
 // `New Folder/film.mp4` planned from the drive root. Returns the next folder
 // below `parent_path` on the way to each such destination, so the planned view
@@ -2325,6 +2608,7 @@ pub fn run() {
             add_local_folder_location,
             create_planned_move,
             list_planned_moves,
+            get_plan_preflight,
             list_planned_folder_entries,
             remove_planned_move
         ])
@@ -2997,6 +3281,173 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn preflight_counts_folder_contents_and_deduplicates_overlapping_sources() {
+        let database = TestDatabase::new("preflight-folder-overlap");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        connection
+            .execute(
+                "UPDATE drives SET available_bytes = 150 WHERE persistent_identifier = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES
+                    ('UUID-A', 'Folder', 'Folder', '', 1, NULL),
+                    ('UUID-A', 'Folder/a.mov', 'a.mov', 'Folder', 0, 100),
+                    ('UUID-A', 'Folder/b.mov', 'b.mov', 'Folder', 0, NULL);",
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder",
+            "drive:UUID-B",
+            "Archive/Folder",
+        )
+        .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder/a.mov",
+            "drive:UUID-B",
+            "Singles/a.mov",
+        )
+        .unwrap();
+
+        let result = plan_preflight(&connection).unwrap();
+        assert_eq!(result.move_count, 2);
+        assert_eq!(result.known_bytes, 100);
+        assert_eq!(result.unknown_size_count, 1);
+        assert_eq!(result.destinations.len(), 1);
+
+        let destination = &result.destinations[0];
+        assert_eq!(destination.location_id, "drive:UUID-B");
+        assert_eq!(destination.move_count, 2);
+        assert_eq!(destination.known_bytes, 100);
+        assert_eq!(destination.unknown_size_count, 1);
+        assert_eq!(destination.available_bytes, Some(150));
+        assert_eq!(destination.projected_available_bytes, Some(50));
+        assert_eq!(destination.capacity_sufficient, None);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "overlapping_source"));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unknown_source_size"));
+    }
+
+    #[test]
+    fn preflight_reports_insufficient_capacity_and_missing_sources() {
+        let database = TestDatabase::new("preflight-issues");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        connection
+            .execute(
+                "UPDATE drives SET available_bytes = 50 WHERE persistent_identifier = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+        connection
+            .execute(
+                "DELETE FROM files WHERE drive_id = 'UUID-A' AND relative_path = 'film.mov'",
+                [],
+            )
+            .unwrap();
+
+        let stale = plan_preflight(&connection).unwrap();
+        assert_eq!(stale.move_count, 1);
+        assert_eq!(stale.known_bytes, 0);
+        assert!(stale
+            .issues
+            .iter()
+            .any(|issue| issue.code == "missing_source"));
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+        let capacity = plan_preflight(&connection).unwrap();
+        assert_eq!(capacity.known_bytes, 100);
+        assert_eq!(capacity.destinations[0].capacity_sufficient, Some(false));
+        assert_eq!(capacity.destinations[0].projected_available_bytes, Some(0));
+        assert!(capacity
+            .issues
+            .iter()
+            .any(|issue| issue.code == "insufficient_capacity"));
+    }
+
+    #[test]
+    fn preflight_handles_empty_plan_and_unknown_local_capacity() {
+        let database = TestDatabase::new("preflight-empty-local");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        let empty = plan_preflight(&connection).unwrap();
+        assert_eq!(empty.move_count, 0);
+        assert_eq!(empty.known_bytes, 0);
+        assert!(empty.destinations.is_empty());
+        assert!(empty.issues.is_empty());
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 25);
+                 INSERT INTO locations
+                    (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Movies', NULL, '/tmp', 0);",
+            )
+            .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "local:test",
+            "media-mapper-preflight-film.mov",
+        )
+        .unwrap();
+
+        let local = plan_preflight(&connection).unwrap();
+        assert_eq!(local.known_bytes, 25);
+        assert_eq!(local.destinations[0].available_bytes, None);
+        assert_eq!(local.destinations[0].projected_available_bytes, None);
+        assert_eq!(local.destinations[0].capacity_sufficient, None);
     }
 
     #[test]
