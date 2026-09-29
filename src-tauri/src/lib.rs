@@ -248,6 +248,8 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     connection
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
         .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
+    register_search_function(&connection)
+        .map_err(|error| format!("Unable to configure catalogue search: {error}"))?;
 
     connection
         .execute_batch(
@@ -1155,15 +1157,65 @@ async fn list_catalogue_entries(
     .await
 }
 
+// Folds text for search: Unicode NFC normalisation, full lowercasing, and
+// `.`, `_` and `-` treated as spaces so `My.Film_2024` matches `my film 2024`.
+//
+// SQLite's own lower() only folds A-Z, so `ÉMILE` never matched `émile`, and
+// macOS can store names decomposed (é as e plus a combining accent), which
+// never matched a typed, composed é. Names and queries go through this same
+// function, so both sides always agree.
+fn search_fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    fn separator_to_space(c: char) -> char {
+        match c {
+            '.' | '_' | '-' => ' ',
+            c => c,
+        }
+    }
+
+    // Search runs this on every catalogued name and path, and most are plain
+    // ASCII, which is already normalised. Skip the Unicode work for them.
+    if text.is_ascii() {
+        return text
+            .chars()
+            .map(|c| separator_to_space(c.to_ascii_lowercase()))
+            .collect();
+    }
+
+    text.nfc()
+        .flat_map(char::to_lowercase)
+        .map(separator_to_space)
+        .collect()
+}
+
+// Makes search_fold available to SQL as mm_search_fold on this connection.
+fn register_search_function(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    connection.create_scalar_function(
+        "mm_search_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            // Borrow the value rather than copying it into a String first.
+            let text = context
+                .get_raw(0)
+                .as_str_or_null()
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+            Ok(text.map(search_fold))
+        },
+    )
+}
+
 fn normalised_search_expression(column: &str) -> String {
-    format!("lower(replace(replace(replace({column}, '.', ' '), '_', ' '), '-', ' '))")
+    format!("mm_search_fold({column})")
 }
 
 fn search_tokens(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| c.is_whitespace() || c == '.' || c == '_' || c == '-')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_lowercase())
+    search_fold(query)
+        .split_whitespace()
+        .map(str::to_owned)
         .collect()
 }
 
@@ -2656,6 +2708,48 @@ mod tests {
         // is not inside Mars.
         assert_eq!(found("/Volumes/Mars 2/Video"), None);
         assert_eq!(found("/Users/me/Movies"), None);
+    }
+
+    #[test]
+    fn search_matches_accents_and_case_beyond_ascii() {
+        let database = TestDatabase::new("unicode-search");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-U", "Test");
+
+        // As HFS+ stores it: decomposed, e followed by a combining acute accent.
+        let decomposed = "Cafe\u{301} E\u{301}mile.MOV";
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory)
+                 VALUES ('UUID-U', ?1, ?1, '', 0)",
+                params![decomposed],
+            )
+            .unwrap();
+
+        let matches = |query: &str| -> bool {
+            let tokens = search_tokens(query);
+            assert!(!tokens.is_empty());
+            let expression = normalised_search_expression("name");
+            tokens.iter().all(|token| {
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM files
+                             WHERE {expression} LIKE '%' || ?1 || '%')"
+                        ),
+                        params![token],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            })
+        };
+
+        // Typed composed, in other case, or with separators.
+        assert!(matches("café"));
+        assert!(matches("ÉMILE"));
+        assert!(matches("émile.mov"));
+        assert!(matches("CAFÉ_émile"));
+        assert!(!matches("cafe emil x"));
     }
 
     #[test]
