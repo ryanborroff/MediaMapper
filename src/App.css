@@ -80,15 +80,17 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .crumb-current { color: #6b6b6b; }
 .crumb-separator { margin-right: 6px; color: #aaa; }
 .file-browser { overflow: hidden; background: transparent; border: 1px solid #dededb; border-radius: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.035); }
-.file-browser-head, .file-row { display: grid; grid-template-columns: minmax(280px, 1fr) 180px 100px; gap: 20px; align-items: center; }
+.file-browser-head, .file-row { display: grid; grid-template-columns: minmax(280px, 1fr) 180px 100px 72px; gap: 20px; align-items: center; }
 /* Sizes are right-aligned with tabular digits so units line up. */
-.file-browser-head > :last-child, .file-row > :last-child { justify-self: end; text-align: right; font-variant-numeric: tabular-nums; }
-.file-row > .folder-row-actions:last-child { align-items: flex-end; }
+.file-browser-head > :nth-child(3), .file-row > :nth-child(3) { justify-self: end; text-align: right; font-variant-numeric: tabular-nums; }
 .file-browser-head { padding: 11px 18px; border-bottom: 1px solid #e5e5e2; color: #6b6b6b; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .file-row { width: 100%; padding: 11px 18px; border: 0; border-bottom: 1px solid #eeeeeb; background: transparent; color: #555; text-align: left; font-size: 13px; }
 .file-row:last-child { border-bottom: 0; }
-.file-row.folder-row { color: #222; cursor: pointer; }
-.file-row.folder-row:hover { background: #f7f7f5; }
+.file-row.folder-row, .file-row.search-row { cursor: pointer; }
+.file-row.folder-row:hover, .file-row.search-row:hover { background: #f7f7f5; }
+/* Files and folders share one name colour; the triangle marks folders. */
+.file-name-primary { color: #222; }
+.file-location { max-width: 100%; margin-top: 3px; overflow: hidden; color: #6b6b6b; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .file-row:disabled { opacity: 1; cursor: default; }
 .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-kind { display: inline-block; width: 18px; color: #6b6b6b; }
@@ -99,12 +101,11 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .catalogue-search input { width:min(520px,100%); border:1px solid #d2d2cf; border-radius:9px; padding:10px 12px; background:#fff; color:#222; font:inherit; font-size:13px; outline:none; }
 .catalogue-search input:focus { border-color:#999; box-shadow:0 0 0 3px rgba(0,0,0,.05); }
 .search-summary { color: #6b6b6b; font-size: 13px; white-space:nowrap; }
-.search-results { overflow:hidden; margin-bottom:22px; background:#fff; border:1px solid #dededb; border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,.035); }
-.search-result { display:grid; grid-template-columns:minmax(280px,1fr) 110px 210px; gap:20px; align-items:center; width:100%; padding:12px 18px; border:0; border-bottom:1px solid #eeeeeb; background:#fff; color:#555; text-align:left; cursor:pointer; }
+/* Every file list shares the file table's surface, type and column rhythm. */
+.search-results { overflow:hidden; margin:10px 0 22px; background:transparent; border:1px solid #dededb; border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,.035); }
+.search-result { display:grid; grid-template-columns:minmax(280px,1fr) 180px 100px; gap:20px; align-items:center; width:100%; padding:11px 18px; border:0; border-bottom:1px solid #eeeeeb; background:transparent; color:#555; text-align:left; cursor:pointer; }
 .search-result:last-child { border-bottom:0; }
-/* Drive search results use the file table's columns: name, modified, size. */
-.catalogue-search-result { grid-template-columns:minmax(280px,1fr) 180px 100px; }
-.catalogue-search-result > :last-child { justify-self:end; text-align:right; font-variant-numeric:tabular-nums; }
+.search-result > :last-child { justify-self:end; text-align:right; font-variant-numeric:tabular-nums; }
 .search-result:hover { background:#f7f7f5; }
 .search-result-main { min-width:0; display:flex; flex-direction:column; gap:3px; }
 .search-result-main strong { overflow:hidden; color:#222; font-size:13px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
@@ -209,13 +210,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .section-heading h2 { font-size:15px; line-height:1.3; font-weight:650; }
 .section-description, .section-heading span, .search-summary { font-size: 13px; line-height:1.4; font-weight:400; }
 .search-result { font-size: 13px; line-height:1.35; }
-.search-result-main strong { font-size:13px; line-height:1.35; font-weight:600; }
-.search-result-main span { font-size: 13px; line-height:1.35; font-weight:400; }
+.search-result-main strong { font-size:13px; line-height:1.35; font-weight:400; }
+.search-result-main span { font-size: 12px; line-height:1.35; font-weight:400; }
+.duplicate-group > .search-result .search-result-main strong { font-weight:600; }
 .search-result > span:not(.search-result-main) { font-size: 13px; line-height:1.35; font-weight:400; color:#666; }
 .duplicate-group > .search-result > span:nth-child(3) { font-weight:500; color:#444; }
-.duplicate-files .search-result { padding-top:10px; padding-bottom:10px; background:#fafafa; }
-.duplicate-files .search-result-main strong { font-size: 13px; font-weight:500; }
-.duplicate-files .search-result-main span { font-size:11px; color: #6b6b6b; }
+.duplicate-files .search-result { padding-top:10px; padding-bottom:10px; background:#fafaf8; }
 .browse-button, .back-button, .scan-button, .cancel-scan-button { font-size: 13px; line-height:1.2; }
 
 /* Section tools are secondary: an outline button at the end of the heading row. */
@@ -541,37 +541,58 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   white-space: nowrap;
 }
 
-.moving-out-row {
-  background: #fafaf8;
-}
-
+/* Planned rows carry a grey stripe; rows that exist only in the plan also get
+   a PLANNED tag and a muted name, so they never pass for real files (§9). */
+.moving-out-row,
 .planned-arrival-row {
   background: #fafaf8;
-  color: #555;
+  box-shadow: inset 3px 0 0 #9e9e9a;
 }
 
-.planned-arrival-row .file-name {
-  font-weight: 500;
-}
-
-.folder-row-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-}
-
-.folder-plan-button {
-  border: 0;
-  padding: 0;
-  background: transparent;
+.planned-arrival-row .file-name-primary {
   color: #6b6b6b;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
+  font-style: italic;
 }
 
-.folder-plan-button:hover {
+.planned-tag {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 5px;
+  border: 1px solid #b5b5b0;
+  border-radius: 4px;
+  color: #555;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
+
+/* Row action: visible on hover or keyboard focus, always reachable by Tab. */
+.row-action {
+  justify-self: end;
+}
+
+.row-action button {
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: #555;
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.file-row:hover .row-action button,
+.file-row:focus-within .row-action button,
+.row-action button:focus-visible {
+  opacity: 1;
+}
+
+.row-action button:hover {
   color: #222;
   text-decoration: underline;
 }
@@ -598,7 +619,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   box-shadow: inset 0 0 0 1px #b8beb3;
 }
 
-.folder-drop-target .folder-row-actions > span:first-child {
+.folder-drop-target .drop-hint {
   color: #444;
   font-weight: 600;
 }
@@ -626,4 +647,8 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .file-row:focus-visible,
 .search-result:focus-visible {
   outline-offset: -2px;
+}
+
+@media (hover: none) {
+  .row-action button { opacity: 1; }
 }
