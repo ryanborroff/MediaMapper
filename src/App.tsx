@@ -161,6 +161,8 @@ function App() {
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
   const [savingPlan, setSavingPlan] = useState(false);
+  const [draggedEntry, setDraggedEntry] = useState<CatalogueEntry | null>(null);
+  const [dragOverFolderPath, setDragOverFolderPath] = useState<string | null>(null);
 
   const loadLocations = useCallback(async () => {
     try {
@@ -479,6 +481,33 @@ function App() {
     }
   };
 
+  const planEntryToFolder = async (
+    entry: CatalogueEntry,
+    destinationFolder: string,
+  ) => {
+    if (!browserDrive) return;
+
+    const destinationRelativePath = destinationFolder
+      ? `${destinationFolder}/${entry.name}`
+      : entry.name;
+
+    setError(null);
+
+    try {
+      await invoke<number>("create_planned_move", {
+        sourceDriveId: browserDrive.persistentIdentifier,
+        sourceRelativePath: entry.relativePath,
+        destinationLocationId: `drive:${browserDrive.persistentIdentifier}`,
+        destinationRelativePath,
+      });
+
+      await loadPlannedMoves();
+      await openFolder(browserDrive, browserPath);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
   const addFolderOnThisMac = async () => {
     setError(null);
 
@@ -709,10 +738,63 @@ function App() {
 
                 return (
                   <div
-                    className={`file-row ${entry.isDirectory ? "folder-row" : "plannable-file-row"} ${plannedMove ? "moving-out-row" : ""}`}
+                    className={[
+                      "file-row",
+                      entry.isDirectory ? "folder-row" : "plannable-file-row",
+                      plannedMove ? "moving-out-row" : "",
+                      draggedEntry?.relativePath === entry.relativePath ? "drag-source-row" : "",
+                      dragOverFolderPath === entry.relativePath ? "folder-drop-target" : "",
+                    ].filter(Boolean).join(" ")}
                     key={entry.relativePath}
                     role="button"
                     tabIndex={0}
+                    draggable
+                    onDragStart={(event) => {
+                      setDraggedEntry(entry);
+                      setDragOverFolderPath(null);
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", entry.relativePath);
+                    }}
+                    onDragEnd={() => {
+                      setDraggedEntry(null);
+                      setDragOverFolderPath(null);
+                    }}
+                    onDragOver={(event) => {
+                      if (
+                        !entry.isDirectory ||
+                        !draggedEntry ||
+                        draggedEntry.relativePath === entry.relativePath
+                      ) {
+                        return;
+                      }
+
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      setDragOverFolderPath(entry.relativePath);
+                    }}
+                    onDragLeave={() => {
+                      if (dragOverFolderPath === entry.relativePath) {
+                        setDragOverFolderPath(null);
+                      }
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+
+                      const source = draggedEntry;
+                      setDraggedEntry(null);
+                      setDragOverFolderPath(null);
+
+                      if (
+                        !entry.isDirectory ||
+                        !source ||
+                        source.relativePath === entry.relativePath
+                      ) {
+                        return;
+                      }
+
+                      void planEntryToFolder(source, entry.relativePath);
+                    }}
                     onClick={openOrPlan}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === " ") {
@@ -735,7 +817,11 @@ function App() {
                     <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
                     {entry.isDirectory ? (
                       <span className="folder-row-actions">
-                        <span>Folder</span>
+                        <span>
+                          {dragOverFolderPath === entry.relativePath
+                            ? "Drop to move here"
+                            : "Folder"}
+                        </span>
                         <button
                           type="button"
                           className="folder-plan-button"
