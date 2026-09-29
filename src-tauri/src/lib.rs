@@ -2141,6 +2141,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
 
     let mut issues = Vec::new();
     let mut counted_files: HashSet<(String, String)> = HashSet::new();
+    let mut counted_files_by_destination: HashMap<String, HashSet<(String, String)>> =
+        HashMap::new();
     let mut known_bytes = 0_i64;
     let mut unknown_size_count = 0_i64;
     let mut destination_totals: HashMap<String, (String, String, i64, i64, i64, Option<i64>)> =
@@ -2255,21 +2257,36 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
         };
 
         let mut has_unknown_size = false;
+        let destination_files = counted_files_by_destination
+            .entry(planned.destination_location_id.clone())
+            .or_default();
 
         for (relative_path, size) in source_files {
             let key = (planned.source_drive_id.clone(), relative_path);
-            if !counted_files.insert(key) {
-                continue;
+
+            if size.is_none() {
+                has_unknown_size = true;
             }
-            match size {
-                Some(bytes) => {
-                    known_bytes = known_bytes.saturating_add(bytes);
-                    destination.3 = destination.3.saturating_add(bytes);
+
+            if counted_files.insert(key.clone()) {
+                match size {
+                    Some(bytes) => {
+                        known_bytes = known_bytes.saturating_add(bytes);
+                    }
+                    None => {
+                        unknown_size_count += 1;
+                    }
                 }
-                None => {
-                    unknown_size_count += 1;
-                    destination.4 += 1;
-                    has_unknown_size = true;
+            }
+
+            if destination_files.insert(key) {
+                match size {
+                    Some(bytes) => {
+                        destination.3 = destination.3.saturating_add(bytes);
+                    }
+                    None => {
+                        destination.4 += 1;
+                    }
                 }
             }
         }
@@ -3351,6 +3368,67 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "unknown_source_size"));
+    }
+
+    #[test]
+    fn preflight_counts_overlapping_sources_per_destination_without_double_counting_headline() {
+        let database = TestDatabase::new("preflight-overlap-destinations");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        insert_drive(&connection, "UUID-C", "Archive");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES
+                    ('UUID-A', 'Folder', 'Folder', '', 1, NULL),
+                    ('UUID-A', 'Folder/a.mov', 'a.mov', 'Folder', 0, 100);",
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder",
+            "drive:UUID-B",
+            "Folder",
+        )
+        .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Folder/a.mov",
+            "drive:UUID-C",
+            "a.mov",
+        )
+        .unwrap();
+
+        let result = plan_preflight(&connection).unwrap();
+
+        assert_eq!(result.move_count, 2);
+        assert_eq!(result.known_bytes, 100);
+        assert_eq!(result.unknown_size_count, 0);
+
+        let backup = result
+            .destinations
+            .iter()
+            .find(|destination| destination.location_id == "drive:UUID-B")
+            .unwrap();
+        let archive = result
+            .destinations
+            .iter()
+            .find(|destination| destination.location_id == "drive:UUID-C")
+            .unwrap();
+
+        assert_eq!(backup.known_bytes, 100);
+        assert_eq!(archive.known_bytes, 100);
+        assert_eq!(backup.move_count, 1);
+        assert_eq!(archive.move_count, 1);
     }
 
     #[test]
