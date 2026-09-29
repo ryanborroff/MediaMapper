@@ -225,9 +225,26 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(directory.join("catalogue.sqlite3"))
 }
 
+// How long a connection waits for another connection's write lock before
+// reporting `database is locked`. This absorbs brief contention between
+// commands. It does not make writes succeed during a long scan, which holds
+// its write transaction for the whole traversal. Commands still run on the
+// main thread, so a longer wait would freeze the window for that long.
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Opens a connection and makes sure the schema is current.
+//
+// Every command calls this, including read-only ones, so it must not write
+// during normal use. The schema statements below only write when a table,
+// index or column is missing; once the schema exists they need no write lock.
+// Routine location synchronisation lives in `sync_drive_locations`.
 fn open_database(path: &Path) -> Result<Connection, String> {
     let mut connection = Connection::open(path)
         .map_err(|error| format!("Unable to open catalogue database: {error}"))?;
+
+    connection
+        .busy_timeout(DATABASE_BUSY_TIMEOUT)
+        .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
 
     connection
         .execute_batch(
@@ -452,47 +469,6 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             .map_err(|error| format!("Unable to add drive labels: {error}"))?;
     }
 
-    // Every catalogued external drive is also a Media Mapper location.
-    //
-    // The `drive:` prefix keeps the location namespace separate from future
-    // local-folder identifiers while preserving the drive UUID as its stable
-    // underlying identity.
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO locations (
-                id,
-                kind,
-                display_name,
-                drive_id,
-                local_path,
-                created_at
-            )
-            SELECT
-                'drive:' || persistent_identifier,
-                'external_drive',
-                name,
-                persistent_identifier,
-                NULL,
-                ?1
-            FROM drives",
-            params![now_unix()],
-        )
-        .map_err(|error| format!("Unable to create drive locations: {error}"))?;
-
-    connection
-        .execute(
-            "UPDATE locations
-             SET display_name = (
-                 SELECT drives.name
-                 FROM drives
-                 WHERE drives.persistent_identifier = locations.drive_id
-             )
-             WHERE kind = 'external_drive'
-               AND drive_id IS NOT NULL",
-            [],
-        )
-        .map_err(|error| format!("Unable to update drive locations: {error}"))?;
-
     // Planned destinations use Media Mapper locations rather than assuming
     // every destination is an external drive.
     let planned_move_table_exists: bool = connection
@@ -549,6 +525,10 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             let transaction = connection
                 .transaction()
                 .map_err(|error| format!("Unable to start planned move migration: {error}"))?;
+
+            // The migrated rows reference `drive:` locations through a foreign
+            // key, so those locations must exist before the rows are copied.
+            sync_drive_locations(&transaction)?;
 
             transaction
                 .execute_batch(
@@ -609,6 +589,62 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     }
 
     Ok(connection)
+}
+
+// Every catalogued external drive is also a Media Mapper location.
+//
+// The `drive:` prefix keeps the location namespace separate from future
+// local-folder identifiers while preserving the drive UUID as its stable
+// underlying identity. Existing locations keep their id and user label; only
+// the display name follows the drive's current volume name.
+//
+// This writes, so it runs only where changes are expected: at startup, inside
+// the scan transaction, and before the legacy planned-move migration.
+fn sync_drive_locations(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO locations (
+                id,
+                kind,
+                display_name,
+                drive_id,
+                local_path,
+                created_at
+            )
+            SELECT
+                'drive:' || persistent_identifier,
+                'external_drive',
+                name,
+                persistent_identifier,
+                NULL,
+                ?1
+            FROM drives",
+            params![now_unix()],
+        )
+        .map_err(|error| format!("Unable to create drive locations: {error}"))?;
+
+    connection
+        .execute(
+            "UPDATE locations
+             SET display_name = (
+                 SELECT drives.name
+                 FROM drives
+                 WHERE drives.persistent_identifier = locations.drive_id
+             )
+             WHERE kind = 'external_drive'
+               AND drive_id IS NOT NULL",
+            [],
+        )
+        .map_err(|error| format!("Unable to update drive locations: {error}"))?;
+
+    Ok(())
+}
+
+// Runs once at startup: brings the schema up to date and backfills drive
+// locations for catalogues created before locations existed.
+fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
+    let connection = open_database(&database_path(app)?)?;
+    sync_drive_locations(&connection)
 }
 
 #[cfg(target_os = "macos")]
@@ -945,6 +981,10 @@ async fn scan_drive(
                 ],
             )
             .map_err(|error| format!("Unable to save drive record: {error}"))?;
+
+        // Create or rename this drive's location in the same transaction, so a
+        // cancelled or failed scan leaves locations exactly as they were.
+        sync_drive_locations(&transaction)?;
 
         // A rescan replaces the previous snapshot atomically. Any filesystem read
         // failure aborts the scan, so an incomplete traversal can never replace the
@@ -1817,6 +1857,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // A failure here must not stop the app from opening. Commands
+            // open the database themselves and will report the same error.
+            if let Err(error) = initialise_database(app.handle()) {
+                eprintln!("Media Mapper database initialisation failed: {error}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_external_drives,
             list_catalogued_drives,
@@ -1837,4 +1885,137 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "media-mapper-{name}-{}-{}.sqlite3",
+                std::process::id(),
+                now_unix()
+            ));
+            let database = TestDatabase(path);
+            database.remove_files();
+            database
+        }
+
+        fn remove_files(&self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut file = self.0.clone().into_os_string();
+                file.push(suffix);
+                let _ = fs::remove_file(file);
+            }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            self.remove_files();
+        }
+    }
+
+    fn insert_drive(connection: &Connection, id: &str, name: &str) {
+        connection
+            .execute(
+                "INSERT INTO drives (persistent_identifier, name, last_seen_at)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT(persistent_identifier) DO UPDATE SET name = excluded.name",
+                params![id, name],
+            )
+            .unwrap();
+    }
+
+    fn location_count(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT COUNT(*) FROM locations", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn read_connection_opens_while_scan_holds_write_transaction() {
+        let database = TestDatabase::new("read-during-scan");
+        {
+            let setup = open_database(&database.0).unwrap();
+            insert_drive(&setup, "UUID-1", "Backup");
+            sync_drive_locations(&setup).unwrap();
+        }
+
+        // Simulate a scan: one long write transaction replacing the catalogue.
+        let mut writer = open_database(&database.0).unwrap();
+        let scan = writer.transaction().unwrap();
+        scan.execute("DELETE FROM files WHERE drive_id = 'UUID-1'", [])
+            .unwrap();
+        scan.execute(
+            "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory)
+             VALUES ('UUID-1', 'film.mp4', 'film.mp4', '', 0)",
+            [],
+        )
+        .unwrap();
+
+        // Opening a connection must not wait on the scan's write lock.
+        let started = Instant::now();
+        let reader = open_database(&database.0).expect("opening must not write");
+        assert!(started.elapsed() < DATABASE_BUSY_TIMEOUT);
+
+        assert_eq!(location_count(&reader), 1);
+        let visible_files: i64 = reader
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(visible_files, 0, "uncommitted scan rows must stay invisible");
+
+        // Location sync is a write, which is why it no longer runs on open.
+        assert!(sync_drive_locations(&reader).is_err());
+
+        scan.rollback().unwrap();
+    }
+
+    #[test]
+    fn scan_location_sync_follows_the_scan_transaction() {
+        let database = TestDatabase::new("scan-location-sync");
+        let mut connection = open_database(&database.0).unwrap();
+
+        // A cancelled first scan leaves no drive and no location behind.
+        let cancelled = connection.transaction().unwrap();
+        insert_drive(&cancelled, "UUID-1", "Backup");
+        sync_drive_locations(&cancelled).unwrap();
+        cancelled.rollback().unwrap();
+        assert_eq!(location_count(&connection), 0);
+
+        // A committed scan creates the location.
+        let first = connection.transaction().unwrap();
+        insert_drive(&first, "UUID-1", "Backup");
+        sync_drive_locations(&first).unwrap();
+        first.commit().unwrap();
+
+        connection
+            .execute(
+                "UPDATE locations SET user_label = 'Mars' WHERE drive_id = 'UUID-1'",
+                [],
+            )
+            .unwrap();
+
+        // A rescan after a volume rename updates the display name only.
+        let rescan = connection.transaction().unwrap();
+        insert_drive(&rescan, "UUID-1", "Backup 2");
+        sync_drive_locations(&rescan).unwrap();
+        rescan.commit().unwrap();
+
+        let (id, display_name, user_label): (String, String, Option<String>) = connection
+            .query_row(
+                "SELECT id, display_name, user_label FROM locations WHERE drive_id = 'UUID-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "drive:UUID-1");
+        assert_eq!(display_name, "Backup 2");
+        assert_eq!(user_label.as_deref(), Some("Mars"));
+        assert_eq!(location_count(&connection), 1);
+    }
 }
