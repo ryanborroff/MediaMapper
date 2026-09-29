@@ -829,11 +829,11 @@ function App() {
         {searchQuery.trim() && <section className="search-results" aria-live="polite">
           {searching ? <div className="browser-message">Searching catalogue…</div>
           : visibleSearchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-          : visibleSearchResults.map((entry) => <button className="search-result" key={entry.relativePath}
+          : visibleSearchResults.map((entry) => <button className="search-result catalogue-search-result" key={entry.relativePath}
               onClick={() => void openSearchResult(liveDrive, entry)}>
               <span className="search-result-main"><strong>{entry.name}</strong><span>{entry.relativePath}</span></span>
-              <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
               <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
+              <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
             </button>)}
         </section>}
 
