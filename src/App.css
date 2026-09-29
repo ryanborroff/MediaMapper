@@ -234,6 +234,13 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .section-action:disabled { color: #999; cursor: default; }
 
 .section-heading + .section-description { margin: -4px 0 12px; color: #6b6b6b; }
+.section-empty { margin: 0; color: #6b6b6b; font-size: 13px; }
+
+/* Tools: one row per tool, action at the end, results directly below. */
+.tool-row { display: flex; align-items: center; gap: 20px; padding: 12px 0; border-top: 1px solid #e2e2df; }
+.section-heading + .tool-row { border-top: 0; padding-top: 0; }
+.tool-row h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.tool-row p { margin: 2px 0 0; color: #6b6b6b; font-size: 13px; }
 
 /* Keep safety copy on one line when space allows. */
 .safety-note {
