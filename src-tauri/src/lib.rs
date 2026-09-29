@@ -1584,6 +1584,190 @@ async fn add_local_folder_location(
     .await
 }
 
+// Validates a planned move and saves it, replacing any existing plan for the
+// same source. The checks and the write share one transaction, so two plans
+// cannot claim the same destination between the check and the insert.
+//
+// Drives Media Mapper sees are almost always case-insensitive (APFS and HFS+
+// by default, exFAT and FAT always), so destinations that differ only in case
+// are treated as the same place.
+fn plan_move(
+    connection: &mut Connection,
+    source_drive_id: &str,
+    source_relative_path: &str,
+    destination_location_id: &str,
+    destination_relative_path: &str,
+) -> Result<i64, String> {
+    validate_catalogue_relative_path(source_relative_path)?;
+    validate_catalogue_relative_path(destination_relative_path)?;
+
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to start planning: {error}"))?;
+
+    let (destination_kind, destination_drive_id, destination_local_path): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = transaction
+        .query_row(
+            "SELECT kind, drive_id, local_path FROM locations WHERE id = ?1",
+            params![destination_location_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
+
+    let same_drive = destination_drive_id.as_deref() == Some(source_drive_id);
+
+    if same_drive && source_relative_path == destination_relative_path {
+        return Err(
+            "The planned destination is the same as the current catalogue location.".to_string(),
+        );
+    }
+
+    let source_is_directory = match transaction.query_row(
+        "SELECT is_directory
+         FROM files
+         WHERE drive_id = ?1 AND relative_path = ?2",
+        params![source_drive_id, source_relative_path],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value != 0,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err("The source item is not present in the catalogue.".to_string());
+        }
+        Err(error) => {
+            return Err(format!("Unable to validate planned move source: {error}"));
+        }
+    };
+
+    if source_is_directory
+        && same_drive
+        && destination_relative_path
+            .to_lowercase()
+            .starts_with(&format!("{}/", source_relative_path.to_lowercase()))
+    {
+        return Err("A folder cannot be planned inside itself.".to_string());
+    }
+
+    // Planning must not silently target a location that is already occupied.
+    // The catalogue is a snapshot, so this is an early safety check; execution
+    // will re-check the live destination before any future copy. The source
+    // itself is excluded so a plan that only changes letter case is allowed.
+    match destination_kind.as_str() {
+        "external_drive" => {
+            let destination_drive_id = destination_drive_id
+                .as_deref()
+                .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
+
+            let destination_occupied: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM files
+                        WHERE drive_id = ?1
+                          AND relative_path = ?2 COLLATE NOCASE
+                          AND NOT (drive_id = ?3 AND relative_path = ?4)
+                    )",
+                    params![
+                        destination_drive_id,
+                        destination_relative_path,
+                        source_drive_id,
+                        source_relative_path
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Unable to check planned destination: {error}"))?;
+
+            if destination_occupied {
+                return Err(
+                    "That destination already exists in the destination drive catalogue."
+                        .to_string(),
+                );
+            }
+        }
+        "local_folder" => {
+            // Folders on this Mac are always available, so check the real
+            // folder rather than a catalogue.
+            let local_path = destination_local_path
+                .as_deref()
+                .ok_or_else(|| "Folder location has no path.".to_string())?;
+
+            if fs::symlink_metadata(Path::new(local_path).join(destination_relative_path)).is_ok() {
+                return Err(
+                    "That destination already exists in the folder on this Mac.".to_string()
+                );
+            }
+        }
+        _ => {}
+    }
+
+    // Two sources must never claim the same planned destination. Exclude this
+    // source so an existing plan can still be edited or replaced.
+    let destination_already_planned: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM planned_moves
+                WHERE destination_location_id = ?1
+                  AND destination_relative_path = ?2 COLLATE NOCASE
+                  AND NOT (
+                      source_drive_id = ?3
+                      AND source_relative_path = ?4
+                  )
+            )",
+            params![
+                destination_location_id,
+                destination_relative_path,
+                source_drive_id,
+                source_relative_path
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
+
+    if destination_already_planned {
+        return Err("Another planned move already uses that destination.".to_string());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO planned_moves (
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
+                destination_location_id = excluded.destination_location_id,
+                destination_relative_path = excluded.destination_relative_path,
+                created_at = excluded.created_at",
+            params![
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                now_unix()
+            ],
+        )
+        .map_err(|error| format!("Unable to save planned move: {error}"))?;
+
+    let id = transaction
+        .query_row(
+            "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
+            params![source_drive_id, source_relative_path],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to read planned move id: {error}"))?;
+
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to save planned move: {error}"))?;
+
+    Ok(id)
+}
+
 #[tauri::command]
 async fn create_planned_move(
     app: tauri::AppHandle,
@@ -1593,134 +1777,14 @@ async fn create_planned_move(
     destination_relative_path: String,
 ) -> Result<i64, String> {
     run_blocking(move || {
-        validate_catalogue_relative_path(&source_relative_path)?;
-        validate_catalogue_relative_path(&destination_relative_path)?;
-
-        let connection = open_database(&database_path(&app)?)?;
-
-        let (destination_kind, destination_drive_id): (String, Option<String>) = connection
-            .query_row(
-                "SELECT kind, drive_id FROM locations WHERE id = ?1",
-                params![destination_location_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
-
-        if destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-            && source_relative_path == destination_relative_path
-        {
-            return Err(
-                "The planned destination is the same as the current catalogue location.".to_string(),
-            );
-        }
-        let source_is_directory = match connection.query_row(
-            "SELECT is_directory
-             FROM files
-             WHERE drive_id = ?1 AND relative_path = ?2",
-            params![source_drive_id, source_relative_path],
-            |row| row.get::<_, i64>(0),
-        ) {
-            Ok(value) => value != 0,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err("The source item is not present in the catalogue.".to_string());
-            }
-            Err(error) => {
-                return Err(format!("Unable to validate planned move source: {error}"));
-            }
-        };
-
-        if source_is_directory
-            && destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-            && destination_relative_path.starts_with(&(source_relative_path.clone() + "/"))
-        {
-            return Err("A folder cannot be planned inside itself.".to_string());
-        }
-
-        // Planning must not silently target a catalogue location that is already
-        // occupied. The catalogue is a snapshot, so this is an early safety check;
-        // execution will re-check the live destination before any future copy.
-        if destination_kind == "external_drive" {
-            let destination_drive_id = destination_drive_id
-                .as_deref()
-                .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
-
-            let destination_occupied: bool = connection
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1
-                        FROM files
-                        WHERE drive_id = ?1 AND relative_path = ?2
-                    )",
-                    params![destination_drive_id, destination_relative_path],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("Unable to check planned destination: {error}"))?;
-
-            if destination_occupied {
-                return Err(
-                    "That destination already exists in the destination drive catalogue.".to_string(),
-                );
-            }
-        }
-
-        // Two source files must never silently claim the same planned destination.
-        // Exclude this source so an existing plan can still be edited/replaced.
-        let destination_already_planned: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                SELECT 1
-                FROM planned_moves
-                WHERE destination_location_id = ?1
-                  AND destination_relative_path = ?2
-                  AND NOT (
-                      source_drive_id = ?3
-                      AND source_relative_path = ?4
-                  )
-            )",
-                params![
-                    destination_location_id,
-                    destination_relative_path,
-                    source_drive_id,
-                    source_relative_path
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
-
-        if destination_already_planned {
-            return Err("Another planned move already uses that destination.".to_string());
-        }
-
-        connection
-            .execute(
-                "INSERT INTO planned_moves (
-                    source_drive_id,
-                    source_relative_path,
-                    destination_location_id,
-                    destination_relative_path,
-                    created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
-                    destination_location_id = excluded.destination_location_id,
-                    destination_relative_path = excluded.destination_relative_path,
-                    created_at = excluded.created_at",
-                params![
-                    source_drive_id,
-                    source_relative_path,
-                    destination_location_id,
-                    destination_relative_path,
-                    now_unix()
-                ],
-            )
-            .map_err(|error| format!("Unable to save planned move: {error}"))?;
-
-        connection
-            .query_row(
-                "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
-                params![source_drive_id, source_relative_path],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to read planned move id: {error}"))
+        let mut connection = open_database(&database_path(&app)?)?;
+        plan_move(
+            &mut connection,
+            &source_drive_id,
+            &source_relative_path,
+            &destination_location_id,
+            &destination_relative_path,
+        )
     })
     .await
 }
@@ -1881,7 +1945,9 @@ async fn list_planned_folder_entries(
         };
 
         let new_folders = planned_intermediate_folders(
-            roots.iter().map(|root| root.destination_relative_path.as_str()),
+            roots
+                .iter()
+                .map(|root| root.destination_relative_path.as_str()),
             &parent_path,
         );
 
@@ -2133,7 +2199,10 @@ mod tests {
         let visible_files: i64 = reader
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(visible_files, 0, "uncommitted scan rows must stay invisible");
+        assert_eq!(
+            visible_files, 0,
+            "uncommitted scan rows must stay invisible"
+        );
 
         // Location sync is a write, which is why it no longer runs on open.
         assert!(sync_drive_locations(&reader).is_err());
@@ -2460,6 +2529,71 @@ mod tests {
 
         // Two files of 4 bytes, two folders, and nothing counted as skipped.
         assert_eq!(counters, (2, 2, 8, 0));
+    }
+
+    #[test]
+    fn planning_treats_destinations_that_differ_in_case_as_the_same() {
+        let database = TestDatabase::new("plan-case");
+        let folder = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&folder.0).unwrap();
+        fs::write(folder.0.join("exists.mp4"), b"x").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Archive");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory)
+                 VALUES ('UUID-A', 'film.mp4', 'film.mp4', '', 0),
+                        ('UUID-A', 'Folder', 'Folder', '', 1),
+                        ('UUID-A', 'Folder/clip.mp4', 'clip.mp4', 'Folder', 0),
+                        ('UUID-B', 'Video', 'Video', '', 1),
+                        ('UUID-B', 'Video/Film.mp4', 'Film.mp4', 'Video', 0);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Test', ?1, 0)",
+                params![folder.0.to_string_lossy()],
+            )
+            .unwrap();
+
+        let mut plan = |source: &str, location: &str, destination: &str| {
+            plan_move(&mut connection, "UUID-A", source, location, destination)
+        };
+
+        // Occupied in the destination catalogue, differing only in case.
+        let error = plan("film.mp4", "drive:UUID-B", "video/film.mp4").unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+
+        let first = plan("film.mp4", "drive:UUID-B", "Video/new.mp4").unwrap();
+
+        // Another source cannot claim the same destination in other case.
+        let error = plan("Folder/clip.mp4", "drive:UUID-B", "VIDEO/NEW.mp4").unwrap_err();
+        assert!(error.contains("Another planned move"), "{error}");
+
+        // The same source can still re-plan, keeping its id.
+        assert_eq!(
+            plan("film.mp4", "drive:UUID-B", "Video/NEW.mp4").unwrap(),
+            first
+        );
+
+        // Changing only letter case in place is not blocked by the file itself.
+        plan("film.mp4", "drive:UUID-A", "Film.mp4").unwrap();
+
+        let error = plan("Folder", "drive:UUID-A", "folder/Sub/Folder").unwrap_err();
+        assert!(error.contains("inside itself"), "{error}");
+
+        // Folders on this Mac are checked on disk.
+        let error = plan("Folder/clip.mp4", "local:test", "exists.mp4").unwrap_err();
+        assert!(error.contains("folder on this Mac"), "{error}");
+        plan("Folder/clip.mp4", "local:test", "fresh.mp4").unwrap();
     }
 
     #[test]
