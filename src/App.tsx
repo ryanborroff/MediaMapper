@@ -539,6 +539,17 @@ function App() {
     return () => { dispose?.(); };
   }, []);
 
+  // Recovery of interrupted transfers finishes after launch, once drives are
+  // listed, and can change both history and the plan.
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen("transfers-recovered", () => {
+      void loadTransfers();
+      void loadPlannedMoves();
+    }).then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, [loadTransfers, loadPlannedMoves]);
+
   const connectedIds = useMemo(
     () => new Set(connected.flatMap((drive) => drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
     [connected],
