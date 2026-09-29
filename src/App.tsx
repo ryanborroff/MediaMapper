@@ -301,7 +301,7 @@ function App() {
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<"drives" | "browse" | "plan">("drives");
+  const [activeView, setActiveView] = useState<"drives" | "browse" | "plan" | "transfers">("drives");
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
   const [entries, setEntries] = useState<CatalogueEntry[]>([]);
@@ -929,7 +929,118 @@ function App() {
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
 
-  if (activeView === "plan" && !browserDrive) {
+  if (activeView === "transfers" && !browserDrive) {
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("plan")}>Plan</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content transfers-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">TRANSFERS</p>
+              <h1>Transfers</h1>
+              <p className="intro">See what's copying now and what MediaMapper has already copied and verified.</p>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          {executionProgress && (() => {
+            const { moves, completed } = executionProgress;
+            const current = moves[Math.min(completed, moves.length - 1)];
+            const paths = plannedMovePaths(current);
+            return (
+              <section className="transfer-active-card" aria-live="polite">
+                <span className="transfer-active-label">COPYING</span>
+                <h2>{current.sourceName}</h2>
+                <TransferPaths from={paths.from} to={paths.to} />
+                <div className="transfer-file-progress">
+                  <span style={{ width: `${moves.length ? (completed / moves.length) * 100 : 0}%` }} />
+                </div>
+                <p>{Math.min(completed + 1, moves.length)} of {moves.length} files · Each file is verified before the next begins.</p>
+              </section>
+            );
+          })()}
+
+          {!executionProgress && executionResult && (
+            <section className={`transfer-result-card ${executionResult.stopped ? "failed" : "completed"}`}>
+              <div>
+                <strong>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
+                <p>{executionResult.message}</p>
+              </div>
+              <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+            </section>
+          )}
+
+          {!executionProgress && !executionResult && plannedMoves.length > 0 && (
+            <section className="transfer-waiting-card">
+              <div>
+                <span className="transfer-active-label">PLANNED</span>
+                <h2>{plannedMoves.length} {plannedMoves.length === 1 ? "transfer" : "transfers"} waiting</h2>
+                <p>Open Plan to see what is required before copying can begin.</p>
+              </div>
+              <button className="browse-button" onClick={() => setActiveView("plan")}>View plan</button>
+            </section>
+          )}
+
+          <section className="transfer-history-section">
+            <div className="section-heading">
+              <h2>Recent</h2>
+              {transfers.length > 0 && <span className="count-badge">{transfers.length}</span>}
+            </div>
+            {transfers.length === 0 ? (
+              <div className="transfer-history-empty">
+                <h3>No transfers yet</h3>
+                <p>Copied and verified files will appear here.</p>
+              </div>
+            ) : (
+              <>
+                <div className="transfer-history-new">
+                  {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
+                    const outcome = transferOutcome(transfer.status);
+                    const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
+                    const location = locations.find((item) => item.id === transfer.destinationLocationId);
+                    return (
+                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id}>
+                        <span className="transfer-history-mark" aria-hidden="true">{outcome.tone === "completed" ? "✓" : outcome.tone === "failed" ? "×" : "–"}</span>
+                        <div className="transfer-item">
+                          <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                          <TransferPaths
+                            from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
+                            to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
+                          />
+                          {transfer.status === "failed" && transfer.errorMessage && <p className="transfer-error">{transfer.errorMessage}</p>}
+                        </div>
+                        <span className="transfer-history-size">{size === null ? "" : formatBytes(size)}</span>
+                        <div className="transfer-outcome">
+                          <span className="transfer-status">{outcome.label}</span>
+                          <span>{formatDate(transfer.completedAt ?? transfer.startedAt ?? transfer.createdAt)}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {transfers.length > RECENT_TRANSFER_COUNT && (
+                  <button className="transfer-more-button" onClick={() => setShowAllTransfers((value) => !value)}>
+                    {showAllTransfers ? "Show recent only" : `Show all ${transfers.length.toLocaleString()}`}
+                  </button>
+                )}
+              </>
+            )}
+          </section>
+        </div>
+      </main>
+    );
+  }
+
+    if (activeView === "plan" && !browserDrive) {
     const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
     const folderMoveCount = plannedMoves.length - fileMoves.length;
     const knownBytes = planPreflight?.knownBytes ?? fileMoves.reduce((sum, move) => sum + (move.sourceSizeBytes ?? 0), 0);
@@ -958,7 +1069,7 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
             <button className="sidebar-item active" type="button" aria-current="page">Plan</button>
-            <button className="sidebar-item" type="button" disabled>Transfers</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
         <div className="app-content plan-home">
@@ -1069,7 +1180,7 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
-            <button className="sidebar-item" type="button" disabled>Transfers</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
         <div className="app-content browse-home">
@@ -1560,7 +1671,7 @@ function App() {
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
-          <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Transfers</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
         </nav>
       </aside>
       <div className="app-content">
