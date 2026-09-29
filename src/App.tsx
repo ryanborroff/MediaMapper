@@ -947,7 +947,6 @@ function App() {
             <div>
               <p className="eyebrow">TRANSFERS</p>
               <h1>Transfers</h1>
-              <p className="intro">See what's copying now and what MediaMapper has already copied and verified.</p>
             </div>
           </header>
 
@@ -993,8 +992,7 @@ function App() {
 
           <section className="transfer-history-section">
             <div className="section-heading">
-              <h2>Recent</h2>
-              {transfers.length > 0 && <span className="count-badge">{transfers.length}</span>}
+              <h2>Recent transfers</h2>
             </div>
             {transfers.length === 0 ? (
               <div className="transfer-history-empty">
