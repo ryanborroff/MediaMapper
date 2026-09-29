@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -413,6 +414,133 @@ fn list_transfer_records(connection: &Connection) -> Result<Vec<TransferRecord>,
         .map_err(|error| format!("Unable to read transfer rows: {error}"))?;
 
     Ok(transfers)
+}
+
+fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
+    let first_file = fs::File::open(first)
+        .map_err(|error| format!("Unable to open source for verification: {error}"))?;
+    let second_file = fs::File::open(second)
+        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?;
+
+    if first_file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len()
+        != second_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+    {
+        return Ok(false);
+    }
+
+    let mut first_reader = BufReader::new(first_file);
+    let mut second_reader = BufReader::new(second_file);
+    let mut first_buffer = [0_u8; 1024 * 1024];
+    let mut second_buffer = [0_u8; 1024 * 1024];
+
+    loop {
+        let first_count = first_reader
+            .read(&mut first_buffer)
+            .map_err(|error| format!("Unable to verify source file: {error}"))?;
+        let second_count = second_reader
+            .read(&mut second_buffer)
+            .map_err(|error| format!("Unable to verify copied file: {error}"))?;
+
+        if first_count != second_count {
+            return Ok(false);
+        }
+
+        if first_count == 0 {
+            return Ok(true);
+        }
+
+        if first_buffer[..first_count] != second_buffer[..second_count] {
+            return Ok(false);
+        }
+    }
+}
+
+fn copy_file_verified(source: &Path, destination: &Path) -> Result<u64, String> {
+    if destination.exists() {
+        return Err(format!(
+            "Destination already exists: {}",
+            destination.display()
+        ));
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Destination has no parent folder.".to_string())?;
+
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to create destination folder: {error}"))?;
+
+    let file_name = destination
+        .file_name()
+        .ok_or_else(|| "Destination has no file name.".to_string())?
+        .to_string_lossy();
+
+    let temporary = parent.join(format!(
+        ".mediamapper-{}-{}.partial",
+        std::process::id(),
+        file_name
+    ));
+
+    if temporary.exists() {
+        fs::remove_file(&temporary)
+            .map_err(|error| format!("Unable to remove stale temporary file: {error}"))?;
+    }
+
+    let result = (|| -> Result<u64, String> {
+        let source_file = fs::File::open(source)
+            .map_err(|error| format!("Unable to open source file: {error}"))?;
+        let mut reader = BufReader::new(source_file);
+
+        let temporary_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Unable to create temporary destination file: {error}"))?;
+        let mut writer = BufWriter::new(temporary_file);
+
+        let copied = std::io::copy(&mut reader, &mut writer)
+            .map_err(|error| format!("Unable to copy file: {error}"))?;
+
+        writer
+            .flush()
+            .map_err(|error| format!("Unable to flush copied file: {error}"))?;
+
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("Unable to sync copied file: {error}"))?;
+
+        drop(writer);
+
+        if !files_are_identical(source, &temporary)? {
+            return Err("Copied file failed byte-for-byte verification.".to_string());
+        }
+
+        // Refuse a late collision that appeared while the copy was running.
+        if destination.exists() {
+            return Err(format!(
+                "Destination appeared while copying: {}",
+                destination.display()
+            ));
+        }
+
+        fs::rename(&temporary, destination)
+            .map_err(|error| format!("Unable to finalise copied file: {error}"))?;
+
+        Ok(copied)
+    })();
+
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+
+    result
 }
 
 fn now_unix() -> i64 {
@@ -4353,6 +4481,53 @@ mod tests {
             "{:?}",
             result.issues
         );
+    }
+
+    #[test]
+    fn verified_copy_creates_identical_destination_and_preserves_source() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("nested/destination.bin");
+        let contents = vec![0x5a_u8; 2 * 1024 * 1024 + 17];
+
+        fs::write(&source, &contents).unwrap();
+
+        let copied = copy_file_verified(&source, &destination).unwrap();
+
+        assert_eq!(copied, contents.len() as u64);
+        assert_eq!(fs::read(&source).unwrap(), contents);
+        assert_eq!(fs::read(&destination).unwrap(), contents);
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn verified_copy_refuses_existing_destination() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-copy-collision-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let source = volume.0.join("source.bin");
+        let destination = volume.0.join("destination.bin");
+
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+
+        let error = copy_file_verified(&source, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
     }
 
     #[test]
