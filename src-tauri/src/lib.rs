@@ -3260,11 +3260,27 @@ fn validate_plan_live(
 
 #[tauri::command]
 async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, String> {
-    let drives = external_drives()?;
-
     run_blocking(move || {
+        let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
         validate_plan_live(&connection, &drives)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn execute_planned_move(
+    app: tauri::AppHandle,
+    planned_move_id: i64,
+) -> Result<TransferRecord, String> {
+    run_blocking(move || {
+        // Discover the physical drives immediately before execution. This is
+        // deliberately inside the blocking worker because diskutil and file
+        // verification must never block the window thread.
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+
+        execute_planned_transfer(&connection, planned_move_id, &drives)
     })
     .await
 }
@@ -3550,6 +3566,7 @@ pub fn run() {
             list_planned_moves,
             get_plan_preflight,
             validate_plan,
+            execute_planned_move,
             list_planned_folder_entries,
             remove_planned_move
         ])
