@@ -308,6 +308,12 @@ function App() {
   const catalogueSearchRequest = useRef(0);
   const librarySearchRequest = useRef(0);
 
+  // What the browser shows right now. A scan runs for a long time, and the
+  // user may open a drive while it does, so code that finishes later reads
+  // this rather than the values from when it started.
+  const browserState = useRef({ browserDrive, browserPath, searchQuery });
+  browserState.current = { browserDrive, browserPath, searchQuery };
+
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<ScanProgress>("scan-progress", (event) => setScanProgress(event.payload))
@@ -671,11 +677,12 @@ function App() {
       // A successful rescan replaces the SQLite snapshot. If this drive is
       // currently open, reload the visible folder/search from that new snapshot
       // so the browser cannot keep showing stale in-memory entries.
-      if (browserDrive?.persistentIdentifier === drive.persistentIdentifier) {
-        if (searchQuery.trim()) {
-          await searchCatalogue(browserDrive, searchQuery);
+      const shown = browserState.current;
+      if (shown.browserDrive?.persistentIdentifier === drive.persistentIdentifier) {
+        if (shown.searchQuery.trim()) {
+          await searchCatalogue(shown.browserDrive, shown.searchQuery);
         } else {
-          await openFolder(browserDrive, browserPath);
+          await openFolder(shown.browserDrive, shown.browserPath);
         }
       }
 
