@@ -1276,17 +1276,22 @@ function App() {
 
           <div className="plan-fields">
             <label>
-              <span>Move to</span>
+              <span>Location</span>
               <select
                 ref={planLocationSelect}
                 value={planDestinationLocationId}
                 onChange={(event) => {
+                  if (event.target.value === "__choose_mac__") {
+                    void addFolderOnThisMac();
+                    return;
+                  }
                   setPlanDestinationLocationId(event.target.value);
                   setPlanDestinationFolder("");
                   setFolderPickerOpen(false);
                 }}
               >
                 <option value="">Choose a location</option>
+                <option value="__choose_mac__">Choose a folder on this Mac…</option>
 
                 <optgroup label="External drives">
                   {locations
@@ -1314,13 +1319,7 @@ function App() {
                 )}
               </select>
 
-              <button
-                type="button"
-                className="plan-add-location"
-                onClick={() => void addFolderOnThisMac()}
-              >
-                Choose folder on this Mac…
-              </button>
+
             </label>
 
             <label>
