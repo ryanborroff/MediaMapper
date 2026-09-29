@@ -613,3 +613,14 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   cursor: pointer;
 }
 .hidden-items-toggle input { margin: 0; }
+
+/* Keyboard focus. :focus-visible leaves mouse clicks unmarked. Full-width
+   rows draw the ring inside so their container does not clip it. */
+:where(button, select, input, [tabindex]):focus-visible {
+  outline: 2px solid #2f6fd6;
+  outline-offset: 2px;
+}
+.file-row:focus-visible,
+.search-result:focus-visible {
+  outline-offset: -2px;
+}

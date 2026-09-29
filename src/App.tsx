@@ -108,6 +108,8 @@ type PlannedFolderEntry = {
   isDirectory: boolean;
   sizeBytes: number | null;
   destinationRelativePath: string;
+  // A folder that exists only in the plan, created by moves planned into it.
+  isNewFolder: boolean;
 };
 
 function formatBytes(bytes: number | null) {
@@ -127,6 +129,17 @@ function formatDate(timestamp: number | null) {
 // Searches wait for a pause in typing before querying, so each keystroke does
 // not start its own full catalogue search. Short enough to feel immediate.
 const SEARCH_DEBOUNCE_MS = 200;
+
+// Cleans a typed folder path: trims each folder name and drops empty and "."
+// parts, so " ./Video//Archive/ " becomes "Video/Archive". ".." is left in
+// place for the backend to reject with an explanation.
+function normaliseFolderInput(folder: string) {
+  return folder
+    .split("/")
+    .map((part) => part.trim())
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
+}
 
 function waitForTypingPause() {
   return new Promise<void>((resolve) => window.setTimeout(resolve, SEARCH_DEBOUNCE_MS));
@@ -305,6 +318,23 @@ function App() {
   const folderRequest = useRef(0);
   const catalogueSearchRequest = useRef(0);
   const librarySearchRequest = useRef(0);
+
+  // What the browser shows right now. A scan runs for a long time, and the
+  // user may open a drive while it does, so code that finishes later reads
+  // this rather than the values from when it started.
+  const browserState = useRef({ browserDrive, browserPath, searchQuery });
+  browserState.current = { browserDrive, browserPath, searchQuery };
+
+  // The plan panel opens below the file list, which can be long, so bring it
+  // into view and move keyboard focus to its first field when a file is picked.
+  const planPanel = useRef<HTMLElement>(null);
+  const planLocationSelect = useRef<HTMLSelectElement>(null);
+  useEffect(() => {
+    if (!selectedPlanEntry) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    planPanel.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
+    planLocationSelect.current?.focus({ preventScroll: true });
+  }, [selectedPlanEntry]);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -551,7 +581,7 @@ function App() {
   const savePlannedMove = async () => {
     if (!browserDrive || !selectedPlanEntry || !planDestinationLocationId) return;
 
-    const folder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const folder = normaliseFolderInput(planDestinationFolder);
     const destinationRelativePath = folder
       ? `${folder}/${selectedPlanEntry.name}`
       : selectedPlanEntry.name;
@@ -662,16 +692,19 @@ function App() {
     try {
       const result = await invoke<ScanProgress>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
-      await refresh();
+      // A scan can add a drive's location or rename it, and changes the names
+      // and sizes planned moves show, so reload those alongside the drives.
+      await Promise.all([refresh(), loadLocations(), loadPlannedMoves()]);
 
       // A successful rescan replaces the SQLite snapshot. If this drive is
       // currently open, reload the visible folder/search from that new snapshot
       // so the browser cannot keep showing stale in-memory entries.
-      if (browserDrive?.persistentIdentifier === drive.persistentIdentifier) {
-        if (searchQuery.trim()) {
-          await searchCatalogue(browserDrive, searchQuery);
+      const shown = browserState.current;
+      if (shown.browserDrive?.persistentIdentifier === drive.persistentIdentifier) {
+        if (shown.searchQuery.trim()) {
+          await searchCatalogue(shown.browserDrive, shown.searchQuery);
         } else {
-          await openFolder(browserDrive, browserPath);
+          await openFolder(shown.browserDrive, shown.browserPath);
         }
       }
 
@@ -703,7 +736,7 @@ function App() {
     const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
     const liveDriveHasLabel = liveDriveName !== liveDrive.name;
 
-    const normalisedPlanFolder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const normalisedPlanFolder = normaliseFolderInput(planDestinationFolder);
     const proposedDestinationPath = selectedPlanEntry
       ? (normalisedPlanFolder
           ? `${normalisedPlanFolder}/${selectedPlanEntry.name}`
@@ -953,7 +986,9 @@ function App() {
                       </span>
                       <span className="file-name-text">
                         <span className="file-name-primary">{planned.name}</span>
-                        {plannedFromPath(planned)}
+                        {planned.isNewFolder
+                          ? <span className="planned-path">New folder in the plan</span>
+                          : plannedFromPath(planned)}
                       </span>
                     </span>
                     <span>Planned</span>
@@ -964,7 +999,7 @@ function App() {
           )}
         </section>}
 
-        {selectedPlanEntry && <section className="plan-move-panel">
+        {selectedPlanEntry && <section className="plan-move-panel" ref={planPanel}>
           <div className="plan-move-heading">
             <div>
               <p className="eyebrow">PLANNED LOCATION</p>
@@ -985,6 +1020,7 @@ function App() {
             <label>
               <span>Move to</span>
               <select
+                ref={planLocationSelect}
                 value={planDestinationLocationId}
                 onChange={(event) => setPlanDestinationLocationId(event.target.value)}
               >
@@ -1045,7 +1081,7 @@ function App() {
                 return destination?.userLabel ?? destination?.displayName ?? "Choose a location";
               })()}
               {" / "}
-              {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
+              {normalisedPlanFolder ? `${normalisedPlanFolder}/` : ""}
               {selectedPlanEntry.name}
             </strong>
           </div>

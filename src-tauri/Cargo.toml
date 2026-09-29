@@ -1,8 +1,8 @@
 [package]
 name = "media-mapper"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Catalogue external drives and plan where files should live"
+authors = ["ryanborroff"]
 edition = "2021"
 
 [lib]
@@ -14,10 +14,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+unicode-normalization = "0.1"
 tauri-plugin-dialog = "2"
 
 [profile.release]

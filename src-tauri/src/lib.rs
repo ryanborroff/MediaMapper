@@ -198,6 +198,9 @@ struct PlannedFolderEntry {
     is_directory: bool,
     size_bytes: Option<i64>,
     destination_relative_path: String,
+    // A folder that exists only in the plan: some planned destination sits
+    // inside it, but it is not in the catalogue. It has no single source move.
+    is_new_folder: bool,
 }
 
 fn now_unix() -> i64 {
@@ -232,12 +235,15 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 // main thread, so a longer wait would freeze the window for that long.
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
-// Opens a connection and makes sure the schema is current.
+// Databases whose schema this process has already brought up to date.
+static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+// Opens a connection, bringing the schema up to date the first time each
+// database is opened in this run of the app.
 //
 // Every command calls this, including read-only ones, so it must not write
-// during normal use. The schema statements below only write when a table,
-// index or column is missing; once the schema exists they need no write lock.
-// Routine location synchronisation lives in `sync_drive_locations`.
+// during normal use. Migrations only write when a table, index or column is
+// missing. Routine location synchronisation lives in `sync_drive_locations`.
 fn open_database(path: &Path) -> Result<Connection, String> {
     let mut connection = Connection::open(path)
         .map_err(|error| format!("Unable to open catalogue database: {error}"))?;
@@ -245,7 +251,32 @@ fn open_database(path: &Path) -> Result<Connection, String> {
     connection
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
         .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
+    register_search_function(&connection)
+        .map_err(|error| format!("Unable to configure catalogue search: {error}"))?;
+    // Foreign keys are a per-connection setting, so every connection sets it.
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
 
+    // The lock is held while migrating, so two commands opening the database
+    // at the same moment cannot both run the same migration. A failed
+    // migration is not recorded, so the next open tries again.
+    let mut migrated = MIGRATED_DATABASES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| "Unable to access catalogue migration state.".to_string())?;
+    if !migrated.contains(path) {
+        migrate_database(&mut connection)?;
+        migrated.insert(path.to_path_buf());
+    }
+
+    Ok(connection)
+}
+
+// Creates any missing tables, indexes and columns, and upgrades data from
+// older schema versions. Every step checks first, so it is safe to run on a
+// database that is already current.
+fn migrate_database(connection: &mut Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "
@@ -598,7 +629,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         }
     }
 
-    Ok(connection)
+    Ok(())
 }
 
 // Every catalogued external drive is also a Media Mapper location.
@@ -657,36 +688,52 @@ fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
     sync_drive_locations(&connection)
 }
 
+// Parses `diskutil info` output into its `Key: Value` pairs.
+fn parse_diskutil_info(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+        .collect()
+}
+
+fn parse_diskutil_bytes(value: Option<&String>) -> Option<u64> {
+    let value = value?;
+    if let Some((_, remainder)) = value.split_once('(') {
+        let digits: String = remainder
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+    }
+    value
+        .split_whitespace()
+        .next()?
+        .replace(',', "")
+        .parse()
+        .ok()
+}
+
+// Returns (total, available) bytes for a volume. "Disk Size" is the size of
+// the volume's partition, or of its container on APFS. APFS volumes share
+// their container's free space and report it only as "Container Free Space";
+// other filesystems report "Volume Free Space".
+fn diskutil_capacity(
+    info: &std::collections::HashMap<String, String>,
+) -> (Option<u64>, Option<u64>) {
+    (
+        parse_diskutil_bytes(info.get("Disk Size")),
+        parse_diskutil_bytes(
+            info.get("Volume Free Space")
+                .or_else(|| info.get("Container Free Space")),
+        ),
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn external_drives() -> Result<Vec<DriveInfo>, String> {
-    use std::collections::HashMap;
     use std::process::Command;
-
-    fn parse_info(text: &str) -> HashMap<String, String> {
-        text.lines()
-            .filter_map(|line| line.split_once(':'))
-            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-            .collect()
-    }
-
-    fn parse_bytes(value: Option<&String>) -> Option<u64> {
-        let value = value?;
-        if let Some((_, remainder)) = value.split_once('(') {
-            let digits: String = remainder
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if !digits.is_empty() {
-                return digits.parse().ok();
-            }
-        }
-        value
-            .split_whitespace()
-            .next()?
-            .replace(',', "")
-            .parse()
-            .ok()
-    }
 
     let volumes = Path::new("/Volumes");
     let entries =
@@ -708,7 +755,8 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
             _ => continue,
         };
 
-        let info = parse_info(&String::from_utf8_lossy(&output.stdout));
+        let info = parse_diskutil_info(&String::from_utf8_lossy(&output.stdout));
+        let (total_bytes, available_bytes) = diskutil_capacity(&info);
         if info.get("Device Location").map(String::as_str) == Some("Internal") {
             continue;
         }
@@ -740,8 +788,8 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
                 .get("File System Personality")
                 .or_else(|| info.get("Type (Bundle)"))
                 .cloned(),
-            total_bytes: parse_bytes(info.get("Disk Size")),
-            available_bytes: parse_bytes(info.get("Volume Free Space")),
+            total_bytes,
+            available_bytes,
             persistent_identifier: info
                 .get("Volume UUID")
                 .or_else(|| info.get("Disk / Partition UUID"))
@@ -825,12 +873,36 @@ async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedD
     .await
 }
 
+// Folders that macOS and Windows create at the root of a volume for Spotlight
+// indexing, the trash, filesystem event logs, temporary files and document
+// versions. They are not user content, can hold thousands of entries
+// (including deleted files in the trash), and are often unreadable, which
+// would abort the scan. They are only skipped at the volume root, so a user
+// folder with the same name deeper in the drive is still catalogued.
+const VOLUME_SYSTEM_FOLDERS: &[&str] = &[
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+    "$RECYCLE.BIN",
+    "System Volume Information",
+];
+
+fn is_volume_system_folder(name: &str) -> bool {
+    // FAT and exFAT volumes are case-insensitive, and Windows versions have
+    // written `$RECYCLE.BIN` and `$Recycle.Bin`.
+    VOLUME_SYSTEM_FOLDERS
+        .iter()
+        .any(|system_folder| system_folder.eq_ignore_ascii_case(name))
+}
+
 fn scan_directory(
     root: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
-    app: &tauri::AppHandle,
+    report_progress: &dyn Fn(&(i64, i64, i64, i64), &str),
     last_emit_at: &mut Instant,
 ) -> Result<(), String> {
     // Keep directory traversal on the heap rather than the call stack. This
@@ -875,6 +947,10 @@ fn scan_directory(
             // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
             // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
             if name.starts_with("._") || name == ".DS_Store" {
+                continue;
+            }
+
+            if current == root && is_volume_system_folder(&name) {
                 continue;
             }
 
@@ -939,7 +1015,7 @@ fn scan_directory(
             }
 
             if last_emit_at.elapsed() >= Duration::from_millis(150) {
-                emit_scan_progress(app, drive_id, counters, &relative);
+                report_progress(counters, &relative);
                 *last_emit_at = Instant::now();
             }
         }
@@ -1038,7 +1114,9 @@ async fn scan_drive(
             &mut insert_statement,
             &drive_id,
             &mut counters,
-            &progress_app,
+            &|counters, current_path| {
+                emit_scan_progress(&progress_app, &drive_id, counters, current_path)
+            },
             &mut last_emit_at,
         ) {
             clear_scan_cancel(&drive_id);
@@ -1122,15 +1200,65 @@ async fn list_catalogue_entries(
     .await
 }
 
+// Folds text for search: Unicode NFC normalisation, full lowercasing, and
+// `.`, `_` and `-` treated as spaces so `My.Film_2024` matches `my film 2024`.
+//
+// SQLite's own lower() only folds A-Z, so `ÉMILE` never matched `émile`, and
+// macOS can store names decomposed (é as e plus a combining accent), which
+// never matched a typed, composed é. Names and queries go through this same
+// function, so both sides always agree.
+fn search_fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    fn separator_to_space(c: char) -> char {
+        match c {
+            '.' | '_' | '-' => ' ',
+            c => c,
+        }
+    }
+
+    // Search runs this on every catalogued name and path, and most are plain
+    // ASCII, which is already normalised. Skip the Unicode work for them.
+    if text.is_ascii() {
+        return text
+            .chars()
+            .map(|c| separator_to_space(c.to_ascii_lowercase()))
+            .collect();
+    }
+
+    text.nfc()
+        .flat_map(char::to_lowercase)
+        .map(separator_to_space)
+        .collect()
+}
+
+// Makes search_fold available to SQL as mm_search_fold on this connection.
+fn register_search_function(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    connection.create_scalar_function(
+        "mm_search_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            // Borrow the value rather than copying it into a String first.
+            let text = context
+                .get_raw(0)
+                .as_str_or_null()
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+            Ok(text.map(search_fold))
+        },
+    )
+}
+
 fn normalised_search_expression(column: &str) -> String {
-    format!("lower(replace(replace(replace({column}, '.', ' '), '_', ' '), '-', ' '))")
+    format!("mm_search_fold({column})")
 }
 
 fn search_tokens(query: &str) -> Vec<String> {
-    query
-        .split(|c: char| c.is_whitespace() || c == '.' || c == '_' || c == '-')
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_lowercase())
+    search_fold(query)
+        .split_whitespace()
+        .map(str::to_owned)
         .collect()
 }
 
@@ -1269,92 +1397,106 @@ async fn search_all_catalogues(
     .await
 }
 
+// Groups files with the same name (ignoring case) and exact size, largest
+// potential saving first, and lists every copy.
+//
+// This used to run one query per group, and each of those read the whole
+// files table because lower(name) cannot use an index: 101 full scans. Here
+// the top groups are found once, then matched against the files in a single
+// pass. CROSS JOIN makes SQLite scan files once and look each row up in the
+// small groups table, instead of scanning files once per group.
+fn find_probable_duplicates(connection: &Connection) -> Result<Vec<DuplicateGroup>, String> {
+    let mut statement = connection
+        .prepare(
+            "WITH duplicate_groups AS MATERIALIZED (
+                SELECT lower(name) AS name_key,
+                       size_bytes,
+                       MIN(name) AS display_name,
+                       COUNT(*) AS copies
+                FROM files
+                WHERE is_directory = 0
+                  AND size_bytes IS NOT NULL
+                  AND size_bytes > 0
+                GROUP BY lower(name), size_bytes
+                HAVING COUNT(*) > 1
+                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
+                         size_bytes DESC,
+                         lower(MIN(name))
+                LIMIT 100
+             )
+             SELECT g.name_key,
+                    g.size_bytes,
+                    g.display_name,
+                    g.copies,
+                    f.drive_id,
+                    d.name,
+                    f.relative_path,
+                    f.name,
+                    f.modified_at
+             FROM files f
+             CROSS JOIN duplicate_groups g
+             JOIN drives d ON d.persistent_identifier = f.drive_id
+             WHERE f.is_directory = 0
+               AND f.size_bytes = g.size_bytes
+               AND lower(f.name) = g.name_key
+             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
+                      g.size_bytes DESC,
+                      lower(g.display_name),
+                      g.name_key,
+                      lower(d.name),
+                      lower(f.relative_path)",
+        )
+        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                DuplicateFile {
+                    drive_id: row.get(4)?,
+                    drive_name: row.get(5)?,
+                    relative_path: row.get(6)?,
+                    name: row.get(7)?,
+                    size_bytes: row.get(1)?,
+                    modified_at: row.get(8)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("Unable to read probable duplicates: {error}"))?;
+
+    // Rows arrive grouped and in display order, so each group is a run.
+    let mut results: Vec<DuplicateGroup> = Vec::new();
+    let mut current_key: Option<(String, i64)> = None;
+    for row in rows {
+        let (name_key, size_bytes, display_name, copies, file) =
+            row.map_err(|error| format!("Unable to read probable duplicate rows: {error}"))?;
+        let key = (name_key, size_bytes);
+        if current_key.as_ref() != Some(&key) {
+            results.push(DuplicateGroup {
+                name: display_name,
+                size_bytes,
+                copies,
+                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+                files: Vec::new(),
+            });
+            current_key = Some(key);
+        }
+        if let Some(group) = results.last_mut() {
+            group.files.push(file);
+        }
+    }
+
+    Ok(results)
+}
+
 #[tauri::command]
 async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
     run_blocking(move || {
         let connection = open_database(&database_path(&app)?)?;
-
-        let mut groups_statement = connection
-            .prepare(
-                "SELECT MIN(f.name) AS display_name,
-                        f.size_bytes,
-                        COUNT(*) AS copies
-                 FROM files f
-                 WHERE f.is_directory = 0
-                   AND f.size_bytes IS NOT NULL
-                   AND f.size_bytes > 0
-                 GROUP BY lower(f.name), f.size_bytes
-                 HAVING COUNT(*) > 1
-                 ORDER BY (f.size_bytes * (COUNT(*) - 1)) DESC,
-                          f.size_bytes DESC,
-                          lower(MIN(f.name))
-                 LIMIT 100",
-            )
-            .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
-
-        let group_rows = groups_statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|error| format!("Unable to read probable duplicate groups: {error}"))?;
-
-        let groups = group_rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read probable duplicate group rows: {error}"))?;
-
-        let mut file_statement = connection
-            .prepare(
-                "SELECT f.drive_id,
-                        d.name,
-                        f.relative_path,
-                        f.name,
-                        f.size_bytes,
-                        f.modified_at
-                 FROM files f
-                 JOIN drives d ON d.persistent_identifier = f.drive_id
-                 WHERE f.is_directory = 0
-                   AND lower(f.name) = lower(?1)
-                   AND f.size_bytes = ?2
-                 ORDER BY lower(d.name), lower(f.relative_path)",
-            )
-            .map_err(|error| {
-                format!("Unable to prepare probable duplicate files query: {error}")
-            })?;
-
-        let mut results = Vec::with_capacity(groups.len());
-
-        for (name, size_bytes, copies) in groups {
-            let file_rows = file_statement
-                .query_map(params![&name, size_bytes], |row| {
-                    Ok(DuplicateFile {
-                        drive_id: row.get(0)?,
-                        drive_name: row.get(1)?,
-                        relative_path: row.get(2)?,
-                        name: row.get(3)?,
-                        size_bytes: row.get(4)?,
-                        modified_at: row.get(5)?,
-                    })
-                })
-                .map_err(|error| format!("Unable to read probable duplicate files: {error}"))?;
-
-            let files = file_rows
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Unable to read probable duplicate file rows: {error}"))?;
-
-            results.push(DuplicateGroup {
-                name,
-                size_bytes,
-                copies,
-                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
-                files,
-            });
-        }
-
-        Ok(results)
+        find_probable_duplicates(&connection)
     })
     .await
 }
@@ -1400,21 +1542,18 @@ async fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String
     .await
 }
 
+// Catalogue paths are `/`-separated and relative to the volume root. Checks
+// the raw segments rather than Path::components, which silently drops `.` in
+// the middle of a path and merges repeated slashes, so `a/./b` or `a//b`
+// would pass but never match a catalogue path.
 fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
-    let candidate = Path::new(path);
     if path.trim().is_empty()
-        || candidate.is_absolute()
-        || candidate.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err(
-            "Planned paths must be non-empty relative paths without '..' components.".to_string(),
+            "Planned paths must be relative paths without empty, '.' or '..' folders.".to_string(),
         );
     }
     Ok(())
@@ -1461,7 +1600,9 @@ async fn set_drive_label(
     run_blocking(move || {
         let trimmed = label.trim();
 
-        if trimmed.chars().count() > 40 {
+        // Counted in UTF-16 units, as the label field's maxLength counts them,
+        // so the app and the field agree on what fits.
+        if trimmed.encode_utf16().count() > 40 {
             return Err("Drive labels can be up to 40 characters.".to_string());
         }
 
@@ -1485,6 +1626,13 @@ async fn set_drive_label(
     .await
 }
 
+// Returns the connected external drive whose volume contains `path`, if any.
+fn external_drive_containing<'a>(path: &Path, drives: &'a [DriveInfo]) -> Option<&'a DriveInfo> {
+    drives
+        .iter()
+        .find(|drive| path.starts_with(Path::new(&drive.mount_point)))
+}
+
 #[tauri::command]
 async fn add_local_folder_location(
     app: tauri::AppHandle,
@@ -1506,6 +1654,34 @@ async fn add_local_folder_location(
 
         let canonical = fs::canonicalize(&candidate)
             .map_err(|error| format!("Unable to resolve selected folder: {error}"))?;
+
+        // A folder on an external drive must be planned through that drive's
+        // own location, or the same place would have two identities and the
+        // drive's catalogue checks would not apply to it.
+        let drives = external_drives().unwrap_or_default();
+        if let Some(drive) = external_drive_containing(&canonical, &drives) {
+            let connection = open_database(&database_path(&app)?)?;
+            let drive_name = drive
+                .persistent_identifier
+                .as_deref()
+                .and_then(|drive_id| {
+                    connection
+                        .query_row(
+                            "SELECT COALESCE(NULLIF(user_label, ''), display_name)
+                             FROM locations
+                             WHERE drive_id = ?1",
+                            params![drive_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                })
+                .unwrap_or_else(|| drive.name.clone());
+            return Err(format!(
+                "That folder is on the external drive {drive_name}. Scan the drive if you \
+                 haven't, then choose {drive_name} in Move to and enter the folder."
+            ));
+        }
+
         let local_path = canonical.to_string_lossy().into_owned();
 
         let display_name = canonical
@@ -1551,6 +1727,190 @@ async fn add_local_folder_location(
     .await
 }
 
+// Validates a planned move and saves it, replacing any existing plan for the
+// same source. The checks and the write share one transaction, so two plans
+// cannot claim the same destination between the check and the insert.
+//
+// Drives Media Mapper sees are almost always case-insensitive (APFS and HFS+
+// by default, exFAT and FAT always), so destinations that differ only in case
+// are treated as the same place.
+fn plan_move(
+    connection: &mut Connection,
+    source_drive_id: &str,
+    source_relative_path: &str,
+    destination_location_id: &str,
+    destination_relative_path: &str,
+) -> Result<i64, String> {
+    validate_catalogue_relative_path(source_relative_path)?;
+    validate_catalogue_relative_path(destination_relative_path)?;
+
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to start planning: {error}"))?;
+
+    let (destination_kind, destination_drive_id, destination_local_path): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = transaction
+        .query_row(
+            "SELECT kind, drive_id, local_path FROM locations WHERE id = ?1",
+            params![destination_location_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
+
+    let same_drive = destination_drive_id.as_deref() == Some(source_drive_id);
+
+    if same_drive && source_relative_path == destination_relative_path {
+        return Err(
+            "The planned destination is the same as the current catalogue location.".to_string(),
+        );
+    }
+
+    let source_is_directory = match transaction.query_row(
+        "SELECT is_directory
+         FROM files
+         WHERE drive_id = ?1 AND relative_path = ?2",
+        params![source_drive_id, source_relative_path],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value != 0,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err("The source item is not present in the catalogue.".to_string());
+        }
+        Err(error) => {
+            return Err(format!("Unable to validate planned move source: {error}"));
+        }
+    };
+
+    if source_is_directory
+        && same_drive
+        && destination_relative_path
+            .to_lowercase()
+            .starts_with(&format!("{}/", source_relative_path.to_lowercase()))
+    {
+        return Err("A folder cannot be planned inside itself.".to_string());
+    }
+
+    // Planning must not silently target a location that is already occupied.
+    // The catalogue is a snapshot, so this is an early safety check; execution
+    // will re-check the live destination before any future copy. The source
+    // itself is excluded so a plan that only changes letter case is allowed.
+    match destination_kind.as_str() {
+        "external_drive" => {
+            let destination_drive_id = destination_drive_id
+                .as_deref()
+                .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
+
+            let destination_occupied: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM files
+                        WHERE drive_id = ?1
+                          AND relative_path = ?2 COLLATE NOCASE
+                          AND NOT (drive_id = ?3 AND relative_path = ?4)
+                    )",
+                    params![
+                        destination_drive_id,
+                        destination_relative_path,
+                        source_drive_id,
+                        source_relative_path
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Unable to check planned destination: {error}"))?;
+
+            if destination_occupied {
+                return Err(
+                    "That destination already exists in the destination drive catalogue."
+                        .to_string(),
+                );
+            }
+        }
+        "local_folder" => {
+            // Folders on this Mac are always available, so check the real
+            // folder rather than a catalogue.
+            let local_path = destination_local_path
+                .as_deref()
+                .ok_or_else(|| "Folder location has no path.".to_string())?;
+
+            if fs::symlink_metadata(Path::new(local_path).join(destination_relative_path)).is_ok() {
+                return Err(
+                    "That destination already exists in the folder on this Mac.".to_string()
+                );
+            }
+        }
+        _ => {}
+    }
+
+    // Two sources must never claim the same planned destination. Exclude this
+    // source so an existing plan can still be edited or replaced.
+    let destination_already_planned: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM planned_moves
+                WHERE destination_location_id = ?1
+                  AND destination_relative_path = ?2 COLLATE NOCASE
+                  AND NOT (
+                      source_drive_id = ?3
+                      AND source_relative_path = ?4
+                  )
+            )",
+            params![
+                destination_location_id,
+                destination_relative_path,
+                source_drive_id,
+                source_relative_path
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
+
+    if destination_already_planned {
+        return Err("Another planned move already uses that destination.".to_string());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO planned_moves (
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
+                destination_location_id = excluded.destination_location_id,
+                destination_relative_path = excluded.destination_relative_path,
+                created_at = excluded.created_at",
+            params![
+                source_drive_id,
+                source_relative_path,
+                destination_location_id,
+                destination_relative_path,
+                now_unix()
+            ],
+        )
+        .map_err(|error| format!("Unable to save planned move: {error}"))?;
+
+    let id = transaction
+        .query_row(
+            "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
+            params![source_drive_id, source_relative_path],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to read planned move id: {error}"))?;
+
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to save planned move: {error}"))?;
+
+    Ok(id)
+}
+
 #[tauri::command]
 async fn create_planned_move(
     app: tauri::AppHandle,
@@ -1560,134 +1920,14 @@ async fn create_planned_move(
     destination_relative_path: String,
 ) -> Result<i64, String> {
     run_blocking(move || {
-        validate_catalogue_relative_path(&source_relative_path)?;
-        validate_catalogue_relative_path(&destination_relative_path)?;
-
-        let connection = open_database(&database_path(&app)?)?;
-
-        let (destination_kind, destination_drive_id): (String, Option<String>) = connection
-            .query_row(
-                "SELECT kind, drive_id FROM locations WHERE id = ?1",
-                params![destination_location_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
-
-        if destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-            && source_relative_path == destination_relative_path
-        {
-            return Err(
-                "The planned destination is the same as the current catalogue location.".to_string(),
-            );
-        }
-        let source_is_directory = match connection.query_row(
-            "SELECT is_directory
-             FROM files
-             WHERE drive_id = ?1 AND relative_path = ?2",
-            params![source_drive_id, source_relative_path],
-            |row| row.get::<_, i64>(0),
-        ) {
-            Ok(value) => value != 0,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err("The source item is not present in the catalogue.".to_string());
-            }
-            Err(error) => {
-                return Err(format!("Unable to validate planned move source: {error}"));
-            }
-        };
-
-        if source_is_directory
-            && destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-            && destination_relative_path.starts_with(&(source_relative_path.clone() + "/"))
-        {
-            return Err("A folder cannot be planned inside itself.".to_string());
-        }
-
-        // Planning must not silently target a catalogue location that is already
-        // occupied. The catalogue is a snapshot, so this is an early safety check;
-        // execution will re-check the live destination before any future copy.
-        if destination_kind == "external_drive" {
-            let destination_drive_id = destination_drive_id
-                .as_deref()
-                .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
-
-            let destination_occupied: bool = connection
-                .query_row(
-                    "SELECT EXISTS(
-                        SELECT 1
-                        FROM files
-                        WHERE drive_id = ?1 AND relative_path = ?2
-                    )",
-                    params![destination_drive_id, destination_relative_path],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("Unable to check planned destination: {error}"))?;
-
-            if destination_occupied {
-                return Err(
-                    "That destination already exists in the destination drive catalogue.".to_string(),
-                );
-            }
-        }
-
-        // Two source files must never silently claim the same planned destination.
-        // Exclude this source so an existing plan can still be edited/replaced.
-        let destination_already_planned: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                SELECT 1
-                FROM planned_moves
-                WHERE destination_location_id = ?1
-                  AND destination_relative_path = ?2
-                  AND NOT (
-                      source_drive_id = ?3
-                      AND source_relative_path = ?4
-                  )
-            )",
-                params![
-                    destination_location_id,
-                    destination_relative_path,
-                    source_drive_id,
-                    source_relative_path
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
-
-        if destination_already_planned {
-            return Err("Another planned move already uses that destination.".to_string());
-        }
-
-        connection
-            .execute(
-                "INSERT INTO planned_moves (
-                    source_drive_id,
-                    source_relative_path,
-                    destination_location_id,
-                    destination_relative_path,
-                    created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
-                    destination_location_id = excluded.destination_location_id,
-                    destination_relative_path = excluded.destination_relative_path,
-                    created_at = excluded.created_at",
-                params![
-                    source_drive_id,
-                    source_relative_path,
-                    destination_location_id,
-                    destination_relative_path,
-                    now_unix()
-                ],
-            )
-            .map_err(|error| format!("Unable to save planned move: {error}"))?;
-
-        connection
-            .query_row(
-                "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
-                params![source_drive_id, source_relative_path],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to read planned move id: {error}"))
+        let mut connection = open_database(&database_path(&app)?)?;
+        plan_move(
+            &mut connection,
+            &source_drive_id,
+            &source_relative_path,
+            &destination_location_id,
+            &destination_relative_path,
+        )
     })
     .await
 }
@@ -1749,6 +1989,37 @@ async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, S
     .await
 }
 
+// Planned destinations can sit inside folders that do not exist yet, such as
+// `New Folder/film.mp4` planned from the drive root. Returns the next folder
+// below `parent_path` on the way to each such destination, so the planned view
+// can show it and the user can open it. Items directly inside `parent_path`
+// are not folders on the way to anything and are left out.
+fn planned_intermediate_folders<'a>(
+    destinations: impl IntoIterator<Item = &'a str>,
+    parent_path: &str,
+) -> Vec<String> {
+    let prefix = if parent_path.is_empty() {
+        String::new()
+    } else {
+        format!("{parent_path}/")
+    };
+
+    let mut folders = Vec::new();
+    for destination in destinations {
+        let Some(remainder) = destination.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((next_folder, _)) = remainder.split_once('/') else {
+            continue;
+        };
+        let folder = format!("{prefix}{next_folder}");
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders
+}
+
 #[tauri::command]
 async fn list_planned_folder_entries(
     app: tauri::AppHandle,
@@ -1807,6 +2078,7 @@ async fn list_planned_folder_entries(
                         is_directory: row.get::<_, i64>(5)? != 0,
                         size_bytes: row.get(6)?,
                         destination_relative_path: row.get(7)?,
+                        is_new_folder: false,
                     })
                 })
                 .map_err(|error| format!("Unable to read planned folder: {error}"))?;
@@ -1814,6 +2086,13 @@ async fn list_planned_folder_entries(
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("Unable to read planned folder rows: {error}"))?
         };
+
+        let new_folders = planned_intermediate_folders(
+            roots
+                .iter()
+                .map(|root| root.destination_relative_path.as_str()),
+            &parent_path,
+        );
 
         let mut entries = Vec::new();
 
@@ -1898,8 +2177,32 @@ async fn list_planned_folder_entries(
                     is_directory,
                     size_bytes,
                     destination_relative_path,
+                    is_new_folder: false,
                 });
             }
+        }
+
+        // A planned folder move can already be the folder itself; only add
+        // folders that nothing else in this listing represents.
+        for folder in new_folders {
+            if entries
+                .iter()
+                .any(|entry| entry.destination_relative_path == folder)
+            {
+                continue;
+            }
+            let name = folder.rsplit('/').next().unwrap_or(&folder).to_owned();
+            entries.push(PlannedFolderEntry {
+                move_id: 0,
+                source_drive_id: String::new(),
+                source_drive_name: String::new(),
+                source_relative_path: String::new(),
+                name,
+                is_directory: true,
+                size_bytes: None,
+                destination_relative_path: folder,
+                is_new_folder: true,
+            });
         }
 
         entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
@@ -1928,7 +2231,6 @@ async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), Strin
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // A failure here must not stop the app from opening. Commands
             // open the database themselves and will report the same error.
@@ -2039,7 +2341,10 @@ mod tests {
         let visible_files: i64 = reader
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(visible_files, 0, "uncommitted scan rows must stay invisible");
+        assert_eq!(
+            visible_files, 0,
+            "uncommitted scan rows must stay invisible"
+        );
 
         // Location sync is a write, which is why it no longer runs on open.
         assert!(sync_drive_locations(&reader).is_err());
@@ -2281,5 +2586,419 @@ mod tests {
         }
 
         assert_planned_moves_migrated(&database.0);
+    }
+
+    // A temporary folder standing in for a mounted volume.
+    struct TestVolume(PathBuf);
+
+    impl Drop for TestVolume {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_volume_system_folders_only_at_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database = TestDatabase::new("system-folders");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-volume-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+
+        for folder in [
+            ".Trashes/501",
+            ".Spotlight-V100/Store-V2",
+            ".fseventsd",
+            "$Recycle.Bin/S-1-5-21",
+            "System Volume Information",
+            "Video/.Trashes",
+        ] {
+            fs::create_dir_all(volume.0.join(folder)).unwrap();
+        }
+        fs::write(volume.0.join(".Trashes/501/deleted.mp4"), b"deleted").unwrap();
+        fs::write(volume.0.join("Video/film.mp4"), b"film").unwrap();
+        fs::write(volume.0.join("Video/.Trashes/kept.txt"), b"kept").unwrap();
+
+        // Spotlight's store is usually unreadable. It must not abort the scan.
+        let spotlight = volume.0.join(".Spotlight-V100");
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-SCAN", "Test");
+        let transaction = connection.transaction().unwrap();
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
+
+        let result = scan_directory(
+            &volume.0,
+            &mut insert,
+            "UUID-SCAN",
+            &mut counters,
+            &|_, _| {},
+            &mut Instant::now(),
+        );
+        fs::set_permissions(&spotlight, fs::Permissions::from_mode(0o755)).unwrap();
+        result.expect("system folders must not abort the scan");
+        drop(insert);
+
+        let paths: Vec<String> = transaction
+            .prepare("SELECT relative_path FROM files ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            [
+                "Video",
+                "Video/.Trashes",
+                "Video/.Trashes/kept.txt",
+                "Video/film.mp4"
+            ]
+        );
+
+        // Two files of 4 bytes, two folders, and nothing counted as skipped.
+        assert_eq!(counters, (2, 2, 8, 0));
+    }
+
+    #[test]
+    fn planning_treats_destinations_that_differ_in_case_as_the_same() {
+        let database = TestDatabase::new("plan-case");
+        let folder = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&folder.0).unwrap();
+        fs::write(folder.0.join("exists.mp4"), b"x").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Archive");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory)
+                 VALUES ('UUID-A', 'film.mp4', 'film.mp4', '', 0),
+                        ('UUID-A', 'Folder', 'Folder', '', 1),
+                        ('UUID-A', 'Folder/clip.mp4', 'clip.mp4', 'Folder', 0),
+                        ('UUID-B', 'Video', 'Video', '', 1),
+                        ('UUID-B', 'Video/Film.mp4', 'Film.mp4', 'Video', 0);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Test', ?1, 0)",
+                params![folder.0.to_string_lossy()],
+            )
+            .unwrap();
+
+        let mut plan = |source: &str, location: &str, destination: &str| {
+            plan_move(&mut connection, "UUID-A", source, location, destination)
+        };
+
+        // Occupied in the destination catalogue, differing only in case.
+        let error = plan("film.mp4", "drive:UUID-B", "video/film.mp4").unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+
+        let first = plan("film.mp4", "drive:UUID-B", "Video/new.mp4").unwrap();
+
+        // Another source cannot claim the same destination in other case.
+        let error = plan("Folder/clip.mp4", "drive:UUID-B", "VIDEO/NEW.mp4").unwrap_err();
+        assert!(error.contains("Another planned move"), "{error}");
+
+        // The same source can still re-plan, keeping its id.
+        assert_eq!(
+            plan("film.mp4", "drive:UUID-B", "Video/NEW.mp4").unwrap(),
+            first
+        );
+
+        // Changing only letter case in place is not blocked by the file itself.
+        plan("film.mp4", "drive:UUID-A", "Film.mp4").unwrap();
+
+        let error = plan("Folder", "drive:UUID-A", "folder/Sub/Folder").unwrap_err();
+        assert!(error.contains("inside itself"), "{error}");
+
+        // Folders on this Mac are checked on disk.
+        let error = plan("Folder/clip.mp4", "local:test", "exists.mp4").unwrap_err();
+        assert!(error.contains("folder on this Mac"), "{error}");
+        plan("Folder/clip.mp4", "local:test", "fresh.mp4").unwrap();
+    }
+
+    #[test]
+    fn folders_on_external_drives_are_matched_by_mount_point() {
+        let drive = |name: &str, mount_point: &str| DriveInfo {
+            name: name.to_string(),
+            mount_point: mount_point.to_string(),
+            filesystem: None,
+            total_bytes: None,
+            available_bytes: None,
+            persistent_identifier: None,
+            device_identifier: None,
+        };
+        let drives = [
+            drive("Backup", "/Volumes/Backup"),
+            drive("Mars", "/Volumes/Mars"),
+        ];
+
+        let found = |path: &str| {
+            external_drive_containing(Path::new(path), &drives).map(|drive| drive.name.as_str())
+        };
+        assert_eq!(found("/Volumes/Mars/Video/Archive"), Some("Mars"));
+        assert_eq!(found("/Volumes/Mars"), Some("Mars"));
+        // Whole path components only: a sibling volume with a longer name
+        // is not inside Mars.
+        assert_eq!(found("/Volumes/Mars 2/Video"), None);
+        assert_eq!(found("/Users/me/Movies"), None);
+    }
+
+    #[test]
+    fn search_matches_accents_and_case_beyond_ascii() {
+        let database = TestDatabase::new("unicode-search");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-U", "Test");
+
+        // As HFS+ stores it: decomposed, e followed by a combining acute accent.
+        let decomposed = "Cafe\u{301} E\u{301}mile.MOV";
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory)
+                 VALUES ('UUID-U', ?1, ?1, '', 0)",
+                params![decomposed],
+            )
+            .unwrap();
+
+        let matches = |query: &str| -> bool {
+            let tokens = search_tokens(query);
+            assert!(!tokens.is_empty());
+            let expression = normalised_search_expression("name");
+            tokens.iter().all(|token| {
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM files
+                             WHERE {expression} LIKE '%' || ?1 || '%')"
+                        ),
+                        params![token],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            })
+        };
+
+        // Typed composed, in other case, or with separators.
+        assert!(matches("café"));
+        assert!(matches("ÉMILE"));
+        assert!(matches("émile.mov"));
+        assert!(matches("CAFÉ_émile"));
+        assert!(!matches("cafe emil x"));
+    }
+
+    #[test]
+    fn capacity_is_read_for_apfs_and_other_volumes() {
+        // Trimmed `diskutil info` output from real volumes.
+        let exfat = parse_diskutil_info(
+            "   File System Personality:   ExFAT
+   Disk Size:                 500.1 GB (500106788864 Bytes) (exactly 976771072 512-Byte-Units)
+   Volume Used Space:         94.4 GB (94447075328 Bytes) (exactly 184466944 512-Byte-Units) (18.9%)
+   Volume Free Space:         405.6 GB (405643067392 Bytes) (exactly 792271616 512-Byte-Units) (81.1%)",
+        );
+        assert_eq!(
+            diskutil_capacity(&exfat),
+            (Some(500_106_788_864), Some(405_643_067_392))
+        );
+
+        let apfs = parse_diskutil_info(
+            "   File System Personality:   APFS
+   Disk Size:                 494.4 GB (494384795648 Bytes) (exactly 965595304 512-Byte-Units)
+   Volume Used Space:         13.7 GB (13658537984 Bytes) (exactly 26676832 512-Byte-Units)
+   Container Total Space:     494.4 GB (494384795648 Bytes) (exactly 965595304 512-Byte-Units)
+   Container Free Space:      273.5 GB (273512333312 Bytes) (exactly 534203776 512-Byte-Units)",
+        );
+        assert_eq!(
+            diskutil_capacity(&apfs),
+            (Some(494_384_795_648), Some(273_512_333_312))
+        );
+    }
+
+    #[test]
+    fn probable_duplicates_are_grouped_by_name_ignoring_case_and_size() {
+        let database = TestDatabase::new("duplicates");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-B', 'x/film.MP4', 'film.MP4', 'x', 0, 100),
+                        ('UUID-A', 'Film.mp4', 'Film.mp4', '', 0, 100),
+                        ('UUID-B', 'Film.mp4', 'Film.mp4', '', 0, 50),
+                        ('UUID-A', 'clip.mov', 'clip.mov', '', 0, 10),
+                        ('UUID-A', 'sub/clip.mov', 'clip.mov', 'sub', 0, 10),
+                        ('UUID-A', 'sub/clip2.mov', 'clip2.mov', 'sub', 0, 10),
+                        ('UUID-A', 'empty.txt', 'empty.txt', '', 0, 0),
+                        ('UUID-B', 'empty.txt', 'empty.txt', '', 0, 0),
+                        ('UUID-A', 'sub', 'sub', '', 1, NULL),
+                        ('UUID-B', 'sub', 'sub', '', 1, NULL);",
+            )
+            .unwrap();
+
+        let groups = find_probable_duplicates(&connection).unwrap();
+        let summary: Vec<(String, i64, i64, i64, Vec<String>)> = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name.clone(),
+                    group.size_bytes,
+                    group.copies,
+                    group.potential_wasted_bytes,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        // Largest saving first; each group lists copies by drive, then path.
+        // Different sizes, empty files and folders are never duplicates.
+        assert_eq!(
+            summary,
+            [
+                (
+                    "Film.mp4".to_string(),
+                    100,
+                    2,
+                    100,
+                    vec!["Alpha:Film.mp4".to_string(), "Beta:x/film.MP4".to_string()]
+                ),
+                (
+                    "clip.mov".to_string(),
+                    10,
+                    2,
+                    10,
+                    vec![
+                        "Alpha:clip.mov".to_string(),
+                        "Alpha:sub/clip.mov".to_string()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_paths_reject_empty_dot_and_parent_segments() {
+        for valid in [
+            "film.mp4",
+            "Video/Archive/film.mp4",
+            "My Films/ spaced .mp4",
+        ] {
+            assert!(validate_catalogue_relative_path(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            " ",
+            "/Video/film.mp4",
+            "Video/",
+            "Video//film.mp4",
+            "./film.mp4",
+            "Video/./film.mp4",
+            "../film.mp4",
+            "Video/../film.mp4",
+        ] {
+            assert!(
+                validate_catalogue_relative_path(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_is_migrated_once_per_database() {
+        let database = TestDatabase::new("migrate-once");
+        open_database(&database.0).unwrap();
+
+        // Remove something migrations would create. A later open must not
+        // run them again, so it stays missing until the next app run.
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_files_drive_parent;")
+            .unwrap();
+        let connection = open_database(&database.0).unwrap();
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_files_drive_parent')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!index_exists);
+    }
+
+    #[test]
+    fn concurrent_first_opens_migrate_an_old_database_once() {
+        let database = TestDatabase::new("migrate-concurrently");
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch(LEGACY_SCHEMA)
+            .unwrap();
+
+        let path = database.0.clone();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || open_database(&path).map(|_| ()))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().expect("every open must succeed");
+        }
+
+        assert_planned_moves_migrated(&database.0);
+    }
+
+    #[test]
+    fn planned_view_shows_folders_that_exist_only_in_the_plan() {
+        let destinations = [
+            "New Folder/film.mp4",
+            "New Folder/Extras/clip.mp4",
+            "Archive/2024/Deep/scan.tif",
+            "top.mp4",
+        ];
+
+        // At the drive root: the first folder on the way to each destination,
+        // once each, and nothing for items that sit directly at the root.
+        assert_eq!(
+            planned_intermediate_folders(destinations, ""),
+            ["New Folder", "Archive"]
+        );
+
+        // Inside a new folder: its planned subfolders, but not its own files.
+        assert_eq!(
+            planned_intermediate_folders(destinations, "New Folder"),
+            ["New Folder/Extras"]
+        );
+        assert_eq!(
+            planned_intermediate_folders(destinations, "Archive/2024"),
+            ["Archive/2024/Deep"]
+        );
+
+        // A folder name that only shares a prefix is not a parent.
+        assert!(planned_intermediate_folders(destinations, "New").is_empty());
+        assert!(planned_intermediate_folders(destinations, "Archive/2024/Deep").is_empty());
     }
 }
