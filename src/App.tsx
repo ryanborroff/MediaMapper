@@ -74,6 +74,20 @@ type DuplicateGroup = {
   files: DuplicateFile[];
 };
 
+
+type PlannedMove = {
+  id: number;
+  sourceDriveId: string;
+  sourceDriveName: string;
+  sourceRelativePath: string;
+  sourceName: string;
+  sourceSizeBytes: number | null;
+  destinationDriveId: string;
+  destinationDriveName: string;
+  destinationRelativePath: string;
+  createdAt: number;
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -115,6 +129,20 @@ function App() {
   const [duplicatesLoading, setDuplicatesLoading] = useState(false);
   const [showDuplicates, setShowDuplicates] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
+  const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
+  const [selectedPlanFile, setSelectedPlanFile] = useState<CatalogueEntry | null>(null);
+  const [planDestinationDriveId, setPlanDestinationDriveId] = useState("");
+  const [planDestinationFolder, setPlanDestinationFolder] = useState("");
+  const [savingPlan, setSavingPlan] = useState(false);
+  const [planConfirmation, setPlanConfirmation] = useState<string | null>(null);
+
+  const loadPlannedMoves = useCallback(async () => {
+    try {
+      setPlannedMoves(await invoke<PlannedMove[]>("list_planned_moves"));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -133,7 +161,10 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    void refresh();
+    void loadPlannedMoves();
+  }, [refresh, loadPlannedMoves]);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -297,6 +328,67 @@ function App() {
     });
   };
 
+  const beginPlanMove = (entry: CatalogueEntry) => {
+    if (entry.isDirectory) return;
+    setPlanConfirmation(null);
+    setSelectedPlanFile(entry);
+    setPlanDestinationDriveId(browserDrive?.persistentIdentifier ?? "");
+
+    // Start from the file's current folder. This makes the proposed
+    // destination explicit and prevents the UI from making a root-level
+    // destination look like the file's existing catalogue location.
+    const separator = entry.relativePath.lastIndexOf("/");
+    const currentFolder =
+      separator >= 0 ? entry.relativePath.slice(0, separator) : "";
+    setPlanDestinationFolder(currentFolder);
+
+    setError(null);
+  };
+
+  const savePlannedMove = async () => {
+    if (!browserDrive || !selectedPlanFile || !planDestinationDriveId) return;
+
+    const folder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const destinationRelativePath = folder
+      ? `${folder}/${selectedPlanFile.name}`
+      : selectedPlanFile.name;
+
+    setSavingPlan(true);
+    setError(null);
+
+    try {
+      await invoke<number>("create_planned_move", {
+        sourceDriveId: browserDrive.persistentIdentifier,
+        sourceRelativePath: selectedPlanFile.relativePath,
+        destinationDriveId: planDestinationDriveId,
+        destinationRelativePath,
+      });
+      await loadPlannedMoves();
+
+      const destinationDriveName =
+        catalogued.find((drive) => drive.persistentIdentifier === planDestinationDriveId)?.name
+        ?? "Destination";
+
+      setPlanConfirmation(`${destinationDriveName} / ${destinationRelativePath}`);
+      setSelectedPlanFile(null);
+      setPlanDestinationFolder("");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setSavingPlan(false);
+    }
+  };
+
+  const removePlannedMove = async (id: number) => {
+    setError(null);
+    try {
+      await invoke("remove_planned_move", { id });
+      await loadPlannedMoves();
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
   const cancelScan = async (persistentIdentifier: string) => {
     setCancellingId(persistentIdentifier);
     try {
@@ -360,6 +452,18 @@ function App() {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
     const online = connectedIds.has(liveDrive.persistentIdentifier);
 
+    const normalisedPlanFolder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
+    const proposedDestinationPath = selectedPlanFile
+      ? (normalisedPlanFolder
+          ? `${normalisedPlanFolder}/${selectedPlanFile.name}`
+          : selectedPlanFile.name)
+      : "";
+
+    const planIsCurrentLocation =
+      selectedPlanFile !== null &&
+      planDestinationDriveId === liveDrive.persistentIdentifier &&
+      proposedDestinationPath === selectedPlanFile.relativePath;
+
     return (
       <main className="app-shell browser-shell">
         <header className="browser-header">
@@ -398,6 +502,11 @@ function App() {
         </header>
 
         {error && <div className="notice error">{error}</div>}
+        {planConfirmation && (
+          <div className="notice" role="status">
+            Move planned → {planConfirmation}
+          </div>
+        )}
 
         {searchQuery.trim() && <section className="search-results" aria-live="polite">
           {searching ? <div className="browser-message">Searching catalogue…</div>
@@ -421,10 +530,11 @@ function App() {
           ) : (
             entries.map((entry) => (
               <button
-                className={`file-row ${entry.isDirectory ? "folder-row" : ""}`}
+                className={`file-row ${entry.isDirectory ? "folder-row" : "plannable-file-row"}`}
                 key={entry.relativePath}
-                disabled={!entry.isDirectory}
-                onClick={() => entry.isDirectory && void openFolder(liveDrive, entry.relativePath)}
+                onClick={() => entry.isDirectory
+                  ? void openFolder(liveDrive, entry.relativePath)
+                  : beginPlanMove(entry)}
               >
                 <span className="file-name">
                   <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
@@ -435,6 +545,75 @@ function App() {
               </button>
             ))
           )}
+        </section>}
+
+        {selectedPlanFile && <section className="plan-move-panel">
+          <div className="plan-move-heading">
+            <div>
+              <p className="eyebrow">PLANNED LOCATION</p>
+              <h2>Plan move</h2>
+              <p className="section-description">
+                {selectedPlanFile.name} remains at its current location until a future transfer is explicitly executed.
+              </p>
+            </div>
+            <button className="plan-cancel-button" onClick={() => setSelectedPlanFile(null)}>Cancel</button>
+          </div>
+
+          <div className="plan-source">
+            <span>Current</span>
+            <strong>{liveDrive.name} / {selectedPlanFile.relativePath}</strong>
+          </div>
+
+          <div className="plan-fields">
+            <label>
+              <span>Destination drive</span>
+              <select
+                value={planDestinationDriveId}
+                onChange={(event) => setPlanDestinationDriveId(event.target.value)}
+              >
+                <option value="">Choose a drive</option>
+                {catalogued.map((drive) => (
+                  <option key={drive.persistentIdentifier} value={drive.persistentIdentifier}>
+                    {drive.name}{connectedIds.has(drive.persistentIdentifier) ? " · Connected" : " · Offline"}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Destination folder</span>
+              <input
+                value={planDestinationFolder}
+                placeholder="e.g. Video/Archive"
+                onChange={(event) => setPlanDestinationFolder(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="plan-preview">
+            <span>Planned</span>
+            <strong>
+              {(catalogued.find((drive) => drive.persistentIdentifier === planDestinationDriveId)?.name ?? "Choose a drive")}
+              {" / "}
+              {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
+              {selectedPlanFile.name}
+            </strong>
+          </div>
+
+          <div className="plan-actions">
+            <span className={planIsCurrentLocation ? "plan-location-warning" : undefined}>
+              {planIsCurrentLocation
+                ? "Already at this location."
+                : "This changes the Media Mapper plan only. No files are moved."}
+            </span>
+            <button
+              className="browse-button"
+              disabled={!planDestinationDriveId || savingPlan || planIsCurrentLocation}
+              onClick={() => void savePlannedMove()}
+            >
+              {savingPlan ? "Saving…" : "Plan move"}
+            </button>
+          </div>
         </section>}
 
         <footer className="safety-note">
@@ -584,6 +763,34 @@ function App() {
             ))
           )}
         </div>}
+      </section>}
+
+      {plannedMoves.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <div>
+            <h2>Planned moves</h2>
+            <p className="section-description">Virtual locations only. No files have been moved.</p>
+          </div>
+          <span>{plannedMoves.length}</span>
+        </div>
+
+        <div className="planned-move-list">
+          {plannedMoves.map((move) => (
+            <div className="planned-move-row" key={move.id}>
+              <div className="planned-move-main">
+                <strong>{move.sourceName}</strong>
+                <span>{move.sourceDriveName} / {move.sourceRelativePath}</span>
+                <span className="planned-destination">
+                  Planned → {move.destinationDriveName} / {move.destinationRelativePath}
+                </span>
+              </div>
+              <span>{formatBytes(move.sourceSizeBytes)}</span>
+              <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
       </section>}
 
       <section className="section-block">
