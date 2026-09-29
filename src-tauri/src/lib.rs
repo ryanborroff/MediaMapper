@@ -180,13 +180,14 @@ struct PlannedMove {
     source_relative_path: String,
     source_name: String,
     source_size_bytes: Option<i64>,
+    source_is_directory: bool,
     destination_location_id: String,
     destination_location_name: String,
     destination_relative_path: String,
     created_at: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PlannedFolderEntry {
     move_id: i64,
@@ -194,6 +195,7 @@ struct PlannedFolderEntry {
     source_drive_name: String,
     source_relative_path: String,
     name: String,
+    is_directory: bool,
     size_bytes: Option<i64>,
     destination_relative_path: String,
 }
@@ -1481,13 +1483,27 @@ fn create_planned_move(
             "The planned destination is the same as the current catalogue location.".to_string(),
         );
     }
-    let source_exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE drive_id = ?1 AND relative_path = ?2 AND is_directory = 0)",
+    let source_is_directory = match connection.query_row(
+        "SELECT is_directory
+         FROM files
+         WHERE drive_id = ?1 AND relative_path = ?2",
         params![source_drive_id, source_relative_path],
-        |row| row.get(0),
-    ).map_err(|error| format!("Unable to validate planned move source: {error}"))?;
-    if !source_exists {
-        return Err("The source file is not present in the catalogue.".to_string());
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(value) => value != 0,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err("The source item is not present in the catalogue.".to_string());
+        }
+        Err(error) => {
+            return Err(format!("Unable to validate planned move source: {error}"));
+        }
+    };
+
+    if source_is_directory
+        && destination_drive_id.as_deref() == Some(source_drive_id.as_str())
+        && destination_relative_path.starts_with(&(source_relative_path.clone() + "/"))
+    {
+        return Err("A folder cannot be planned inside itself.".to_string());
     }
 
     // Planning must not silently target a catalogue location that is already
@@ -1588,6 +1604,7 @@ fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String>
                 p.source_relative_path,
                 sf.name,
                 sf.size_bytes,
+                COALESCE(sf.is_directory, 0),
                 dl.id,
                 COALESCE(NULLIF(dl.user_label, ''), dl.display_name),
                 p.destination_relative_path,
@@ -1617,10 +1634,11 @@ fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String>
                 source_relative_path,
                 source_name: row.get::<_, Option<String>>(4)?.unwrap_or(fallback_name),
                 source_size_bytes: row.get(5)?,
-                destination_location_id: row.get(6)?,
-                destination_location_name: row.get(7)?,
-                destination_relative_path: row.get(8)?,
-                created_at: row.get(9)?,
+                source_is_directory: row.get::<_, i64>(6)? != 0,
+                destination_location_id: row.get(7)?,
+                destination_location_name: row.get(8)?,
+                destination_relative_path: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })
         .map_err(|error| format!("Unable to read planned moves: {error}"))?;
@@ -1641,68 +1659,143 @@ fn list_planned_folder_entries(
 
     let connection = open_database(&database_path(&app)?)?;
 
-    let mut statement = connection
-        .prepare(
-            "SELECT
-                p.id,
-                p.source_drive_id,
-                sd.name,
-                p.source_relative_path,
-                sf.name,
-                sf.size_bytes,
-                p.destination_relative_path
-             FROM planned_moves p
-             JOIN drives sd
-               ON sd.persistent_identifier = p.source_drive_id
-             LEFT JOIN files sf
-               ON sf.drive_id = p.source_drive_id
-              AND sf.relative_path = p.source_relative_path
-             WHERE p.destination_location_id = ?1
-             ORDER BY lower(p.destination_relative_path)",
-        )
-        .map_err(|error| format!("Unable to query planned folder: {error}"))?;
+    let roots = {
+        let mut statement = connection
+            .prepare(
+                "SELECT
+                    p.id,
+                    p.source_drive_id,
+                    sd.name,
+                    p.source_relative_path,
+                    sf.name,
+                    COALESCE(sf.is_directory, 0),
+                    sf.size_bytes,
+                    p.destination_relative_path
+                 FROM planned_moves p
+                 JOIN drives sd
+                   ON sd.persistent_identifier = p.source_drive_id
+                 LEFT JOIN files sf
+                   ON sf.drive_id = p.source_drive_id
+                  AND sf.relative_path = p.source_relative_path
+                 WHERE p.destination_location_id = ?1
+                 ORDER BY lower(p.destination_relative_path)",
+            )
+            .map_err(|error| format!("Unable to query planned folder: {error}"))?;
 
-    let rows = statement
-        .query_map(params![destination_location_id], |row| {
-            let destination_relative_path: String = row.get(6)?;
-            let source_relative_path: String = row.get(3)?;
-            let stored_name: Option<String> = row.get(4)?;
+        let rows = statement
+            .query_map(params![destination_location_id], |row| {
+                let source_relative_path: String = row.get(3)?;
+                let stored_name: Option<String> = row.get(4)?;
 
-            let name = stored_name.unwrap_or_else(|| {
-                Path::new(&source_relative_path)
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(&source_relative_path)
-                    .to_owned()
-            });
+                let name = stored_name.unwrap_or_else(|| {
+                    Path::new(&source_relative_path)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(&source_relative_path)
+                        .to_owned()
+                });
 
-            Ok(PlannedFolderEntry {
-                move_id: row.get(0)?,
-                source_drive_id: row.get(1)?,
-                source_drive_name: row.get(2)?,
-                source_relative_path,
-                name,
-                size_bytes: row.get(5)?,
-                destination_relative_path,
+                Ok(PlannedFolderEntry {
+                    move_id: row.get(0)?,
+                    source_drive_id: row.get(1)?,
+                    source_drive_name: row.get(2)?,
+                    source_relative_path,
+                    name,
+                    is_directory: row.get::<_, i64>(5)? != 0,
+                    size_bytes: row.get(6)?,
+                    destination_relative_path: row.get(7)?,
+                })
             })
-        })
-        .map_err(|error| format!("Unable to read planned folder: {error}"))?;
+            .map_err(|error| format!("Unable to read planned folder: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read planned folder rows: {error}"))?
+    };
 
     let mut entries = Vec::new();
 
-    for row in rows {
-        let entry = row.map_err(|error| format!("Unable to read planned folder row: {error}"))?;
-
-        let destination_parent = Path::new(&entry.destination_relative_path)
+    for root in roots {
+        let destination_parent = Path::new(&root.destination_relative_path)
             .parent()
             .and_then(|value| value.to_str())
             .unwrap_or("")
             .replace('\\', "/");
 
+        // Show the planned item itself in its future parent folder.
         if destination_parent == parent_path {
-            entries.push(entry);
+            entries.push(root.clone());
+        }
+
+        if !root.is_directory {
+            continue;
+        }
+
+        // If the user is browsing inside a planned directory at its future
+        // location, map that virtual path back to the source catalogue.
+        let source_parent = if parent_path == root.destination_relative_path {
+            Some(root.source_relative_path.clone())
+        } else {
+            let prefix = format!("{}/", root.destination_relative_path);
+
+            parent_path.strip_prefix(&prefix).map(|suffix| {
+                if suffix.is_empty() {
+                    root.source_relative_path.clone()
+                } else {
+                    format!("{}/{}", root.source_relative_path, suffix)
+                }
+            })
+        };
+
+        let Some(source_parent) = source_parent else {
+            continue;
+        };
+
+        let children = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT relative_path, name, is_directory, size_bytes
+                     FROM files
+                     WHERE drive_id = ?1 AND parent_path = ?2
+                     ORDER BY lower(name)",
+                )
+                .map_err(|error| format!("Unable to query planned directory contents: {error}"))?;
+
+            let rows = statement
+                .query_map(params![root.source_drive_id, source_parent], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(|error| format!("Unable to read planned directory contents: {error}"))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read planned directory rows: {error}"))?
+        };
+
+        for (source_relative_path, name, is_directory, size_bytes) in children {
+            let destination_relative_path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", parent_path, name)
+            };
+
+            entries.push(PlannedFolderEntry {
+                move_id: root.move_id,
+                source_drive_id: root.source_drive_id.clone(),
+                source_drive_name: root.source_drive_name.clone(),
+                source_relative_path,
+                name,
+                is_directory,
+                size_bytes,
+                destination_relative_path,
+            });
         }
     }
+
+    entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
 
     Ok(entries)
 }

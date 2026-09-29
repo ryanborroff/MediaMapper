@@ -92,6 +92,7 @@ type PlannedMove = {
   sourceRelativePath: string;
   sourceName: string;
   sourceSizeBytes: number | null;
+  sourceIsDirectory: boolean;
   destinationLocationId: string;
   destinationLocationName: string;
   destinationRelativePath: string;
@@ -104,6 +105,7 @@ type PlannedFolderEntry = {
   sourceDriveName: string;
   sourceRelativePath: string;
   name: string;
+  isDirectory: boolean;
   sizeBytes: number | null;
   destinationRelativePath: string;
 };
@@ -155,7 +157,7 @@ function App() {
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
   const [driveLabelDraft, setDriveLabelDraft] = useState("");
   const [savingDriveLabel, setSavingDriveLabel] = useState(false);
-  const [selectedPlanFile, setSelectedPlanFile] = useState<CatalogueEntry | null>(null);
+  const [selectedPlanEntry, setSelectedPlanEntry] = useState<CatalogueEntry | null>(null);
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
   const [savingPlan, setSavingPlan] = useState(false);
@@ -431,13 +433,12 @@ function App() {
   };
 
   const beginPlanMove = (entry: CatalogueEntry) => {
-    if (entry.isDirectory) return;
-    setSelectedPlanFile(entry);
+    setSelectedPlanEntry(entry);
     setPlanDestinationLocationId(
       browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
     );
 
-    // Start from the file's current folder. This makes the proposed
+    // Start from the item's current folder. This makes the proposed
     // destination explicit and prevents the UI from making a root-level
     // destination look like the file's existing catalogue location.
     const separator = entry.relativePath.lastIndexOf("/");
@@ -449,12 +450,12 @@ function App() {
   };
 
   const savePlannedMove = async () => {
-    if (!browserDrive || !selectedPlanFile || !planDestinationLocationId) return;
+    if (!browserDrive || !selectedPlanEntry || !planDestinationLocationId) return;
 
     const folder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
     const destinationRelativePath = folder
-      ? `${folder}/${selectedPlanFile.name}`
-      : selectedPlanFile.name;
+      ? `${folder}/${selectedPlanEntry.name}`
+      : selectedPlanEntry.name;
 
     setSavingPlan(true);
     setError(null);
@@ -462,14 +463,14 @@ function App() {
     try {
       await invoke<number>("create_planned_move", {
         sourceDriveId: browserDrive.persistentIdentifier,
-        sourceRelativePath: selectedPlanFile.relativePath,
+        sourceRelativePath: selectedPlanEntry.relativePath,
         destinationLocationId: planDestinationLocationId,
         destinationRelativePath,
       });
       await loadPlannedMoves();
       await openFolder(browserDrive, browserPath);
 
-      setSelectedPlanFile(null);
+      setSelectedPlanEntry(null);
       setPlanDestinationFolder("");
     } catch (cause) {
       setError(String(cause));
@@ -575,16 +576,16 @@ function App() {
     const online = connectedIds.has(liveDrive.persistentIdentifier);
 
     const normalisedPlanFolder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
-    const proposedDestinationPath = selectedPlanFile
+    const proposedDestinationPath = selectedPlanEntry
       ? (normalisedPlanFolder
-          ? `${normalisedPlanFolder}/${selectedPlanFile.name}`
-          : selectedPlanFile.name)
+          ? `${normalisedPlanFolder}/${selectedPlanEntry.name}`
+          : selectedPlanEntry.name)
       : "";
 
     const planIsCurrentLocation =
-      selectedPlanFile !== null &&
+      selectedPlanEntry !== null &&
       planDestinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
-      proposedDestinationPath === selectedPlanFile.relativePath;
+      proposedDestinationPath === selectedPlanEntry.relativePath;
 
     const plannedMoveBySourcePath = new Map(
       plannedMoves
@@ -687,13 +688,27 @@ function App() {
               {entries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
 
+                const openOrPlan = () => {
+                  if (entry.isDirectory) {
+                    void openFolder(liveDrive, entry.relativePath);
+                  } else {
+                    beginPlanMove(entry);
+                  }
+                };
+
                 return (
-                  <button
+                  <div
                     className={`file-row ${entry.isDirectory ? "folder-row" : "plannable-file-row"} ${plannedMove ? "moving-out-row" : ""}`}
                     key={entry.relativePath}
-                    onClick={() => entry.isDirectory
-                      ? void openFolder(liveDrive, entry.relativePath)
-                      : beginPlanMove(entry)}
+                    role="button"
+                    tabIndex={0}
+                    onClick={openOrPlan}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openOrPlan();
+                      }
+                    }}
                   >
                     <span className="file-name">
                       <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
@@ -707,8 +722,24 @@ function App() {
                       </span>
                     </span>
                     <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
-                    <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
-                  </button>
+                    {entry.isDirectory ? (
+                      <span className="folder-row-actions">
+                        <span>Folder</span>
+                        <button
+                          type="button"
+                          className="folder-plan-button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            beginPlanMove(entry);
+                          }}
+                        >
+                          Plan move
+                        </button>
+                      </span>
+                    ) : (
+                      <span>{formatBytes(entry.sizeBytes)}</span>
+                    )}
+                  </div>
                 );
               })}
 
@@ -717,12 +748,21 @@ function App() {
                   !entries.some((entry) => entry.relativePath === planned.destinationRelativePath),
                 )
                 .map((planned) => (
-                  <div
-                    className="file-row planned-arrival-row"
-                    key={`planned:${planned.moveId}`}
+                  <button
+                    className={`file-row planned-arrival-row ${planned.isDirectory ? "folder-row" : ""}`}
+                    key={`planned:${planned.moveId}:${planned.destinationRelativePath}`}
+                    type="button"
+                    disabled={!planned.isDirectory}
+                    onClick={() => {
+                      if (planned.isDirectory) {
+                        void openFolder(liveDrive, planned.destinationRelativePath);
+                      }
+                    }}
                   >
                     <span className="file-name">
-                      <span className="file-kind" aria-hidden="true" />
+                      <span className="file-kind" aria-hidden="true">
+                        {planned.isDirectory ? "▸" : ""}
+                      </span>
                       <span className="file-name-text">
                         <span className="file-name-primary">{planned.name}</span>
                         <span className="planned-row-status">
@@ -731,28 +771,28 @@ function App() {
                       </span>
                     </span>
                     <span>Planned</span>
-                    <span>{formatBytes(planned.sizeBytes)}</span>
-                  </div>
+                    <span>{planned.isDirectory ? "Folder" : formatBytes(planned.sizeBytes)}</span>
+                  </button>
                 ))}
             </>
           )}
         </section>}
 
-        {selectedPlanFile && <section className="plan-move-panel">
+        {selectedPlanEntry && <section className="plan-move-panel">
           <div className="plan-move-heading">
             <div>
               <p className="eyebrow">PLANNED LOCATION</p>
               <h2>Plan move</h2>
               <p className="section-description">
-                {selectedPlanFile.name} remains at its current location until a future transfer is explicitly executed.
+                {selectedPlanEntry.name} remains at its current location until a future transfer is explicitly executed.
               </p>
             </div>
-            <button className="plan-cancel-button" onClick={() => setSelectedPlanFile(null)}>Cancel</button>
+            <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
           </div>
 
           <div className="plan-source">
             <span>Current</span>
-            <strong>{liveDrive.name} / {selectedPlanFile.relativePath}</strong>
+            <strong>{liveDrive.name} / {selectedPlanEntry.relativePath}</strong>
           </div>
 
           <div className="plan-fields">
@@ -820,7 +860,7 @@ function App() {
               })()}
               {" / "}
               {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
-              {selectedPlanFile.name}
+              {selectedPlanEntry.name}
             </strong>
           </div>
 
