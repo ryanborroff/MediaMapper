@@ -342,6 +342,9 @@ function App() {
   const [driveLabelDraft, setDriveLabelDraft] = useState("");
   const [savingDriveLabel, setSavingDriveLabel] = useState(false);
   const [selectedPlanEntry, setSelectedPlanEntry] = useState<CatalogueEntry | null>(null);
+  // Why the plan panel's last action was refused. Shown inside the panel: the
+  // page's error banner is at the top, out of sight below a long folder.
+  const [planError, setPlanError] = useState<string | null>(null);
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
   const [savingPlan, setSavingPlan] = useState(false);
@@ -515,6 +518,12 @@ function App() {
     planPanel.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
     planLocationSelect.current?.focus({ preventScroll: true });
   }, [selectedPlanEntry]);
+
+  // A refusal describes the destination it was given; once the user picks
+  // another item, location or folder it no longer applies.
+  useEffect(() => {
+    setPlanError(null);
+  }, [selectedPlanEntry, planDestinationLocationId, planDestinationFolder]);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -795,7 +804,7 @@ function App() {
       setSelectedPlanEntry(null);
       setPlanDestinationFolder("");
     } catch (cause) {
-      setError(String(cause));
+      setPlanError(String(cause));
     } finally {
       setSavingPlan(false);
     }
@@ -847,7 +856,7 @@ function App() {
       await loadLocations();
       setPlanDestinationLocationId(location.id);
     } catch (cause) {
-      setError(String(cause));
+      setPlanError(String(cause));
     }
   };
 
@@ -1316,11 +1325,15 @@ function App() {
           </div>
 
           <div className="plan-actions">
-            <span className={planIsCurrentLocation ? "plan-location-warning" : undefined}>
-              {planIsCurrentLocation
-                ? "Already at this location."
-                : "This changes the Media Mapper plan only. No files are moved."}
-            </span>
+            {planError ? (
+              <span className="plan-location-warning" role="alert">{planError}</span>
+            ) : (
+              <span className={planIsCurrentLocation ? "plan-location-warning" : undefined}>
+                {planIsCurrentLocation
+                  ? "Already at this location."
+                  : "This changes the Media Mapper plan only. No files are moved."}
+              </span>
+            )}
             <button
               className="browse-button"
               disabled={!planDestinationLocationId || savingPlan || planIsCurrentLocation}
