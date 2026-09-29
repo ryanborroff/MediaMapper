@@ -325,6 +325,17 @@ function App() {
   const browserState = useRef({ browserDrive, browserPath, searchQuery });
   browserState.current = { browserDrive, browserPath, searchQuery };
 
+  // The plan panel opens below the file list, which can be long, so bring it
+  // into view and move keyboard focus to its first field when a file is picked.
+  const planPanel = useRef<HTMLElement>(null);
+  const planLocationSelect = useRef<HTMLSelectElement>(null);
+  useEffect(() => {
+    if (!selectedPlanEntry) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    planPanel.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
+    planLocationSelect.current?.focus({ preventScroll: true });
+  }, [selectedPlanEntry]);
+
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<ScanProgress>("scan-progress", (event) => setScanProgress(event.payload))
@@ -988,7 +999,7 @@ function App() {
           )}
         </section>}
 
-        {selectedPlanEntry && <section className="plan-move-panel">
+        {selectedPlanEntry && <section className="plan-move-panel" ref={planPanel}>
           <div className="plan-move-heading">
             <div>
               <p className="eyebrow">PLANNED LOCATION</p>
@@ -1009,6 +1020,7 @@ function App() {
             <label>
               <span>Move to</span>
               <select
+                ref={planLocationSelect}
                 value={planDestinationLocationId}
                 onChange={(event) => setPlanDestinationLocationId(event.target.value)}
               >
