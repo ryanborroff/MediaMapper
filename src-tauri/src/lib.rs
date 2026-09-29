@@ -34,6 +34,9 @@ struct CataloguedDrive {
     file_count: i64,
     directory_count: i64,
     catalogued_bytes: i64,
+    // Folders the last scan could not fully read. Their catalogued contents
+    // are incomplete.
+    unreadable_folder_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +48,10 @@ struct ScanResult {
     catalogued_bytes: i64,
     skipped_count: i64,
     scanned_at: i64,
+    unreadable_folder_count: i64,
+    // A few of the unreadable folders, for the scan summary. "" is the top
+    // folder of the drive.
+    unreadable_examples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +121,8 @@ struct CatalogueEntry {
     is_directory: bool,
     size_bytes: Option<i64>,
     modified_at: Option<i64>,
+    // A folder the last scan could not fully read.
+    unreadable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -359,6 +368,14 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
             .map_err(|error| format!("Unable to add drive byte count: {error}"))?;
         added_summary_columns = true;
     }
+    if !existing_columns.contains("unreadable_folder_count") {
+        connection
+            .execute(
+                "ALTER TABLE drives ADD COLUMN unreadable_folder_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| format!("Unable to add drive unreadable folder count: {error}"))?;
+    }
 
     // Existing catalogues are preserved. This aggregation runs once when the
     // summary columns are first added; subsequent catalogue loads read the
@@ -443,6 +460,15 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
         transaction
             .commit()
             .map_err(|error| format!("Unable to commit parent path migration: {error}"))?;
+    }
+
+    if !file_columns.contains("unreadable") {
+        connection
+            .execute(
+                "ALTER TABLE files ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| format!("Unable to add unreadable folder marker: {error}"))?;
     }
 
     connection
@@ -843,7 +869,8 @@ async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedD
                     d.last_scanned_at,
                     d.file_count,
                     d.directory_count,
-                    d.catalogued_bytes
+                    d.catalogued_bytes,
+                    d.unreadable_folder_count
                 FROM drives d
                 ORDER BY lower(d.name)
                 ",
@@ -863,6 +890,7 @@ async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedD
                     file_count: row.get(7)?,
                     directory_count: row.get(8)?,
                     catalogued_bytes: row.get(9)?,
+                    unreadable_folder_count: row.get(10)?,
                 })
             })
             .map_err(|error| format!("Unable to read catalogue: {error}"))?;
@@ -897,14 +925,35 @@ fn is_volume_system_folder(name: &str) -> bool {
         .any(|system_folder| system_folder.eq_ignore_ascii_case(name))
 }
 
+// Walks the drive and writes every entry through `insert_statement`.
+//
+// A folder that cannot be read, or an entry whose details cannot be read, is
+// skipped and its folder is added to `unreadable_folders` ("" for the top
+// folder), so one unreadable folder does not stop the whole scan. The scan
+// still fails if the top folder of the drive cannot be listed at all, since
+// nothing could be catalogued.
 fn scan_directory(
     root: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
     drive_id: &str,
     counters: &mut (i64, i64, i64, i64),
+    unreadable_folders: &mut Vec<String>,
     report_progress: &dyn Fn(&(i64, i64, i64, i64), &str),
     last_emit_at: &mut Instant,
 ) -> Result<(), String> {
+    let relative_to_root = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    };
+    // Folders are read one at a time, so a repeat is always the latest entry.
+    let note_unreadable = |unreadable_folders: &mut Vec<String>, folder: String| {
+        if unreadable_folders.last() != Some(&folder) {
+            unreadable_folders.push(folder);
+        }
+    };
+
     // Keep directory traversal on the heap rather than the call stack. This
     // avoids stack overflow on drives with unusually deep folder structures.
     let mut directories = vec![root.to_path_buf()];
@@ -914,32 +963,30 @@ fn scan_directory(
             return Err(SCAN_CANCELLED.to_string());
         }
 
-        let entries = fs::read_dir(&current).map_err(|error| {
-            let relative = current
-                .strip_prefix(root)
-                .unwrap_or(&current)
-                .to_string_lossy();
-            format!(
-                "Scan could not read folder '{}': {error}. The previous catalogue has been kept unchanged.",
-                if relative.is_empty() { "/" } else { relative.as_ref() }
-            )
-        })?;
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) if current == root => {
+                return Err(format!(
+                    "Scan could not read the top folder of the drive: {error}. The previous catalogue has been kept unchanged."
+                ));
+            }
+            Err(_) => {
+                note_unreadable(unreadable_folders, relative_to_root(&current));
+                continue;
+            }
+        };
 
         for entry_result in entries {
             if scan_is_cancelled(drive_id) {
                 return Err(SCAN_CANCELLED.to_string());
             }
 
-            let entry = entry_result.map_err(|error| {
-                let relative = current
-                    .strip_prefix(root)
-                    .unwrap_or(&current)
-                    .to_string_lossy();
-                format!(
-                    "Scan could not read an entry in folder '{}': {error}. The previous catalogue has been kept unchanged.",
-                    if relative.is_empty() { "/" } else { relative.as_ref() }
-                )
-            })?;
+            let Ok(entry) = entry_result else {
+                // The listing broke off part way; the rest of this folder is
+                // unknown.
+                note_unreadable(unreadable_folders, relative_to_root(&current));
+                break;
+            };
 
             let name = entry.file_name().to_string_lossy().into_owned();
 
@@ -955,16 +1002,10 @@ fn scan_directory(
             }
 
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy();
-                format!(
-                    "Scan could not read metadata for '{}': {error}. The previous catalogue has been kept unchanged.",
-                    relative
-                )
-            })?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                note_unreadable(unreadable_folders, relative_to_root(&current));
+                continue;
+            };
 
             // Never follow symlinks. This prevents a catalogue scan escaping the selected volume.
             if metadata.file_type().is_symlink() {
@@ -1089,9 +1130,11 @@ async fn scan_drive(
         // cancelled or failed scan leaves locations exactly as they were.
         sync_drive_locations(&transaction)?;
 
-        // A rescan replaces the previous snapshot atomically. Any filesystem read
-        // failure aborts the scan, so an incomplete traversal can never replace the
-        // last good catalogue. Cancellation and other failures roll back here too.
+        // A rescan replaces the previous snapshot atomically. Cancellation,
+        // database errors and an unreadable top folder roll everything back,
+        // keeping the last catalogue. Folders deeper in the drive that cannot
+        // be read are skipped and marked, so the new catalogue says where it
+        // is incomplete.
         transaction
             .execute("DELETE FROM files WHERE drive_id = ?1", params![drive_id])
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
@@ -1107,6 +1150,7 @@ async fn scan_drive(
             .map_err(|error| format!("Unable to prepare catalogue writer: {error}"))?;
 
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
+        let mut unreadable_folders = Vec::new();
         let mut last_emit_at = Instant::now();
         emit_scan_progress(&progress_app, &drive_id, &counters, "");
         if let Err(error) = scan_directory(
@@ -1114,6 +1158,7 @@ async fn scan_drive(
             &mut insert_statement,
             &drive_id,
             &mut counters,
+            &mut unreadable_folders,
             &|counters, current_path| {
                 emit_scan_progress(&progress_app, &drive_id, counters, current_path)
             },
@@ -1130,6 +1175,20 @@ async fn scan_drive(
 
         drop(insert_statement);
 
+        {
+            let mut mark_unreadable = transaction
+                .prepare(
+                    "UPDATE files SET unreadable = 1 WHERE drive_id = ?1 AND relative_path = ?2",
+                )
+                .map_err(|error| format!("Unable to mark unreadable folders: {error}"))?;
+            for folder in unreadable_folders.iter().filter(|folder| !folder.is_empty()) {
+                mark_unreadable
+                    .execute(params![drive_id, folder])
+                    .map_err(|error| format!("Unable to mark unreadable folders: {error}"))?;
+            }
+        }
+        let unreadable_folder_count = unreadable_folders.len() as i64;
+
         transaction
             .execute(
                 "
@@ -1137,10 +1196,18 @@ async fn scan_drive(
                 SET last_scanned_at = ?1,
                     file_count = ?2,
                     directory_count = ?3,
-                    catalogued_bytes = ?4
-                WHERE persistent_identifier = ?5
+                    catalogued_bytes = ?4,
+                    unreadable_folder_count = ?5
+                WHERE persistent_identifier = ?6
                 ",
-                params![scanned_at, counters.0, counters.1, counters.2, drive_id],
+                params![
+                    scanned_at,
+                    counters.0,
+                    counters.1,
+                    counters.2,
+                    unreadable_folder_count,
+                    drive_id
+                ],
             )
             .map_err(|error| format!("Unable to finish drive scan: {error}"))?;
 
@@ -1155,6 +1222,8 @@ async fn scan_drive(
             catalogued_bytes: counters.2,
             skipped_count: counters.3,
             scanned_at,
+            unreadable_folder_count,
+            unreadable_examples: unreadable_folders.into_iter().take(3).collect(),
         })
     })
     .await
@@ -1173,7 +1242,7 @@ async fn list_catalogue_entries(
         let mut statement = connection
             .prepare(
                 "
-                SELECT relative_path, name, is_directory, size_bytes, modified_at
+                SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
                 FROM files
                 WHERE drive_id = ?1
                   AND parent_path = ?2
@@ -1190,6 +1259,7 @@ async fn list_catalogue_entries(
                     is_directory: row.get::<_, i64>(2)? != 0,
                     size_bytes: row.get(3)?,
                     modified_at: row.get(4)?,
+                    unreadable: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
@@ -1292,7 +1362,7 @@ async fn search_catalogue(
             .collect();
 
         let sql = format!(
-            "SELECT relative_path, name, is_directory, size_bytes, modified_at
+            "SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
              FROM files
              WHERE drive_id = ?1
                AND {}
@@ -1319,6 +1389,7 @@ async fn search_catalogue(
                     is_directory: row.get::<_, i64>(2)? != 0,
                     size_bytes: row.get(3)?,
                     modified_at: row.get(4)?,
+                    unreadable: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|error| format!("Unable to read search results: {error}"))?;
@@ -2645,6 +2716,7 @@ mod tests {
             &mut insert,
             "UUID-SCAN",
             &mut counters,
+            &mut Vec::new(),
             &|_, _| {},
             &mut Instant::now(),
         );
@@ -2969,6 +3041,99 @@ mod tests {
         }
 
         assert_planned_moves_migrated(&database.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_unreadable_folders_and_reports_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database = TestDatabase::new("unreadable-folders");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-unreadable-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        for folder in ["Video", "Private", "Public/Nested/Locked"] {
+            fs::create_dir_all(volume.0.join(folder)).unwrap();
+        }
+        fs::write(volume.0.join("Video/film.mp4"), b"film").unwrap();
+        fs::write(volume.0.join("Public/ok.txt"), b"ok").unwrap();
+        fs::write(volume.0.join("Private/secret.mp4"), b"secret").unwrap();
+        fs::write(volume.0.join("Public/Nested/Locked/x.mp4"), b"x").unwrap();
+
+        let set_mode = |relative: &str, mode: u32| {
+            fs::set_permissions(volume.0.join(relative), fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-LOCK", "Test");
+        let transaction = connection.transaction().unwrap();
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        let mut scan = |counters: &mut (i64, i64, i64, i64), unreadable: &mut Vec<String>| {
+            transaction
+                .execute("DELETE FROM files WHERE drive_id = 'UUID-LOCK'", [])
+                .unwrap();
+            scan_directory(
+                &volume.0,
+                &mut insert,
+                "UUID-LOCK",
+                counters,
+                unreadable,
+                &|_, _| {},
+                &mut Instant::now(),
+            )
+        };
+
+        set_mode("Private", 0o000);
+        set_mode("Public/Nested/Locked", 0o000);
+        let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
+        let mut unreadable = Vec::new();
+        let result = scan(&mut counters, &mut unreadable);
+        set_mode("Private", 0o755);
+        set_mode("Public/Nested/Locked", 0o755);
+
+        result.expect("an unreadable folder must not stop the scan");
+        unreadable.sort();
+        assert_eq!(unreadable, ["Private", "Public/Nested/Locked"]);
+
+        // The unreadable folders themselves are catalogued; their contents
+        // are not.
+        let paths: Vec<String> = transaction
+            .prepare("SELECT relative_path FROM files ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            [
+                "Private",
+                "Public",
+                "Public/Nested",
+                "Public/Nested/Locked",
+                "Public/ok.txt",
+                "Video",
+                "Video/film.mp4"
+            ]
+        );
+        assert_eq!(counters, (2, 5, 6, 0));
+
+        // With nothing readable at the top of the drive the scan still fails,
+        // keeping the previous catalogue.
+        set_mode("", 0o000);
+        let result = scan(&mut (0, 0, 0, 0), &mut Vec::new());
+        set_mode("", 0o755);
+        let error = result.unwrap_err();
+        assert!(error.contains("top folder"), "{error}");
     }
 
     #[test]

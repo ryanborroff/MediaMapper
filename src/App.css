@@ -652,3 +652,17 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 @media (hover: none) {
   .row-action button { opacity: 1; }
 }
+
+/* A folder the last scan could not fully read. Amber: needs attention
+   (UI guidelines section 12). */
+.unreadable-note {
+  color: #8a5200;
+}
+.file-name-text .unreadable-note {
+  display: block;
+  margin-top: 3px;
+  font-size: 13px;
+}
+.scan-complete .unreadable-note {
+  margin-top: 6px;
+}
