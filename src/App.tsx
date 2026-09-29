@@ -301,7 +301,7 @@ function App() {
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeView, setActiveView] = useState<"drives" | "browse">("drives");
+  const [activeView, setActiveView] = useState<"drives" | "browse" | "plan">("drives");
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
   const [entries, setEntries] = useState<CatalogueEntry[]>([]);
@@ -929,7 +929,138 @@ function App() {
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
 
-  if (activeView === "browse" && !browserDrive) {
+  if (activeView === "plan" && !browserDrive) {
+    const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+    const folderMoveCount = plannedMoves.length - fileMoves.length;
+    const knownBytes = planPreflight?.knownBytes ?? fileMoves.reduce((sum, move) => sum + (move.sourceSizeBytes ?? 0), 0);
+    const sourceIds = Array.from(new Set(plannedMoves.map((move) => move.sourceDriveId)));
+    const destinationIds = Array.from(new Set(plannedMoves.map((move) => move.destinationLocationId)));
+    const missingNames = Array.from(new Set([
+      ...sourceIds
+        .filter((id) => !connectedIds.has(id))
+        .map((id) => sourceDriveName(id)),
+      ...destinationIds.flatMap((id) => {
+        const location = locations.find((item) => item.id === id);
+        if (!location || location.kind === "local_folder") return [];
+        return location.driveId && !connectedIds.has(location.driveId)
+          ? [location.userLabel ?? location.displayName]
+          : [];
+      }),
+    ]));
+    const planReady = plannedMoves.length > 0 && planValidation?.ready === true && (planPreflight?.issues.length ?? 0) === 0;
+    const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
+
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Plan</button>
+            <button className="sidebar-item" type="button" disabled>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content plan-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">PLAN</p>
+              <h1>Planned transfers</h1>
+              <p className="intro">Organise what goes where. Nothing is copied until the required locations are connected and you approve it.</p>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          {plannedMoves.length === 0 ? (
+            <section className="plan-empty">
+              <h2>Nothing planned yet</h2>
+              <p>Browse your catalogued files and choose Plan move to add files here.</p>
+              <button className="browse-button" type="button" onClick={() => setActiveView("browse")}>Browse files</button>
+            </section>
+          ) : (
+            <>
+              <section className="plan-overview">
+                <div>
+                  <span>Planned</span>
+                  <strong>{plannedMoves.length.toLocaleString()} {plannedMoves.length === 1 ? "item" : "items"} · {formatBytes(knownBytes)}</strong>
+                </div>
+                <div>
+                  <span>Status</span>
+                  <strong className={planReady ? "plan-ready-text" : "plan-waiting-text"}>
+                    {planReady ? "Ready to transfer" : missingNames.length > 0 ? `Waiting for ${missingNames.join(" and ")}` : "Needs attention"}
+                  </strong>
+                </div>
+              </section>
+
+              {missingNames.length > 0 && (
+                <section className="connect-instruction">
+                  <span className="connect-instruction-label">NEXT STEP</span>
+                  <h2>Connect {missingNames.join(" and ")}</h2>
+                  <p>{missingNames.length === 1 ? "This location is" : "These locations are"} required before the planned transfer can run. No files will be staged on this Mac.</p>
+                </section>
+              )}
+
+              {planReady && (
+                <section className="connect-instruction ready">
+                  <span className="connect-instruction-label">READY</span>
+                  <h2>Required locations are connected</h2>
+                  <p>MediaMapper will copy directly from source to destination and verify each file.</p>
+                </section>
+              )}
+
+              {(planPreflight?.issues.length ?? 0) > 0 && missingNames.length === 0 && (
+                <section className="plan-attention">
+                  <strong>Plan needs attention</strong>
+                  <ul>{planPreflight!.issues.map((issue, index) => <li key={`${issue.code}:${index}`}>{issue.message}</li>)}</ul>
+                </section>
+              )}
+
+              <section className="plan-file-list">
+                {plannedMoves.map((move) => {
+                  const paths = plannedMovePaths(move);
+                  return (
+                    <div className="plan-file-row" key={move.id}>
+                      <div className="transfer-item">
+                        <strong>{move.sourceName}</strong>
+                        <TransferPaths from={paths.from} to={paths.to} />
+                      </div>
+                      <span>{formatBytes(move.sourceSizeBytes)}</span>
+                      <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                    </div>
+                  );
+                })}
+              </section>
+
+              <section className="plan-review">
+                <div>
+                  <strong>{fileMoves.length.toLocaleString()} {fileMoves.length === 1 ? "file" : "files"} · {formatBytes(knownBytes)}</strong>
+                  <span>Originals remain untouched.</span>
+                  {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
+                </div>
+                {!showCopyConfirmation ? (
+                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Review copy</button>
+                ) : (
+                  <div className="plan-copy-actions">
+                    <button className="secondary-button" disabled={executingPlan} onClick={() => setShowCopyConfirmation(false)}>Cancel</button>
+                    <button className="section-action" disabled={!canCopy} onClick={() => void copyPlannedFiles()}>
+                      {executingPlan ? "Copying…" : "Copy and verify"}
+                    </button>
+                  </div>
+                )}
+              </section>
+
+              {showCopyConfirmation && (
+                <p className="plan-confirmation-note">Final checks run again immediately before each copy. MediaMapper copies directly between locations and verifies the result byte for byte.</p>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+    if (activeView === "browse" && !browserDrive) {
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
@@ -937,7 +1068,7 @@ function App() {
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
-            <button className="sidebar-item" type="button" disabled>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
             <button className="sidebar-item" type="button" disabled>Transfers</button>
           </nav>
         </aside>
@@ -1428,7 +1559,7 @@ function App() {
         <nav className="sidebar-navigation" aria-label="Main navigation">
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
-          <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Plan</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
           <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Transfers</button>
         </nav>
       </aside>
