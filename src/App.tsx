@@ -1793,11 +1793,6 @@ function App() {
           </div>
 
           {folderPickerOpen && (() => {
-            const destination = locations.find(
-              (location) => location.id === planDestinationLocationId,
-            );
-            const destinationName =
-              destination?.userLabel ?? destination?.displayName ?? "Destination";
             const parts = folderPickerPath ? folderPickerPath.split("/") : [];
 
             return (
