@@ -592,6 +592,39 @@ function App() {
         .map((move) => [move.sourceRelativePath, move]),
     );
 
+    const parentFolder = (relativePath: string) => {
+      const separator = relativePath.lastIndexOf("/");
+      return separator === -1 ? "" : relativePath.slice(0, separator);
+    };
+
+    const movingToLabel = (move: PlannedMove) => {
+      const destinationFolder = parentFolder(move.destinationRelativePath);
+      const sameLocation =
+        move.destinationLocationId === `drive:${liveDrive.persistentIdentifier}`;
+
+      if (sameLocation) {
+        return destinationFolder || liveDrive.name;
+      }
+
+      return destinationFolder
+        ? `${move.destinationLocationName} / ${destinationFolder}`
+        : move.destinationLocationName;
+    };
+
+    const movingFromLabel = (planned: PlannedFolderEntry) => {
+      const sourceFolder = parentFolder(planned.sourceRelativePath);
+      const sameLocation =
+        planned.sourceDriveId === liveDrive.persistentIdentifier;
+
+      if (sameLocation) {
+        return sourceFolder || liveDrive.name;
+      }
+
+      return sourceFolder
+        ? `${planned.sourceDriveName} / ${sourceFolder}`
+        : planned.sourceDriveName;
+    };
+
     return (
       <main className="app-shell browser-shell">
         <header className="browser-header">
@@ -668,7 +701,7 @@ function App() {
                         <span className="file-name-primary">{entry.name}</span>
                         {plannedMove && (
                           <span className="planned-row-status">
-                            Moving to {plannedMove.destinationLocationName}
+                            Moving to {movingToLabel(plannedMove)}
                           </span>
                         )}
                       </span>
@@ -693,7 +726,7 @@ function App() {
                       <span className="file-name-text">
                         <span className="file-name-primary">{planned.name}</span>
                         <span className="planned-row-status">
-                          Moving here from {planned.sourceDriveName}
+                          Moving here from {movingFromLabel(planned)}
                         </span>
                       </span>
                     </span>
