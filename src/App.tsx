@@ -1187,7 +1187,6 @@ function App() {
             <div>
               <p className="eyebrow">BROWSE</p>
               <h1>All files</h1>
-              <p className="intro">Search and browse every catalogued drive, even when it is offline.</p>
             </div>
           </header>
 
@@ -1198,7 +1197,7 @@ function App() {
               className="browse-global-search"
               type="search"
               value={libraryQuery}
-              placeholder="Search all files"
+              placeholder="Search files"
               aria-label="Search all catalogued files"
               autoFocus
               onChange={(event) => void searchLibrary(event.target.value)}
@@ -1237,10 +1236,8 @@ function App() {
                   <button className="browse-drive-card" key={drive.persistentIdentifier} onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>
                     <span className="browse-drive-card-top">
                       <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
-                      <span>{connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
                     </span>
-                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)}</span>
-                    <span>Scanned {formatDate(drive.lastScannedAt)}</span>
+                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
                   </button>
                 ))}
               </div>
