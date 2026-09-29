@@ -124,6 +124,31 @@ function formatDate(timestamp: number | null) {
     .format(new Date(timestamp * 1000));
 }
 
+function parentFolder(relativePath: string) {
+  const separator = relativePath.lastIndexOf("/");
+  return separator === -1 ? "" : relativePath.slice(0, separator);
+}
+
+// Paths are shown as "Location / Folder / Subfolder" (UI guidelines §10).
+function formatLocationPath(locationName: string, relativePath: string) {
+  return [locationName, ...relativePath.split("/").filter(Boolean)].join(" / ");
+}
+
+// The single representation of a planned move, used wherever a plan is shown,
+// so plans always read the same way and never look like a real move.
+function PlannedPath({ direction, locationName, folder }: {
+  direction: "to" | "from";
+  locationName: string;
+  folder: string;
+}) {
+  const path = formatLocationPath(locationName, folder);
+  return (
+    <span className="planned-path" title={path}>
+      {direction === "to" ? "Planned → " : "Planned from "}{path}
+    </span>
+  );
+}
+
 function App() {
   const [connected, setConnected] = useState<DriveInfo[]>([]);
   const [catalogued, setCatalogued] = useState<CataloguedDrive[]>([]);
@@ -251,6 +276,11 @@ function App() {
             location.driveId === persistentIdentifier,
         )
       : undefined;
+
+  // Media Mapper labels are the primary drive identity; the volume name is
+  // only a fallback when no label has been set.
+  const driveDisplayName = (persistentIdentifier: string | null, volumeName: string) =>
+    locationForDrive(persistentIdentifier)?.userLabel ?? volumeName;
 
   const beginDriveLabelEdit = (persistentIdentifier: string, currentLabel: string | null) => {
     setEditingDriveLabelId(persistentIdentifier);
@@ -603,6 +633,8 @@ function App() {
   if (browserDrive) {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
     const online = connectedIds.has(liveDrive.persistentIdentifier);
+    const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
+    const liveDriveHasLabel = liveDriveName !== liveDrive.name;
 
     const normalisedPlanFolder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
     const proposedDestinationPath = selectedPlanEntry
@@ -622,48 +654,21 @@ function App() {
         .map((move) => [move.sourceRelativePath, move]),
     );
 
-    const parentFolder = (relativePath: string) => {
-      const separator = relativePath.lastIndexOf("/");
-      return separator === -1 ? "" : relativePath.slice(0, separator);
-    };
-
-    const movingToLabel = (move: PlannedMove) => {
-      const destinationFolder = parentFolder(move.destinationRelativePath);
-      const sameLocation =
-        move.destinationLocationId === `drive:${liveDrive.persistentIdentifier}`;
-
-      if (sameLocation) {
-        return destinationFolder || liveDrive.name;
-      }
-
-      return destinationFolder
-        ? `${move.destinationLocationName} / ${destinationFolder}`
-        : move.destinationLocationName;
-    };
-
-    const movingFromLabel = (planned: PlannedFolderEntry) => {
+    const plannedFromPath = (planned: PlannedFolderEntry) => {
       // Projected children of a planned folder move should describe the
       // original location of the moved folder, not repeat each child's
       // increasingly long source path.
       const rootMove = plannedMoves.find((move) => move.id === planned.moveId);
-      const sourceRelativePath =
-        rootMove?.sourceRelativePath ?? planned.sourceRelativePath;
-      const sourceDriveId =
-        rootMove?.sourceDriveId ?? planned.sourceDriveId;
-      const sourceDriveName =
-        rootMove?.sourceDriveName ?? planned.sourceDriveName;
-
-      const sourceFolder = parentFolder(sourceRelativePath);
-      const sameLocation =
-        sourceDriveId === liveDrive.persistentIdentifier;
-
-      if (sameLocation) {
-        return sourceFolder || liveDrive.name;
-      }
-
-      return sourceFolder
-        ? `${sourceDriveName} / ${sourceFolder}`
-        : sourceDriveName;
+      return (
+        <PlannedPath
+          direction="from"
+          locationName={driveDisplayName(
+            rootMove?.sourceDriveId ?? planned.sourceDriveId,
+            rootMove?.sourceDriveName ?? planned.sourceDriveName,
+          )}
+          folder={parentFolder(rootMove?.sourceRelativePath ?? planned.sourceRelativePath)}
+        />
+      );
     };
 
     return (
@@ -675,14 +680,15 @@ function App() {
           <div className="browser-title-row">
             <div>
               <p className="eyebrow">{online ? "CONNECTED CATALOGUE" : "OFFLINE CATALOGUE"}</p>
-              <h1>{liveDrive.name}</h1>
+              <h1>{liveDriveName}</h1>
+              {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
             </div>
             <span className={online ? "browser-status online-label" : "browser-status offline-label"}>
               {online ? "CONNECTED" : "OFFLINE"}
             </span>
           </div>
           <nav className="breadcrumbs" aria-label="Folder path">
-            <button onClick={() => void openFolder(liveDrive, "")}>{liveDrive.name}</button>
+            <button onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
             {pathParts.map((part, index) => {
               const path = pathParts.slice(0, index + 1).join("/");
               return (
@@ -694,8 +700,8 @@ function App() {
             })}
           </nav>
           <div className="catalogue-search">
-            <input type="search" value={searchQuery} placeholder={`Search ${liveDrive.name}`}
-              aria-label={`Search ${liveDrive.name} catalogue`}
+            <input type="search" value={searchQuery} placeholder={`Search ${liveDriveName}`}
+              aria-label={`Search ${liveDriveName} catalogue`}
               onChange={(event) => void searchCatalogue(liveDrive, event.target.value)} />
             {searchQuery.trim() && <span className="search-summary">
               {searching ? "Searching…" : `${searchResults.length}${searchResults.length === 200 ? "+" : ""} result${searchResults.length === 1 ? "" : "s"}`}
@@ -808,9 +814,11 @@ function App() {
                       <span className="file-name-text">
                         <span className="file-name-primary">{entry.name}</span>
                         {plannedMove && (
-                          <span className="planned-row-status">
-                            Moving to {movingToLabel(plannedMove)}
-                          </span>
+                          <PlannedPath
+                            direction="to"
+                            locationName={plannedMove.destinationLocationName}
+                            folder={parentFolder(plannedMove.destinationRelativePath)}
+                          />
                         )}
                       </span>
                     </span>
@@ -862,9 +870,7 @@ function App() {
                       </span>
                       <span className="file-name-text">
                         <span className="file-name-primary">{planned.name}</span>
-                        <span className="planned-row-status">
-                          Moving here from {movingFromLabel(planned)}
-                        </span>
+                        {plannedFromPath(planned)}
                       </span>
                     </span>
                     <span>Planned</span>
@@ -889,7 +895,7 @@ function App() {
 
           <div className="plan-source">
             <span>Current</span>
-            <strong>{liveDrive.name} / {selectedPlanEntry.relativePath}</strong>
+            <strong>{liveDriveName} / {selectedPlanEntry.relativePath}</strong>
           </div>
 
           <div className="plan-fields">
@@ -1000,7 +1006,7 @@ function App() {
       {error && <div className="notice error">{error}</div>}
 
       {catalogued.length > 0 && <section className="section-block">
-        <div className="section-heading"><h2>Search all drives</h2><span>{catalogued.length}</span></div>
+        <div className="section-heading"><h2>Search all drives</h2></div>
         <div className="catalogue-search">
           <input
             type="search"
@@ -1030,128 +1036,6 @@ function App() {
               <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
             </button>)}
         </div>}
-      </section>}
-
-      {catalogued.length > 0 && <section className="section-block">
-        <div className="section-heading">
-          <div>
-            <h2>Probable duplicates</h2>
-            <p className="section-description">Same filename and exact file size. Contents have not been compared.</p>
-          </div>
-          <button
-            className="browse-button"
-            onClick={() => void loadDuplicates()}
-            disabled={duplicatesLoading}
-          >
-            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
-          </button>
-        </div>
-
-        {showDuplicates && <div className="search-results">
-          {duplicateGroups.length === 0 ? (
-            <div className="browser-message">No probable duplicates found.</div>
-          ) : (
-            duplicateGroups.map((group) => {
-              const key = `${group.name}:${group.sizeBytes}`;
-              const expanded = expandedDuplicate === key;
-
-              return (
-                <div className="duplicate-group" key={key}>
-                  <button
-                    className="search-result"
-                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
-                  >
-                    <span className="search-result-main">
-                      <strong>{group.name}</strong>
-                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
-                    </span>
-                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
-                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
-                  </button>
-
-                  {expanded && <div className="duplicate-files">
-                    {group.files.map((file) => (
-                      <button
-                        className="search-result"
-                        key={`${file.driveId}:${file.relativePath}`}
-                        onClick={() => void openDuplicateFile(file)}
-                      >
-                        <span className="search-result-main">
-                          <strong>{file.driveName}</strong>
-                          <span>{file.relativePath}</span>
-                        </span>
-                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
-                        <span>{formatBytes(file.sizeBytes)}</span>
-                      </button>
-                    ))}
-                  </div>}
-                </div>
-              );
-            })
-          )}
-        </div>}
-      </section>}
-
-      {catalogued.length > 0 && <section className="section-block">
-        <div className="section-heading">
-          <h2>Largest files</h2>
-          <button
-            className="browse-button"
-            onClick={() => void loadLargestFiles()}
-            disabled={largestFilesLoading}
-          >
-            {largestFilesLoading ? "Loading…" : showLargestFiles ? "Hide" : "Show 100 largest"}
-          </button>
-        </div>
-
-        {showLargestFiles && <div className="search-results">
-          {largestFiles.length === 0 ? (
-            <div className="browser-message">No catalogued files with size information.</div>
-          ) : (
-            largestFiles.map((file) => (
-              <button
-                className="search-result"
-                key={`${file.driveId}:${file.relativePath}`}
-                onClick={() => void openLargestFile(file)}
-              >
-                <span className="search-result-main">
-                  <strong>{file.name}</strong>
-                  <span>{file.driveName} / {file.relativePath}</span>
-                </span>
-                <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
-                <span>{formatBytes(file.sizeBytes)}</span>
-              </button>
-            ))
-          )}
-        </div>}
-      </section>}
-
-      {plannedMoves.length > 0 && <section className="section-block">
-        <div className="section-heading">
-          <div>
-            <h2>Planned moves</h2>
-            <p className="section-description">Virtual locations only. No files have been moved.</p>
-          </div>
-          <span>{plannedMoves.length}</span>
-        </div>
-
-        <div className="planned-move-list">
-          {plannedMoves.map((move) => (
-            <div className="planned-move-row" key={move.id}>
-              <div className="planned-move-main">
-                <strong>{move.sourceName}</strong>
-                <span>{move.sourceDriveName} / {move.sourceRelativePath}</span>
-                <span className="planned-destination">
-                  Planned → {move.destinationLocationName} / {move.destinationRelativePath}
-                </span>
-              </div>
-              <span>{formatBytes(move.sourceSizeBytes)}</span>
-              <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
-                Remove
-              </button>
-            </div>
-          ))}
-        </div>
       </section>}
 
       <section className="section-block">
@@ -1308,6 +1192,131 @@ function App() {
           </div>
         )}
       </section>
+
+      {plannedMoves.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <h2>Planned moves</h2>
+          <span>{plannedMoves.length}</span>
+        </div>
+        <p className="section-description">Virtual locations only. No files have been moved.</p>
+
+        <div className="planned-move-list">
+          {plannedMoves.map((move) => (
+            <div className="planned-move-row" key={move.id}>
+              <div className="planned-move-main">
+                <strong>{move.sourceName}</strong>
+                <span>
+                  {formatLocationPath(
+                    driveDisplayName(move.sourceDriveId, move.sourceDriveName),
+                    parentFolder(move.sourceRelativePath),
+                  )}
+                </span>
+                <PlannedPath
+                  direction="to"
+                  locationName={move.destinationLocationName}
+                  folder={parentFolder(move.destinationRelativePath)}
+                />
+              </div>
+              <span>{formatBytes(move.sourceSizeBytes)}</span>
+              <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>}
+
+      {catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <h2>Probable duplicates</h2>
+          <button
+            className="section-action"
+            onClick={() => void loadDuplicates()}
+            disabled={duplicatesLoading}
+          >
+            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
+          </button>
+        </div>
+        <p className="section-description">Same filename and exact file size. Contents have not been compared.</p>
+
+        {showDuplicates && <div className="search-results">
+          {duplicateGroups.length === 0 ? (
+            <div className="browser-message">No probable duplicates found.</div>
+          ) : (
+            duplicateGroups.map((group) => {
+              const key = `${group.name}:${group.sizeBytes}`;
+              const expanded = expandedDuplicate === key;
+
+              return (
+                <div className="duplicate-group" key={key}>
+                  <button
+                    className="search-result"
+                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
+                  >
+                    <span className="search-result-main">
+                      <strong>{group.name}</strong>
+                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
+                    </span>
+                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
+                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
+                  </button>
+
+                  {expanded && <div className="duplicate-files">
+                    {group.files.map((file) => (
+                      <button
+                        className="search-result"
+                        key={`${file.driveId}:${file.relativePath}`}
+                        onClick={() => void openDuplicateFile(file)}
+                      >
+                        <span className="search-result-main">
+                          <strong>{file.driveName}</strong>
+                          <span>{file.relativePath}</span>
+                        </span>
+                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                        <span>{formatBytes(file.sizeBytes)}</span>
+                      </button>
+                    ))}
+                  </div>}
+                </div>
+              );
+            })
+          )}
+        </div>}
+      </section>}
+
+      {catalogued.length > 0 && <section className="section-block">
+        <div className="section-heading">
+          <h2>Largest files</h2>
+          <button
+            className="section-action"
+            onClick={() => void loadLargestFiles()}
+            disabled={largestFilesLoading}
+          >
+            {largestFilesLoading ? "Loading…" : showLargestFiles ? "Hide" : "Show 100 largest"}
+          </button>
+        </div>
+
+        {showLargestFiles && <div className="search-results">
+          {largestFiles.length === 0 ? (
+            <div className="browser-message">No catalogued files with size information.</div>
+          ) : (
+            largestFiles.map((file) => (
+              <button
+                className="search-result"
+                key={`${file.driveId}:${file.relativePath}`}
+                onClick={() => void openLargestFile(file)}
+              >
+                <span className="search-result-main">
+                  <strong>{file.name}</strong>
+                  <span>{file.driveName} / {file.relativePath}</span>
+                </span>
+                <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
+                <span>{formatBytes(file.sizeBytes)}</span>
+              </button>
+            ))
+          )}
+        </div>}
+      </section>}
 
       <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only and does not open, rename, move, copy or delete files.</footer>
     </main>

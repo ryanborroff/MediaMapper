@@ -12,41 +12,41 @@ button { font: inherit; }
 
 .app-shell { max-width: 1040px; margin: 0 auto; padding: 56px 48px 32px; }
 .app-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 32px; margin-bottom: 40px; }
-.eyebrow { margin: 0 0 8px; font-size: 12px; font-weight: 700; letter-spacing: .16em; color: #777; }
+.eyebrow { margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .16em; color: #6b6b6b; }
 h1 { margin: 0; font-size: 34px; letter-spacing: -.035em; font-weight: 650; }
 .intro { max-width: 620px; margin: 10px 0 0; color: #686868; font-size: 15px; line-height: 1.5; }
-.refresh-button, .scan-button { border: 1px solid #d2d2cf; background: transparent; border-radius: 9px; padding: 9px 15px; color: #252525; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+.refresh-button, .scan-button { font-size: 13px; border: 1px solid #d2d2cf; background: transparent; border-radius: 9px; padding: 9px 15px; color: #252525; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
 .refresh-button:disabled, .scan-button:disabled { color: #999; cursor: default; }
-.scan-button { margin-top: 10px; padding: 7px 12px; font-size: 12px; }
+.scan-button { margin-top: 10px; padding: 7px 12px; font-size: 13px; }
 .section-block { margin-top: 30px; }
 .section-heading { display: flex; align-items: center; gap: 9px; margin-bottom: 12px; }
 .section-heading h2 { margin: 0; font-size: 15px; font-weight: 650; }
-.section-heading span { color: #888; font-size: 12px; }
+.section-heading span { color: #6b6b6b; font-size: 13px; }
 .drive-list { display: grid; gap: 16px; }
 .drive-card, .empty-state, .notice { background: transparent; border: 1px solid #dededb; border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.035); }
 .drive-card.offline { background: #fafafa; }
 .drive-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .drive-title-row h3 { margin: 7px 0 0; font-size: 21px; font-weight: 620; letter-spacing: -.02em; }
 .drive-actions { display: flex; flex-direction: column; align-items: flex-end; }
-.status-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #27864a; }
+.status-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #1f6e3c; }
 .status-dot.offline-dot { background: #999; }
-.online-label, .offline-label { font-size: 10px; font-weight: 700; letter-spacing: .11em; }
-.online-label { color: #27864a; }
-.offline-label { color: #777; }
-.capacity { font-size: 17px; font-weight: 600; color: #353535; white-space: nowrap; }
+.online-label, .offline-label { font-size: 11px; font-weight: 700; letter-spacing: .11em; }
+.online-label { color: #1f6e3c; }
+.offline-label { color: #6b6b6b; }
+.capacity { font-size: 15px; font-weight: 600; color: #353535; white-space: nowrap; }
 .capacity-bar { height: 6px; margin: 20px 0 22px; overflow: hidden; border-radius: 9px; background: #e9e9e6; }
 .capacity-bar span { display: block; height: 100%; background: #555; border-radius: inherit; }
 .drive-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px 32px; margin: 0; }
 .drive-details div { min-width: 0; }
 .offline-details { margin-top: 22px; }
-dt { margin-bottom: 4px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+dt { margin-bottom: 4px; color: #6b6b6b; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
 dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-height: 1.4; }
 .empty-state { padding: 56px 32px; text-align: center; }
 .empty-state.compact { padding: 28px; }
-.empty-state h3 { margin: 0 0 8px; font-size: 17px; }
-.empty-state p { margin: 0; color: #707070; font-size: 13px; }
+.empty-state h3 { margin: 0 0 8px; font-size: 15px; }
+.empty-state p { margin: 0; color: #6b6b6b; font-size: 13px; }
 .notice.error { margin-bottom: 20px; color: #8d2626; background: #fff8f8; border-color: #ead1d1; }
-.safety-note { margin-top: 32px; color: #858585; font-size: 12px; text-align: center; }
+.safety-note { margin-top: 32px; color: #6b6b6b; font-size: 13px; text-align: center; }
 
 @media (max-width: 760px) {
   .app-shell { padding: 36px 28px 24px; }
@@ -62,7 +62,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   color: #fff;
   border-radius: 9px;
   padding: 7px 12px;
-  font-size: 12px;
+  font-size: 13px;
   cursor: pointer;
 }
 .browser-shell { max-width: 1180px; }
@@ -70,39 +70,39 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .back-button { margin-bottom: 28px; background: transparent; color: #333; }
 .browser-title-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
 .browser-status { margin-top: 10px; }
-.breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 18px; color: #777; font-size: 13px; }
+.breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 18px; color: #6b6b6b; font-size: 13px; }
 .breadcrumbs button { padding: 0; border: 0; background: transparent; color: #444; cursor: pointer; }
 .crumb-separator { margin-right: 6px; color: #aaa; }
 .file-browser { overflow: hidden; background: transparent; border: 1px solid #dededb; border-radius: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.035); }
 .file-browser-head, .file-row { display: grid; grid-template-columns: minmax(280px, 1fr) 210px 110px; gap: 20px; align-items: center; }
-.file-browser-head { padding: 11px 18px; border-bottom: 1px solid #e5e5e2; color: #888; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.file-browser-head { padding: 11px 18px; border-bottom: 1px solid #e5e5e2; color: #6b6b6b; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .file-row { width: 100%; padding: 11px 18px; border: 0; border-bottom: 1px solid #eeeeeb; background: transparent; color: #555; text-align: left; font-size: 13px; }
 .file-row:last-child { border-bottom: 0; }
 .file-row.folder-row { color: #222; cursor: pointer; }
 .file-row.folder-row:hover { background: #f7f7f5; }
 .file-row:disabled { opacity: 1; cursor: default; }
 .file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-kind { display: inline-block; width: 18px; color: #777; }
-.browser-message { padding: 48px 20px; color: #777; font-size: 13px; text-align: center; }
+.file-kind { display: inline-block; width: 18px; color: #6b6b6b; }
+.browser-message { padding: 48px 20px; color: #6b6b6b; font-size: 13px; text-align: center; }
 
 
 .catalogue-search { display:flex; align-items:center; gap:12px; margin-top:18px; }
 .catalogue-search input { width:min(520px,100%); border:1px solid #d2d2cf; border-radius:9px; padding:10px 12px; background:#fff; color:#222; font:inherit; font-size:13px; outline:none; }
 .catalogue-search input:focus { border-color:#999; box-shadow:0 0 0 3px rgba(0,0,0,.05); }
-.search-summary { color:#888; font-size:12px; white-space:nowrap; }
+.search-summary { color: #6b6b6b; font-size: 13px; white-space:nowrap; }
 .search-results { overflow:hidden; margin-bottom:22px; background:#fff; border:1px solid #dededb; border-radius:14px; box-shadow:0 1px 3px rgba(0,0,0,.035); }
 .search-result { display:grid; grid-template-columns:minmax(280px,1fr) 110px 210px; gap:20px; align-items:center; width:100%; padding:12px 18px; border:0; border-bottom:1px solid #eeeeeb; background:#fff; color:#555; text-align:left; cursor:pointer; }
 .search-result:last-child { border-bottom:0; }
 .search-result:hover { background:#f7f7f5; }
 .search-result-main { min-width:0; display:flex; flex-direction:column; gap:3px; }
 .search-result-main strong { overflow:hidden; color:#222; font-size:13px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
-.search-result-main span { overflow:hidden; color:#888; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
+.search-result-main span { overflow:hidden; color: #6b6b6b; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
 
-.scan-progress, .scan-complete { margin-top:18px; padding:14px 16px; border:1px solid #e2e2df; border-radius:10px; background:#f8f8f6; font-size:12px; }
+.scan-progress, .scan-complete { margin-top:18px; padding:14px 16px; border:1px solid #e2e2df; border-radius:10px; background:#f8f8f6; font-size: 13px; }
 .scan-progress-row { display:flex; justify-content:space-between; gap:20px; color:#333; }
 .scan-progress-row strong { font-weight:650; }
 .scan-progress-stats { display:flex; flex-wrap:wrap; gap:12px; margin-top:7px; color:#666; font-size:11px; }
-.scan-progress-path { margin-top:8px; overflow:hidden; color:#888; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
+.scan-progress-path { margin-top:8px; overflow:hidden; color: #6b6b6b; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
 .scan-complete { color:#444; }
 
 .scan-progress {
@@ -170,13 +170,17 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.scan-cancelled { margin-top:18px; padding:14px 16px; border:1px solid #e2e2df; border-radius:10px; background:#f8f8f6; color:#555; font-size:12px; }
+.scan-cancelled { margin-top:18px; padding:14px 16px; border:1px solid #e2e2df; border-radius:10px; background:#f8f8f6; color:#555; font-size: 13px; }
 
-/* Stable scan status region: always reserves the same space in connected drive cards. */
+/* Stable scan status region: reserves fixed space only while there is a status to show. */
 .scan-status-slot {
   height: 122px;
   margin-top: 18px;
   overflow: hidden;
+}
+.scan-status-slot:empty {
+  height: 0;
+  margin-top: 0;
 }
 .scan-status-slot .scan-progress,
 .scan-status-slot .scan-complete,
@@ -191,22 +195,33 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 
 /* Media Mapper typography consolidation */
 .section-heading h2 { font-size:15px; line-height:1.3; font-weight:650; }
-.section-description, .section-heading span, .search-summary { font-size:12px; line-height:1.4; font-weight:400; }
-.search-result { font-size:12px; line-height:1.35; }
+.section-description, .section-heading span, .search-summary { font-size: 13px; line-height:1.4; font-weight:400; }
+.search-result { font-size: 13px; line-height:1.35; }
 .search-result-main strong { font-size:13px; line-height:1.35; font-weight:600; }
-.search-result-main span { font-size:12px; line-height:1.35; font-weight:400; }
-.search-result > span:not(.search-result-main) { font-size:12px; line-height:1.35; font-weight:400; color:#666; }
+.search-result-main span { font-size: 13px; line-height:1.35; font-weight:400; }
+.search-result > span:not(.search-result-main) { font-size: 13px; line-height:1.35; font-weight:400; color:#666; }
 .duplicate-group > .search-result > span:nth-child(3) { font-weight:500; color:#444; }
 .duplicate-files .search-result { padding-top:10px; padding-bottom:10px; background:#fafafa; }
-.duplicate-files .search-result-main strong { font-size:12px; font-weight:500; }
-.duplicate-files .search-result-main span { font-size:11px; color:#888; }
-.browse-button, .back-button, .scan-button, .cancel-scan-button { font-size:12px; line-height:1.2; }
+.duplicate-files .search-result-main strong { font-size: 13px; font-weight:500; }
+.duplicate-files .search-result-main span { font-size:11px; color: #6b6b6b; }
+.browse-button, .back-button, .scan-button, .cancel-scan-button { font-size: 13px; line-height:1.2; }
 
-/* Fine-tune described section actions to the description line. */
-.section-heading > div + .browse-button {
-  align-self: center;
-  transform: translateY(10px);
+/* Section tools are secondary: an outline button at the end of the heading row. */
+.section-action {
+  margin-left: auto;
+  border: 1px solid #d2d2cf;
+  border-radius: 9px;
+  padding: 7px 12px;
+  background: transparent;
+  color: #252525;
+  font-size: 13px;
+  line-height: 1.2;
+  cursor: pointer;
 }
+.section-action:hover { background: #ededea; }
+.section-action:disabled { color: #999; cursor: default; }
+
+.section-heading + .section-description { margin: -4px 0 12px; color: #6b6b6b; }
 
 /* Keep safety copy on one line when space allows. */
 .safety-note {
@@ -256,7 +271,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   background: transparent;
   color: #666;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
   cursor: pointer;
 }
 
@@ -272,14 +287,14 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   grid-template-columns: 82px minmax(0, 1fr);
   gap: 12px;
   margin-top: 18px;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .plan-source > span,
 .plan-preview > span,
 .plan-fields label > span {
-  color: #777;
-  font-size: 10px;
+  color: #6b6b6b;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: .04em;
   text-transform: uppercase;
@@ -288,7 +303,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 .plan-source strong,
 .plan-preview strong {
   overflow-wrap: anywhere;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
 }
 
@@ -314,7 +329,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   background: #fff;
   color: #252525;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .plan-actions {
@@ -328,7 +343,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 }
 
 .plan-actions > span {
-  color: #777;
+  color: #6b6b6b;
   font-size: 11px;
 }
 
@@ -345,7 +360,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   gap: 18px;
   padding: 12px 14px;
   border-bottom: 1px solid #e7e7e4;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .planned-move-row:last-child {
@@ -366,17 +381,24 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   white-space: nowrap;
 }
 
-.planned-move-main > span {
+.planned-move-main > span:not(.planned-path) {
   overflow: hidden;
-  color: #777;
+  color: #6b6b6b;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.planned-move-main .planned-destination {
+/* Shared planned-move line: neutral, never amber (amber means a warning). */
+.planned-path {
+  display: block;
+  max-width: 100%;
   margin-top: 3px;
-  color: #333;
+  overflow: hidden;
+  color: #555;
+  font-size: 13px;
   font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 
@@ -389,12 +411,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 
 
 .plan-location-warning {
-  color: #a86400;
+  color: #8a5200;
   font-weight: 600;
 }
 
 .plan-actions .plan-location-warning {
-  color: #a86400;
+  color: #8a5200;
   font-weight: 600;
 }
 
@@ -421,8 +443,8 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
 
 .drive-volume-name {
   margin-top: 3px;
-  color: #777;
-  font-size: 12px;
+  color: #6b6b6b;
+  font-size: 13px;
 }
 
 .drive-label-button {
@@ -430,7 +452,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   padding: 0;
   border: 0;
   background: transparent;
-  color: #777;
+  color: #6b6b6b;
   font: inherit;
   font-size: 11px;
   cursor: pointer;
@@ -455,7 +477,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   background: #fff;
   color: #252525;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .drive-label-editor button {
@@ -503,20 +525,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   white-space: nowrap;
 }
 
-.planned-row-status {
-  display: block;
-  margin-top: 3px;
-  color: #9a6a16;
-  font-size: 11px;
-  font-weight: 500;
-}
-
 .moving-out-row {
-  background: #fffdf7;
+  background: #fafaf8;
 }
 
 .planned-arrival-row {
-  background: #fffaf0;
+  background: #fafaf8;
   color: #555;
 }
 
@@ -535,7 +549,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   border: 0;
   padding: 0;
   background: transparent;
-  color: #777;
+  color: #6b6b6b;
   font: inherit;
   font-size: 11px;
   cursor: pointer;
