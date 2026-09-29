@@ -1781,13 +1781,17 @@ function App() {
                   </div>
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} />
-                <dl className="drive-details offline-details">
-                  {catalogue && <div><dt>Files</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Catalogued</dt><dd>{formatBytes(catalogue.cataloguedBytes)}</dd></div>}
-                  <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
-                  {catalogue && catalogue.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
-                </dl>
+                <div className="drive-meta">
+                  <span>
+                    {catalogue
+                      ? `${catalogue.fileCount.toLocaleString()} files · ${catalogue.directoryCount.toLocaleString()} folders · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
+                      : "Not catalogued yet"}
+                  </span>
+                  <span>{catalogue?.lastScannedAt ? `Scanned ${formatDate(catalogue.lastScannedAt)}` : "Not scanned yet"}</span>
+                  {catalogue && catalogue.unreadableFolderCount > 0 && (
+                    <span className="unreadable-note">Couldn't read {catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
+                  )}
+                </div>
                 <div className="scan-status-slot" aria-live="polite">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-progress">
@@ -1870,13 +1874,13 @@ function App() {
                   </div>
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
-                <dl className="drive-details offline-details">
-                  <div><dt>Files</dt><dd>{drive.fileCount.toLocaleString()}</dd></div>
-                  <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
-                  <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
-                  <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
-                  {drive.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
-                </dl>
+                <div className="drive-meta">
+                  <span>{drive.fileCount.toLocaleString()} files · {drive.directoryCount.toLocaleString()} folders · {formatBytes(drive.cataloguedBytes)} catalogued</span>
+                  <span>{drive.lastScannedAt ? `Scanned ${formatDate(drive.lastScannedAt)}` : "Not scanned yet"}</span>
+                  {drive.unreadableFolderCount > 0 && (
+                    <span className="unreadable-note">Couldn't read {drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
+                  )}
+                </div>
               </article>
             ))}
           </div>
