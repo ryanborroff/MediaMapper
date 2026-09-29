@@ -762,18 +762,22 @@ function App() {
             <h1>{liveDriveName}</h1>
             {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
           </div>
-          <nav className="breadcrumbs" aria-label="Folder path">
+          {/* At the drive root the breadcrumb would only repeat the title. */}
+          {pathParts.length > 0 && <nav className="breadcrumbs" aria-label="Folder path">
             <button onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
             {pathParts.map((part, index) => {
               const path = pathParts.slice(0, index + 1).join("/");
+              const current = index === pathParts.length - 1;
               return (
                 <span key={path}>
                   <span className="crumb-separator">/</span>
-                  <button onClick={() => void openFolder(liveDrive, path)}>{part}</button>
+                  {current
+                    ? <span className="crumb-current" aria-current="page">{part}</span>
+                    : <button onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
                 </span>
               );
             })}
-          </nav>
+          </nav>}
           <div className="catalogue-search">
             <input type="search" value={searchQuery} placeholder={`Search ${liveDriveName}`}
               aria-label={`Search ${liveDriveName} catalogue`}
@@ -1075,7 +1079,7 @@ function App() {
         <div>
           <p className="eyebrow">MEDIA MAPPER</p>
           <h1>Drive catalogue</h1>
-          <p className="intro">Catalogue external drives once, then keep browsing their metadata after they are disconnected.</p>
+          <p className="intro">Catalogue external drives once, then keep browsing them while they're offline.</p>
         </div>
         <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
           {loading ? "Checking…" : "Refresh"}
@@ -1124,7 +1128,7 @@ function App() {
       <section className="section-block">
         <div className="section-heading"><h2>Connected</h2><span>{connected.length}</span></div>
         {!loading && connected.length === 0 && (
-          <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive, then choose Refresh.</p></div>
+          <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive and it will appear here.</p></div>
         )}
         <div className="drive-list">
           {connected.map((drive) => {

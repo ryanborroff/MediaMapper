@@ -352,9 +352,9 @@ Example:
 
 `No external drives detected`
 
-`Connect a drive, then choose Refresh.`
+`Connect a drive and it will appear here.`
 
-As automatic drive detection becomes the normal behaviour, wording should be updated so it does not unnecessarily instruct users to refresh manually.
+Drives are detected automatically, so empty states should not instruct users to refresh manually.
 
 ## 16. Lists and file information
 
