@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -231,8 +231,11 @@ function App() {
   // Keep physical drive availability current while the app is open.
   // This only asks macOS which external drives are mounted. It does not
   // scan, catalogue, or read file contents.
+  // The next check is scheduled only after the previous one finishes, so slow
+  // `diskutil` calls cannot pile up.
   useEffect(() => {
     let active = true;
+    let timeout: number | undefined;
 
     const refreshConnectedDrives = async () => {
       try {
@@ -244,17 +247,24 @@ function App() {
         // The main Refresh action remains responsible for surfacing errors.
         // A transient background check should not interrupt the user.
       }
+      if (active) {
+        timeout = window.setTimeout(() => void refreshConnectedDrives(), 2000);
+      }
     };
 
-    const interval = window.setInterval(() => {
-      void refreshConnectedDrives();
-    }, 2000);
+    timeout = window.setTimeout(() => void refreshConnectedDrives(), 2000);
 
     return () => {
       active = false;
-      window.clearInterval(interval);
+      window.clearTimeout(timeout);
     };
   }, []);
+
+  // Commands run concurrently, so responses can arrive out of order. Each
+  // loader numbers its requests and ignores any response that is not the latest.
+  const folderRequest = useRef(0);
+  const catalogueSearchRequest = useRef(0);
+  const librarySearchRequest = useRef(0);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -307,6 +317,7 @@ function App() {
   };
 
   const openFolder = useCallback(async (drive: CataloguedDrive, path: string) => {
+    const request = ++folderRequest.current;
     setBrowserDrive(drive);
     setBrowserPath(path);
     setBrowserLoading(true);
@@ -322,46 +333,56 @@ function App() {
           parentPath: path,
         }),
       ]);
+      if (request !== folderRequest.current) return;
       setEntries(catalogueEntries);
       setPlannedFolderEntries(plannedEntries);
     } catch (cause) {
+      if (request !== folderRequest.current) return;
       setError(String(cause));
       setEntries([]);
     } finally {
-      setBrowserLoading(false);
+      if (request === folderRequest.current) setBrowserLoading(false);
     }
   }, []);
 
   const searchCatalogue = useCallback(async (drive: CataloguedDrive, query: string) => {
+    const request = ++catalogueSearchRequest.current;
     setSearchQuery(query);
     const trimmed = query.trim();
-    if (!trimmed) { setSearchResults([]); return; }
+    if (!trimmed) { setSearchResults([]); setSearching(false); return; }
     setSearching(true); setError(null);
     try {
-      setSearchResults(await invoke<CatalogueEntry[]>("search_catalogue", {
+      const results = await invoke<CatalogueEntry[]>("search_catalogue", {
         persistentIdentifier: drive.persistentIdentifier, query: trimmed,
-      }));
-    } catch (cause) { setError(String(cause)); setSearchResults([]); }
-    finally { setSearching(false); }
+      });
+      if (request === catalogueSearchRequest.current) setSearchResults(results);
+    } catch (cause) {
+      if (request === catalogueSearchRequest.current) { setError(String(cause)); setSearchResults([]); }
+    }
+    finally { if (request === catalogueSearchRequest.current) setSearching(false); }
   }, []);
 
   const searchLibrary = useCallback(async (query: string) => {
+    const request = ++librarySearchRequest.current;
     setLibraryQuery(query);
     const trimmed = query.trim();
     if (!trimmed) {
       setLibraryResults([]);
+      setLibrarySearching(false);
       return;
     }
 
     setLibrarySearching(true);
     setError(null);
     try {
-      setLibraryResults(await invoke<LibrarySearchResult[]>("search_all_catalogues", { query: trimmed }));
+      const results = await invoke<LibrarySearchResult[]>("search_all_catalogues", { query: trimmed });
+      if (request === librarySearchRequest.current) setLibraryResults(results);
     } catch (cause) {
+      if (request !== librarySearchRequest.current) return;
       setError(String(cause));
       setLibraryResults([]);
     } finally {
-      setLibrarySearching(false);
+      if (request === librarySearchRequest.current) setLibrarySearching(false);
     }
   }, []);
 
