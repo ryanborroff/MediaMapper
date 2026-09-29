@@ -164,6 +164,22 @@ type PlanLiveValidation = {
   issues: PlanPreflightIssue[];
 };
 
+type TransferRecord = {
+  id: number;
+  plannedMoveId: number | null;
+  sourceDriveId: string;
+  sourceRelativePath: string;
+  destinationLocationId: string;
+  destinationRelativePath: string;
+  totalBytes: number | null;
+  copiedBytes: number;
+  status: string;
+  errorMessage: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -284,6 +300,10 @@ function App() {
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
   const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
+  const [showCopyConfirmation, setShowCopyConfirmation] = useState(false);
+  const [executingPlan, setExecutingPlan] = useState(false);
+  const [executionProgress, setExecutionProgress] = useState<{ completed: number; total: number } | null>(null);
+  const [executionMessage, setExecutionMessage] = useState<string | null>(null);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
@@ -318,6 +338,59 @@ function App() {
       setError(String(cause));
     }
   }, []);
+
+  const copyPlannedFiles = useCallback(async () => {
+    const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+
+    if (
+      fileMoves.length === 0 ||
+      executingPlan ||
+      !planValidation?.ready ||
+      (planPreflight?.issues.length ?? 0) > 0
+    ) {
+      return;
+    }
+
+    setExecutingPlan(true);
+    setExecutionMessage(null);
+    setExecutionProgress({ completed: 0, total: fileMoves.length });
+
+    let completed = 0;
+
+    try {
+      // The backend reruns final live validation immediately before every
+      // individual copy. UI validation is informative, not the safety gate.
+      for (const move of fileMoves) {
+        await invoke<TransferRecord>("execute_planned_move", {
+          plannedMoveId: move.id,
+        });
+
+        completed += 1;
+        setExecutionProgress({ completed, total: fileMoves.length });
+      }
+
+      setExecutionMessage(
+        `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.`,
+      );
+      setShowCopyConfirmation(false);
+      await loadPlannedMoves();
+    } catch (cause) {
+      setExecutionMessage(
+        completed > 0
+          ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}`
+          : `Nothing was copied. ${String(cause)}`,
+      );
+      await loadPlannedMoves();
+    } finally {
+      setExecutingPlan(false);
+    }
+  }, [
+    executingPlan,
+    loadPlannedMoves,
+    planPreflight,
+    planValidation,
+    plannedMoves,
+  ]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -1495,6 +1568,83 @@ function App() {
             </div>
           )}
         </div>}
+
+        {(() => {
+          const fileMoveCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
+          const folderMoveCount = plannedMoves.length - fileMoveCount;
+          const planReady =
+            planValidation?.ready === true &&
+            (planPreflight?.issues.length ?? 0) === 0;
+          const canCopy = planReady && fileMoveCount > 0 && !executingPlan;
+
+          return (
+            <div className="plan-copy">
+              {!showCopyConfirmation ? (
+                <div className="plan-copy-row">
+                  <div>
+                    <strong>Copy planned files</strong>
+                    <span>
+                      Copies are verified before completion. Originals stay in place.
+                    </span>
+                    {folderMoveCount > 0 && (
+                      <span>
+                        {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    className="section-action"
+                    disabled={!canCopy}
+                    onClick={() => {
+                      setExecutionMessage(null);
+                      setShowCopyConfirmation(true);
+                    }}
+                  >
+                    Review copy
+                  </button>
+                </div>
+              ) : (
+                <div className="plan-copy-confirmation">
+                  <div>
+                    <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
+                    <span>
+                      Media Mapper will run final checks again, copy each file, verify it byte for byte, and leave every original untouched.
+                    </span>
+                  </div>
+                  <div className="plan-copy-actions">
+                    <button
+                      className="secondary-button"
+                      disabled={executingPlan}
+                      onClick={() => setShowCopyConfirmation(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="section-action"
+                      disabled={!canCopy}
+                      onClick={() => void copyPlannedFiles()}
+                    >
+                      {executingPlan ? "Copying…" : "Copy and verify"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {executionProgress && executingPlan && (
+                <p className="plan-copy-status" aria-live="polite">
+                  Copied and verified {executionProgress.completed.toLocaleString()} of{" "}
+                  {executionProgress.total.toLocaleString()} files.
+                </p>
+              )}
+
+              {executionMessage && (
+                <p className="plan-copy-status" aria-live="polite">
+                  {executionMessage}
+                </p>
+              )}
+            </div>
+          );
+        })()}
 
         <div className="planned-move-list">
           {plannedMoves.map((move) => (

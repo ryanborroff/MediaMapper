@@ -482,6 +482,18 @@ fn execute_transfer_paths(
                 Some(copied_bytes),
                 None,
             )?;
+
+            // A verified transfer is no longer an active plan item. The
+            // transfer record contains its own source/destination snapshot,
+            // so removing the plan does not remove execution history.
+            connection
+                .execute(
+                    "DELETE FROM planned_moves WHERE id = ?1",
+                    params![planned_move_id],
+                )
+                .map_err(|error| {
+                    format!("Transfer completed, but the plan could not be cleared: {error}")
+                })?;
         }
         Err(error) => {
             // The transfer snapshot survives the failure and records why it
@@ -3269,6 +3281,15 @@ async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, Stri
 }
 
 #[tauri::command]
+async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        list_transfer_records(&connection)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn execute_planned_move(
     app: tauri::AppHandle,
     planned_move_id: i64,
@@ -3567,6 +3588,7 @@ pub fn run() {
             get_plan_preflight,
             validate_plan,
             execute_planned_move,
+            list_transfers,
             list_planned_folder_entries,
             remove_planned_move
         ])
@@ -5260,6 +5282,18 @@ mod tests {
         let history = list_transfer_records(&connection).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, "completed");
+
+        let planned_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM planned_moves WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            planned_count, 0,
+            "a completed verified transfer must leave the active plan"
+        );
     }
 
     #[test]
@@ -5318,6 +5352,19 @@ mod tests {
         let history = list_transfer_records(&connection).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, "failed");
+
+        let planned_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM planned_moves WHERE id = ?1",
+                params![move_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            planned_count, 1,
+            "a failed transfer must remain in the active plan"
+        );
+
         assert!(history[0]
             .error_message
             .as_deref()
