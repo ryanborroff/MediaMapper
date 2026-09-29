@@ -1773,6 +1773,14 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   border-left: 1px solid var(--divider);
 }
 
+.transfer-history-new-row {
+  padding-right: 18px;
+}
+
+.transfer-history-new-row .transfer-outcome {
+  transform: translateX(14px);
+}
+
 .transfer-history-new-row .transfer-outcome {
   display: flex;
   flex-direction: column;
