@@ -1076,7 +1076,7 @@ function App() {
             <div>
               <p className="eyebrow">PLAN</p>
               <h1>Planned transfers</h1>
-              <p className="intro">Organise what goes where. Nothing is copied until the required locations are connected and you approve it.</p>
+              <p className="intro">Organise your files. Decide what goes where. Copy only when you’re ready.</p>
             </div>
           </header>
 
