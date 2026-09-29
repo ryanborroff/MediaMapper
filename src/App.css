@@ -758,6 +758,16 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 .unreadable-note {
   color: var(--amber);
 }
+/* A refused drag-and-drop plan, shown on the folder it was dropped on.
+   Amber: a blocked action (UI guidelines section 12). */
+.drop-refusal {
+  display: block;
+  margin-top: 3px;
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .file-name-text .unreadable-note {
   display: block;
   margin-top: 3px;
