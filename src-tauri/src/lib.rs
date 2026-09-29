@@ -7,7 +7,10 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
@@ -829,10 +832,27 @@ fn issue_blocks_move(
     }
 }
 
+#[cfg(test)]
 fn execute_planned_transfer(
     connection: &Connection,
     planned_move_id: i64,
     connected_drives: &[DriveInfo],
+) -> Result<TransferRecord, String> {
+    execute_planned_transfer_reporting(
+        connection,
+        planned_move_id,
+        connected_drives,
+        &|_| {},
+        &|| false,
+    )
+}
+
+fn execute_planned_transfer_reporting(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+    report: &dyn Fn(&TransferProgress),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
@@ -922,7 +942,42 @@ fn execute_planned_transfer(
     let (source, destination) =
         resolve_transfer_paths(connection, planned_move_id, connected_drives)?;
 
-    execute_transfer_paths(connection, planned_move_id, &source, &destination)
+    execute_transfer_paths_reporting(
+        connection,
+        planned_move_id,
+        &source,
+        &destination,
+        report,
+        is_cancelled,
+    )
+}
+
+// Which part of a transfer is running: copying the file, then reading both
+// files back to compare them.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TransferStage {
+    Copying,
+    Verifying,
+}
+
+// Sent to the window as a large file copies, so progress is visible.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferProgress {
+    planned_move_id: i64,
+    stage: TransferStage,
+    bytes: u64,
+    total_bytes: u64,
+}
+
+// Set by Cancel copy and checked as each chunk is copied or verified.
+static TRANSFER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+const TRANSFER_CANCELLED: &str = "Copy cancelled.";
+
+#[tauri::command]
+fn cancel_transfer() {
+    TRANSFER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 // How long transfer bookkeeping waits for the database. Once a copy has been
@@ -931,11 +986,30 @@ fn execute_planned_transfer(
 // never freezes the window.
 const TRANSFER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
     source: &Path,
     destination: &Path,
+) -> Result<TransferRecord, String> {
+    execute_transfer_paths_reporting(
+        connection,
+        planned_move_id,
+        source,
+        destination,
+        &|_| {},
+        &|| false,
+    )
+}
+
+fn execute_transfer_paths_reporting(
+    connection: &Connection,
+    planned_move_id: i64,
+    source: &Path,
+    destination: &Path,
+    report: &dyn Fn(&TransferProgress),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
     connection
         .busy_timeout(TRANSFER_BUSY_TIMEOUT)
@@ -955,8 +1029,40 @@ fn execute_transfer_paths(
         return Err(error);
     }
 
-    let copy_result =
-        copy_file_verified_with_stage(source, destination, &temporary, |copied_bytes| {
+    // Progress goes to the window at most every 150 ms, and whenever the
+    // stage changes or a stage finishes. A cancel request stops the transfer
+    // at the next chunk.
+    let total_bytes = fs::metadata(source)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut last_report: Option<(TransferStage, Instant)> = None;
+    let mut on_progress = |stage: TransferStage, bytes: u64| -> Result<(), String> {
+        if is_cancelled() {
+            return Err(TRANSFER_CANCELLED.to_string());
+        }
+        let due = match last_report {
+            Some((last_stage, reported_at)) => {
+                last_stage != stage || reported_at.elapsed() >= Duration::from_millis(150)
+            }
+            None => true,
+        };
+        if due || bytes == total_bytes {
+            report(&TransferProgress {
+                planned_move_id,
+                stage,
+                bytes,
+                total_bytes,
+            });
+            last_report = Some((stage, Instant::now()));
+        }
+        Ok(())
+    };
+
+    let copy_result = copy_file_verified_with_progress(
+        source,
+        destination,
+        &temporary,
+        |copied_bytes| {
             let copied_bytes = i64::try_from(copied_bytes)
                 .map_err(|_| "Copied file is too large to record.".to_string())?;
 
@@ -967,7 +1073,9 @@ fn execute_transfer_paths(
                 Some(copied_bytes),
                 None,
             )
-        });
+        },
+        &mut on_progress,
+    );
 
     match copy_result {
         Ok(copied_bytes) => {
@@ -1195,6 +1303,16 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
 // Compares a source with its copy byte for byte. The copy is read with the
 // cache bypassed, so its bytes come from the drive.
 fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
+    files_are_identical_with_progress(first, second, &mut |_| Ok(()))
+}
+
+// As files_are_identical, reporting how many bytes have been compared.
+// Returning an error from on_progress stops the comparison.
+fn files_are_identical_with_progress(
+    first: &Path,
+    second: &Path,
+    on_progress: &mut dyn FnMut(u64) -> Result<(), String>,
+) -> Result<bool, String> {
     let first_file = fs::File::open(first)
         .map_err(|error| format!("Unable to open source for verification: {error}"))?;
     let second_file = fs::File::open(second)
@@ -1217,6 +1335,7 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
     let mut second_reader = BufReader::new(second_file);
     let mut first_buffer = vec![0_u8; 1024 * 1024];
     let mut second_buffer = vec![0_u8; 1024 * 1024];
+    let mut compared = 0_u64;
 
     loop {
         let first_count = first_reader
@@ -1237,6 +1356,9 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
         if first_buffer[..first_count] != second_buffer[..second_count] {
             return Ok(false);
         }
+
+        compared += first_count as u64;
+        on_progress(compared)?;
     }
 }
 
@@ -1376,11 +1498,30 @@ fn transfer_temporary_path(
     Ok(temporary)
 }
 
+#[cfg(test)]
 fn copy_file_verified_with_stage<F>(
     source: &Path,
     destination: &Path,
     temporary: &Path,
+    on_verifying: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64) -> Result<(), String>,
+{
+    copy_file_verified_with_progress(source, destination, temporary, on_verifying, &mut |_, _| {
+        Ok(())
+    })
+}
+
+// As copy_file_verified_with_stage, also reporting bytes copied and then
+// bytes verified as it goes. Returning an error from on_progress stops the
+// transfer; its temporary file is removed like any other failure.
+fn copy_file_verified_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    temporary: &Path,
     mut on_verifying: F,
+    on_progress: &mut dyn FnMut(TransferStage, u64) -> Result<(), String>,
 ) -> Result<u64, String>
 where
     F: FnMut(u64) -> Result<(), String>,
@@ -1423,8 +1564,21 @@ where
         // Uncached writes go straight to the drive, so write in large chunks.
         let mut writer = BufWriter::with_capacity(1024 * 1024, temporary_file);
 
-        let copied = std::io::copy(&mut reader, &mut writer)
-            .map_err(|error| format!("Unable to copy file: {error}"))?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("Unable to copy file: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            writer
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("Unable to copy file: {error}"))?;
+            copied += count as u64;
+            on_progress(TransferStage::Copying, copied)?;
+        }
 
         writer
             .flush()
@@ -1441,7 +1595,9 @@ where
 
         on_verifying(copied)?;
 
-        if !files_are_identical(source, temporary)? {
+        if !files_are_identical_with_progress(source, temporary, &mut |verified| {
+            on_progress(TransferStage::Verifying, verified)
+        })? {
             return Err("Copied file failed byte-for-byte verification.".to_string());
         }
 
@@ -3949,6 +4105,9 @@ async fn execute_planned_move(
     app: tauri::AppHandle,
     planned_move_id: i64,
 ) -> Result<TransferRecord, String> {
+    // A cancel requested before this copy began belongs to an earlier one.
+    TRANSFER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+
     run_blocking(move || {
         // Discover the physical drives immediately before execution. This is
         // deliberately inside the blocking worker because diskutil and file
@@ -3956,7 +4115,15 @@ async fn execute_planned_move(
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
 
-        execute_planned_transfer(&connection, planned_move_id, &drives)
+        execute_planned_transfer_reporting(
+            &connection,
+            planned_move_id,
+            &drives,
+            &|progress| {
+                let _ = app.emit("transfer-progress", progress);
+            },
+            &|| TRANSFER_CANCEL_REQUESTED.load(Ordering::SeqCst),
+        )
     })
     .await
 }
@@ -4280,6 +4447,7 @@ pub fn run() {
             list_catalogued_drives,
             scan_drive,
             cancel_scan,
+            cancel_transfer,
             list_catalogue_entries,
             search_catalogue,
             search_all_catalogues,
@@ -6159,6 +6327,147 @@ mod tests {
             destination,
             PathBuf::from("/Users/test/Media/Archive/source.mov")
         );
+    }
+
+    // A planned move from a 5 MB source file, ready to execute.
+    struct ProgressFixture {
+        database: TestDatabase,
+        volume: TestVolume,
+        connection: Connection,
+        move_id: i64,
+        source: PathBuf,
+        destination: PathBuf,
+        contents: Vec<u8>,
+    }
+
+    fn progress_fixture(name: &str) -> ProgressFixture {
+        let database = TestDatabase::new(name);
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-{name}-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("clip.mov");
+        let destination = volume.0.join("Archive/clip.mov");
+        let contents: Vec<u8> = (0..5 * 1024 * 1024_u32).map(|i| (i % 249) as u8).collect();
+        fs::write(&source, &contents).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'clip.mov', 'clip.mov', '', 0, ?1)",
+                params![contents.len() as i64],
+            )
+            .unwrap();
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "clip.mov",
+            "drive:UUID-B",
+            "Archive/clip.mov",
+        )
+        .unwrap();
+
+        ProgressFixture {
+            database,
+            volume,
+            connection,
+            move_id,
+            source,
+            destination,
+            contents,
+        }
+    }
+
+    #[test]
+    fn transfer_reports_copy_then_verify_progress() {
+        let fixture = progress_fixture("transfer-progress");
+        let reports = std::cell::RefCell::new(Vec::new());
+
+        let transfer = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| reports.borrow_mut().push(progress.clone()),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(transfer.status, "completed");
+
+        let reports = reports.into_inner();
+        let total = fixture.contents.len() as u64;
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.total_bytes == total
+                    && report.planned_move_id == fixture.move_id)
+        );
+
+        // Copying first, then verifying, each rising to the full size.
+        let split = reports
+            .iter()
+            .position(|report| report.stage == TransferStage::Verifying)
+            .expect("verification progress was reported");
+        let (copying, verifying) = reports.split_at(split);
+        assert!(!copying.is_empty());
+        assert!(copying
+            .iter()
+            .all(|report| report.stage == TransferStage::Copying));
+        assert!(verifying
+            .iter()
+            .all(|report| report.stage == TransferStage::Verifying));
+        for stage in [copying, verifying] {
+            assert!(stage.windows(2).all(|pair| pair[0].bytes <= pair[1].bytes));
+            assert_eq!(stage.last().unwrap().bytes, total);
+        }
+    }
+
+    #[test]
+    fn cancelled_transfer_leaves_no_copy_and_keeps_the_plan() {
+        let fixture = progress_fixture("transfer-cancel");
+
+        // Cancel once the copy is under way.
+        let checks = std::cell::Cell::new(0);
+        let error = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|_| {},
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert!(!fixture.destination.exists());
+        let leftovers: Vec<_> = fs::read_dir(fixture.destination.parent().unwrap())
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "the temporary file was removed");
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history[0].status, "failed");
+        assert_eq!(
+            history[0].error_message.as_deref(),
+            Some(TRANSFER_CANCELLED)
+        );
+        let planned: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(planned, 1, "a cancelled copy stays planned");
+        let _ = (&fixture.database, &fixture.volume);
     }
 
     #[test]

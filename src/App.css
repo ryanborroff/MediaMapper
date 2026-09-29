@@ -1099,6 +1099,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 
 
+
 /* Primary application navigation */
 .app-navigation-shell {
   width: min(1440px, calc(100% - 32px));
@@ -2146,4 +2147,15 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The file being copied: bytes done and a bar, first for copying and then
+   for verifying. */
+.transfer-file-progress {
+  display: grid;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.transfer-file-progress .capacity-bar {
+  margin-top: 0;
 }

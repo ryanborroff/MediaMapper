@@ -145,6 +145,14 @@ type PlanPreflightDestination = {
   capacitySufficient: boolean | null;
 };
 
+// Sent by the backend as a file is copied and then verified.
+type TransferProgress = {
+  plannedMoveId: number;
+  stage: "copying" | "verifying";
+  bytes: number;
+  totalBytes: number;
+};
+
 type PlanPreflightIssue = {
   code: string;
   message: string;
@@ -347,6 +355,10 @@ function App() {
   // Set synchronously so a second click cannot start another run before
   // React re-renders with the button disabled.
   const executionRunning = useRef(false);
+  const [fileProgress, setFileProgress] = useState<TransferProgress | null>(null);
+  // Set by Cancel copy: stops the file in progress and any not yet started.
+  const cancelRequested = useRef(false);
+  const [cancellingCopy, setCancellingCopy] = useState(false);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [showAllTransfers, setShowAllTransfers] = useState(false);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
@@ -424,17 +436,24 @@ function App() {
     }
 
     executionRunning.current = true;
+    cancelRequested.current = false;
+    setCancellingCopy(false);
     setExecutingPlan(true);
     setExecutionResult(null);
     setShowCopyConfirmation(false);
     setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
+    const copiedSoFar = () => completed === 0
+      ? "Nothing was copied."
+      : `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified.`;
 
     try {
       // The backend reruns final live validation immediately before every
       // individual copy. UI validation is informative, not the safety gate.
       for (const move of readyMoves) {
+        if (cancelRequested.current) break;
+        setFileProgress(null);
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
         });
@@ -443,21 +462,32 @@ function App() {
         setExecutionProgress({ moves: readyMoves, completed });
       }
 
-      setExecutionResult({
-        stopped: false,
-        message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
-      });
+      setExecutionResult(cancelRequested.current && completed < readyMoves.length
+        ? {
+          stopped: true,
+          message: `Copy cancelled. ${copiedSoFar()} The rest stay planned.${skippedNote}`,
+        }
+        : {
+          stopped: false,
+          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
+        });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
+      const cancelled = String(cause).includes("Copy cancelled.");
       setExecutionResult({
         stopped: true,
-        message: completed > 0
-          ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
-          : `Nothing was copied. ${String(cause)}${skippedNote}`,
+        message: cancelled
+          ? `Copy cancelled. ${copiedSoFar()} The file being copied was not finished; it and the rest stay planned.${skippedNote}`
+          : completed > 0
+            ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
+            : `Nothing was copied. ${String(cause)}${skippedNote}`,
       });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
       executionRunning.current = false;
+      cancelRequested.current = false;
+      setCancellingCopy(false);
+      setFileProgress(null);
       setExecutingPlan(false);
       setExecutionProgress(null);
     }
@@ -468,6 +498,16 @@ function App() {
     planValidation,
     plannedMoves,
   ]);
+
+  const cancelCopy = async () => {
+    cancelRequested.current = true;
+    setCancellingCopy(true);
+    try {
+      await invoke("cancel_transfer");
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -557,6 +597,13 @@ function App() {
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<ScanProgress>("scan-progress", (event) => setScanProgress(event.payload))
+      .then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, []);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<TransferProgress>("transfer-progress", (event) => setFileProgress(event.payload))
       .then((unlisten) => { dispose = unlisten; });
     return () => { dispose?.(); };
   }, []);
@@ -2104,7 +2151,35 @@ function App() {
                 <strong>{current.sourceName}</strong>
                 <TransferPaths from={paths.from} to={paths.to} />
               </div>
+              {fileProgress?.plannedMoveId === current.id && (() => {
+                const percent = fileProgress.totalBytes > 0
+                  ? Math.min(100, Math.floor((fileProgress.bytes / fileProgress.totalBytes) * 100))
+                  : 100;
+                return (
+                  <div className="transfer-file-progress">
+                    <span>
+                      {fileProgress.stage === "copying" ? "Copying" : "Verifying"}{" "}
+                      {formatBytes(fileProgress.bytes)} of {formatBytes(fileProgress.totalBytes)} · {percent}%
+                    </span>
+                    <div
+                      className="capacity-bar"
+                      role="progressbar"
+                      aria-label={fileProgress.stage === "copying" ? "Copying" : "Verifying"}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={percent}
+                    >
+                      <span style={{ width: `${percent}%` }} />
+                    </div>
+                  </div>
+                );
+              })()}
               <p>Each file is copied and verified before the next one starts. Originals stay in place.</p>
+              <div>
+                <button className="secondary-button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
+                  {cancellingCopy ? "Cancelling…" : "Cancel copy"}
+                </button>
+              </div>
             </div>
           </section>
         );
