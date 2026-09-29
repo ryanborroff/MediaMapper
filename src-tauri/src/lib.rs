@@ -288,6 +288,41 @@ fn read_transfer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRecord> {
     })
 }
 
+fn update_transfer_status(
+    connection: &Connection,
+    transfer_id: i64,
+    status: &str,
+    copied_bytes: Option<i64>,
+    error_message: Option<&str>,
+) -> Result<(), String> {
+    let now = now_unix();
+
+    let changed = connection
+        .execute(
+            "UPDATE transfers
+             SET status = ?1,
+                 copied_bytes = COALESCE(?2, copied_bytes),
+                 error_message = ?3,
+                 started_at = CASE
+                     WHEN ?1 = 'copying' AND started_at IS NULL THEN ?4
+                     ELSE started_at
+                 END,
+                 completed_at = CASE
+                     WHEN ?1 IN ('completed', 'failed') THEN ?4
+                     ELSE completed_at
+                 END
+             WHERE id = ?5",
+            params![status, copied_bytes, error_message, now, transfer_id],
+        )
+        .map_err(|error| format!("Unable to update transfer status: {error}"))?;
+
+    if changed == 0 {
+        return Err("The transfer record no longer exists.".to_string());
+    }
+
+    Ok(())
+}
+
 fn create_transfer_record(
     connection: &Connection,
     planned_move_id: i64,
@@ -4528,6 +4563,121 @@ mod tests {
         assert!(error.contains("Destination already exists"), "{error}");
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn transfer_status_tracks_execution_lifecycle() {
+        let database = TestDatabase::new("transfer-lifecycle");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    status,
+                    created_at
+                 ) VALUES (
+                    'UUID-A',
+                    'film.mov',
+                    'drive:UUID-B',
+                    'film.mov',
+                    100,
+                    'pending',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let id = connection.last_insert_rowid();
+
+        update_transfer_status(&connection, id, "copying", Some(40), None).unwrap();
+
+        let copying: (String, i64, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT status, copied_bytes, started_at, completed_at
+                 FROM transfers WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(copying.0, "copying");
+        assert_eq!(copying.1, 40);
+        assert!(copying.2.is_some());
+        assert!(copying.3.is_none());
+
+        update_transfer_status(&connection, id, "verifying", Some(100), None).unwrap();
+        update_transfer_status(&connection, id, "completed", Some(100), None).unwrap();
+
+        let completed: (String, i64, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT status, copied_bytes, error_message, completed_at
+                 FROM transfers WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(completed.0, "completed");
+        assert_eq!(completed.1, 100);
+        assert_eq!(completed.2, None);
+        assert!(completed.3.is_some());
+    }
+
+    #[test]
+    fn failed_transfer_records_error_without_removing_snapshot() {
+        let database = TestDatabase::new("transfer-failure");
+        let connection = open_database(&database.0).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    status,
+                    created_at
+                 ) VALUES (
+                    'UUID-A',
+                    'film.mov',
+                    'drive:UUID-B',
+                    'film.mov',
+                    'pending',
+                    1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let id = connection.last_insert_rowid();
+
+        update_transfer_status(&connection, id, "copying", None, None).unwrap();
+        update_transfer_status(
+            &connection,
+            id,
+            "failed",
+            None,
+            Some("Destination disconnected."),
+        )
+        .unwrap();
+
+        let transfer = list_transfer_records(&connection).unwrap().remove(0);
+
+        assert_eq!(transfer.id, id);
+        assert_eq!(transfer.status, "failed");
+        assert_eq!(
+            transfer.error_message.as_deref(),
+            Some("Destination disconnected.")
+        );
+        assert_eq!(transfer.source_relative_path, "film.mov");
+        assert!(transfer.started_at.is_some());
+        assert!(transfer.completed_at.is_some());
     }
 
     #[test]
