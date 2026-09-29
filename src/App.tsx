@@ -25,6 +25,9 @@ type CataloguedDrive = {
   fileCount: number;
   directoryCount: number;
   cataloguedBytes: number;
+  // Folders the last scan could not fully read, so the catalogue is
+  // incomplete there.
+  unreadableFolderCount: number;
 };
 
 type ScanProgress = {
@@ -36,12 +39,30 @@ type ScanProgress = {
   currentPath: string;
 };
 
+type ScanResult = ScanProgress & {
+  unreadableFolderCount: number;
+  // A few of the unreadable folders; "" is the top folder of the drive.
+  unreadableExamples: string[];
+};
+
+function unreadableSummary(result: ScanResult) {
+  const count = result.unreadableFolderCount;
+  const example = result.unreadableExamples[0];
+  const folders = count === 1 ? "1 folder" : `${count.toLocaleString()} folders`;
+  const including = example === undefined
+    ? ""
+    : `, including ${example === "" ? "the top folder of the drive" : example}`;
+  return `Couldn't read ${folders}${including}. Their contents are missing from the catalogue.`;
+}
+
 type CatalogueEntry = {
   relativePath: string;
   name: string;
   isDirectory: boolean;
   sizeBytes: number | null;
   modifiedAt: number | null;
+  // A folder the last scan could not fully read.
+  unreadable?: boolean;
 };
 
 type LibrarySearchResult = CatalogueEntry & {
@@ -204,7 +225,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [scanningId, setScanningId] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
-  const [scanComplete, setScanComplete] = useState<ScanProgress | null>(null);
+  const [scanComplete, setScanComplete] = useState<ScanResult | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -690,7 +711,7 @@ function App() {
     setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
     setError(null);
     try {
-      const result = await invoke<ScanProgress>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
+      const result = await invoke<ScanResult>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
       // A scan can add a drive's location or rename it, and changes the names
       // and sizes planned moves show, so reload those alongside the drives.
@@ -708,7 +729,10 @@ function App() {
         }
       }
 
-      window.setTimeout(() => setScanComplete(null), 4000);
+      // Keep the summary on screen when some folders could not be read.
+      if (result.unreadableFolderCount === 0) {
+        window.setTimeout(() => setScanComplete(null), 4000);
+      }
     } catch (cause) {
       const message = String(cause);
       if (message.includes("Scan cancelled.")) {
@@ -846,6 +870,9 @@ function App() {
                     <span className="file-name-text">
                       <span className="file-name-primary">{entry.name}</span>
                       <span className="file-location">{formatLocationPath(liveDriveName, parentFolder(entry.relativePath))}</span>
+                      {entry.unreadable && (
+                        <span className="unreadable-note">Couldn't be read during the last scan</span>
+                      )}
                       {plannedMove && (
                         <PlannedPath
                           direction="to"
@@ -955,6 +982,9 @@ function App() {
                       <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
                       <span className="file-name-text">
                         <span className="file-name-primary">{entry.name}</span>
+                        {entry.unreadable && (
+                          <span className="unreadable-note">Couldn't be read during the last scan</span>
+                        )}
                         {plannedMove && (
                           <PlannedPath
                             direction="to"
@@ -1251,6 +1281,7 @@ function App() {
                   <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
                   <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                   <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
+                  {catalogue && catalogue.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
                 </dl>
                 <div className="scan-status-slot" aria-live="polite">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
@@ -1268,7 +1299,12 @@ function App() {
                       <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
                     </div>
                   ) : scanComplete?.persistentIdentifier === drive.persistentIdentifier ? (
-                    <div className="scan-complete">Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}</div>
+                    <div className="scan-complete">
+                      Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}
+                      {scanComplete.unreadableFolderCount > 0 && (
+                        <div className="unreadable-note">{unreadableSummary(scanComplete)}</div>
+                      )}
+                    </div>
                   ) : scanCancelledId === drive.persistentIdentifier ? (
                     <div className="scan-cancelled">Scan cancelled.</div>
                   ) : null}
@@ -1335,6 +1371,7 @@ function App() {
                   <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
                   <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
+                  {drive.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
                 </dl>
               </article>
             ))}

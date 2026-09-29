@@ -298,9 +298,11 @@ Example:
 
 Use for warnings, blocked actions or conditions requiring attention.
 
-Example:
+Examples:
 
 `Already at this location.`
+
+`Couldn't be read during the last scan` (a folder whose catalogued contents are incomplete)
 
 ### Red
 
