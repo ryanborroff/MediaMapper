@@ -304,6 +304,7 @@ function App() {
   const [executingPlan, setExecutingPlan] = useState(false);
   const [executionProgress, setExecutionProgress] = useState<{ completed: number; total: number } | null>(null);
   const [executionMessage, setExecutionMessage] = useState<string | null>(null);
+  const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
@@ -319,6 +320,14 @@ function App() {
   const loadLocations = useCallback(async () => {
     try {
       setLocations(await invoke<Location[]>("list_locations"));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }, []);
+
+  const loadTransfers = useCallback(async () => {
+    try {
+      setTransfers(await invoke<TransferRecord[]>("list_transfers"));
     } catch (cause) {
       setError(String(cause));
     }
@@ -373,20 +382,21 @@ function App() {
         `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.`,
       );
       setShowCopyConfirmation(false);
-      await loadPlannedMoves();
+      await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
       setExecutionMessage(
         completed > 0
           ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}`
           : `Nothing was copied. ${String(cause)}`,
       );
-      await loadPlannedMoves();
+      await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
       setExecutingPlan(false);
     }
   }, [
     executingPlan,
     loadPlannedMoves,
+    loadTransfers,
     planPreflight,
     planValidation,
     plannedMoves,
@@ -412,8 +422,9 @@ function App() {
   useEffect(() => {
     void refresh();
     void loadPlannedMoves();
+    void loadTransfers();
     void loadLocations();
-  }, [refresh, loadPlannedMoves, loadLocations]);
+  }, [refresh, loadPlannedMoves, loadTransfers, loadLocations]);
 
   // Keep physical drive availability current while the app is open.
   // This only asks macOS which external drives are mounted. It does not
@@ -1671,6 +1682,47 @@ function App() {
           ))}
         </div>
       </section>}
+
+      {transfers.some((transfer) => transfer.status === "completed") && (
+        <section className="section-block">
+          <div className="section-heading">
+            <h2>Completed transfers</h2>
+            <span>{transfers.filter((transfer) => transfer.status === "completed").length}</span>
+          </div>
+          <p className="section-description">
+            Verified copies. Original files were left untouched.
+          </p>
+
+          <div className="transfer-history">
+            {transfers
+              .filter((transfer) => transfer.status === "completed")
+              .slice(0, 10)
+              .map((transfer) => (
+                <div className="transfer-history-row" key={transfer.id}>
+                  <div>
+                    <strong>
+                      {transfer.sourceRelativePath.split("/").pop()}
+                    </strong>
+                    <span>
+                      {(() => {
+                        const location = locations.find(
+                          (item) => item.id === transfer.destinationLocationId,
+                        );
+                        const locationName =
+                          location?.displayName ||
+                          transfer.destinationLocationId;
+
+                        return `${locationName} / ${transfer.destinationRelativePath}`;
+                      })()}
+                    </span>
+                  </div>
+                  <span>{formatBytes(transfer.copiedBytes)}</span>
+                  <span>{formatDate(transfer.completedAt)}</span>
+                </div>
+              ))}
+          </div>
+        </section>
+      )}
 
       {catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
