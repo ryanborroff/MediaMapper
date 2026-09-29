@@ -780,10 +780,16 @@ function App() {
 
   const openDestinationFolderPicker = async (path = "") => {
     const location = locations.find((item) => item.id === planDestinationLocationId);
-    if (!location || location.kind !== "external_drive" || !location.driveId) return;
+    if (!location || location.kind !== "external_drive" || !location.driveId) {
+      setError("Choose a catalogued external drive before choosing a folder.");
+      return;
+    }
 
+    // Open immediately so the click always has visible feedback. Loading the
+    // catalogue happens afterwards and cannot make the picker appear inert.
     setFolderPickerOpen(true);
     setFolderPickerPath(path);
+    setFolderPickerEntries([]);
     setFolderPickerLoading(true);
     setError(null);
 
@@ -1335,7 +1341,12 @@ function App() {
                   <button
                     type="button"
                     className="folder-picker-button"
-                    onClick={() => void openDestinationFolderPicker(planDestinationFolder)}
+                    aria-expanded={folderPickerOpen}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void openDestinationFolderPicker(planDestinationFolder);
+                    }}
                   >
                     {planDestinationFolder || "Top level"}
                     <span>Choose…</span>
