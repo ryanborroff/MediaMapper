@@ -4208,6 +4208,52 @@ async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), Strin
     .await
 }
 
+#[tauri::command]
+async fn open_catalogued_file(
+    app: tauri::AppHandle,
+    drive_id: String,
+    relative_path: String,
+) -> Result<(), String> {
+    run_blocking(move || {
+        validate_catalogue_relative_path(&relative_path)?;
+
+        let connection = open_database(&database_path(&app)?)?;
+        let is_directory: Option<i64> = connection
+            .query_row(
+                "SELECT is_directory FROM files WHERE drive_id = ?1 AND relative_path = ?2",
+                params![drive_id, relative_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to check the catalogue entry: {error}"))?;
+
+        match is_directory {
+            Some(0) => {}
+            Some(_) => return Err("That catalogue entry is a folder.".to_string()),
+            None => return Err("That file is no longer in the catalogue.".to_string()),
+        }
+
+        let drives = external_drives()?;
+        let drive = drives
+            .iter()
+            .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
+            .ok_or_else(|| "Connect this drive to open the file.".to_string())?;
+
+        let path = PathBuf::from(&drive.mount_point).join(&relative_path);
+        if !path.is_file() {
+            return Err("The file is not currently available at its catalogued location.".to_string());
+        }
+
+        std::process::Command::new("/usr/bin/open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("Unable to open the file: {error}"))?;
+
+        Ok(())
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4249,7 +4295,8 @@ pub fn run() {
             execute_planned_move,
             list_transfers,
             list_planned_folder_entries,
-            remove_planned_move
+            remove_planned_move,
+            open_catalogued_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
