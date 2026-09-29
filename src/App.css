@@ -162,11 +162,11 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 /* Sizes are right-aligned with tabular digits so units line up. */
 .file-browser-head > :nth-child(3), .file-row > :nth-child(3) { justify-self: end; text-align: right; font-variant-numeric: tabular-nums; }
 .file-browser-head { padding: 11px 18px; border-bottom: 1px solid var(--divider); color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.file-row { width: 100%; padding: 11px 18px; border: 0; border-bottom: 1px solid var(--divider); background: transparent; color: var(--text-body); text-align: left; font-size: 13px; }
+.file-row { width: 100%; padding: 9px 18px; border: 0; border-bottom: 1px solid var(--divider); background: transparent; color: var(--text-body); text-align: left; font-size: 13px; }
 .file-row:last-child { border-bottom: 0; }
 .file-row.folder-row, .file-row.search-row { cursor: pointer; }
 .file-row.folder-row:hover, .file-row.search-row:hover { background: var(--hover); }
-/* Files and folders share one name colour; the triangle marks folders. */
+/* Files and folders share one quiet, Finder-like row treatment. */
 .file-name-primary { color: var(--text); }
 .file-location { max-width: 100%; margin-top: 3px; overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .file-row:disabled { opacity: 1; cursor: default; }
@@ -1945,4 +1945,64 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .app-content .drive-meta .unreadable-note {
   color: var(--amber);
+}
+
+
+/* Integrated Browse detail */
+.browse-detail .app-header {
+  margin-bottom: 20px;
+}
+
+.browse-detail-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.browse-detail-breadcrumb button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.browse-detail-breadcrumb button:hover {
+  color: var(--text);
+}
+
+.browse-detail-breadcrumb .current {
+  color: var(--text);
+}
+
+.browse-detail-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.browse-detail-search {
+  margin-bottom: 22px;
+}
+
+.browse-detail .file-browser {
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.browse-detail .file-row {
+  min-height: 42px;
+}
+
+.browse-detail .file-row:hover {
+  background: var(--hover);
+}
+
+.browse-detail .file-name-primary {
+  font-weight: 500;
 }
