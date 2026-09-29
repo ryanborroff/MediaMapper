@@ -850,20 +850,49 @@ function App() {
         </header>
 
         {error && <div className="notice error">{error}</div>}
-        {searchQuery.trim() && <section className="search-results" aria-live="polite">
+        {searchQuery.trim() && <section className="file-browser" aria-live="polite">
+          <div className="file-browser-head">
+            <span>Name</span><span>Modified</span><span>Size</span><span />
+          </div>
           {searching ? <div className="browser-message">Searching catalogue…</div>
           : visibleSearchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-          : visibleSearchResults.map((entry) => <button className="search-result catalogue-search-result" key={entry.relativePath}
-              onClick={() => void openSearchResult(liveDrive, entry)}>
-              <span className="search-result-main"><strong>{entry.name}</strong><span>{entry.relativePath}</span></span>
-              <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
-              <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
-            </button>)}
+          : visibleSearchResults.map((entry) => {
+              const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
+              return (
+                <button
+                  className={`file-row search-row ${plannedMove ? "moving-out-row" : ""}`}
+                  key={entry.relativePath}
+                  type="button"
+                  onClick={() => void openSearchResult(liveDrive, entry)}
+                >
+                  <span className="file-name">
+                    <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+                    <span className="file-name-text">
+                      <span className="file-name-primary">{entry.name}</span>
+                      <span className="file-location">{formatLocationPath(liveDriveName, parentFolder(entry.relativePath))}</span>
+                      {entry.unreadable && (
+                        <span className="unreadable-note">Couldn't be read during the last scan</span>
+                      )}
+                      {plannedMove && (
+                        <PlannedPath
+                          direction="to"
+                          locationName={plannedMove.destinationLocationName}
+                          folder={parentFolder(plannedMove.destinationRelativePath)}
+                        />
+                      )}
+                    </span>
+                  </span>
+                  <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
+                  <span>{entry.isDirectory ? "Folder" : formatBytes(entry.sizeBytes)}</span>
+                  <span />
+                </button>
+              );
+            })}
         </section>}
 
         {!searchQuery.trim() && <section className="file-browser">
           <div className="file-browser-head">
-            <span>Name</span><span>Modified</span><span>Size</span>
+            <span>Name</span><span>Modified</span><span>Size</span><span />
           </div>
           {browserLoading ? (
             <div className="browser-message">Loading catalogue…</div>
@@ -966,27 +995,23 @@ function App() {
                       </span>
                     </span>
                     <span>{entry.modifiedAt ? formatDate(entry.modifiedAt) : "—"}</span>
-                    {entry.isDirectory ? (
-                      <span className="folder-row-actions">
-                        <span>
-                          {dragOverFolderPath === entry.relativePath
-                            ? "Drop to move here"
-                            : "Folder"}
-                        </span>
-                        <button
-                          type="button"
-                          className="folder-plan-button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            beginPlanMove(entry);
-                          }}
-                        >
-                          Plan move
-                        </button>
-                      </span>
-                    ) : (
-                      <span>{formatBytes(entry.sizeBytes)}</span>
-                    )}
+                    <span className={dragOverFolderPath === entry.relativePath ? "drop-hint" : undefined}>
+                      {entry.isDirectory
+                        ? (dragOverFolderPath === entry.relativePath ? "Drop to move here" : "Folder")
+                        : formatBytes(entry.sizeBytes)}
+                    </span>
+                    {/* The one place a move is planned from, for files and folders alike. */}
+                    <span className="row-action">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          beginPlanMove(entry);
+                        }}
+                      >
+                        Plan move
+                      </button>
+                    </span>
                   </div>
                 );
               })}
@@ -1012,14 +1037,17 @@ function App() {
                         {planned.isDirectory ? "▸" : ""}
                       </span>
                       <span className="file-name-text">
-                        <span className="file-name-primary">{planned.name}</span>
+                        <span className="file-name-primary">
+                          <span className="planned-tag">Planned</span>{planned.name}
+                        </span>
                         {planned.isNewFolder
                           ? <span className="planned-path">New folder in the plan</span>
                           : plannedFromPath(planned)}
                       </span>
                     </span>
-                    <span>Planned</span>
+                    <span aria-label="Not on the drive yet">—</span>
                     <span>{planned.isDirectory ? "Folder" : formatBytes(planned.sizeBytes)}</span>
+                    <span />
                   </button>
                 ))}
             </>
@@ -1180,7 +1208,7 @@ function App() {
             >
               <span className="search-result-main">
                 <strong>{result.name}</strong>
-                <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), result.relativePath)}</span>
+                <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), parentFolder(result.relativePath))}</span>
               </span>
               <span>{connectedIds.has(result.driveId) ? "Connected" : "Offline"}</span>
               <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
@@ -1425,8 +1453,7 @@ function App() {
                         onClick={() => void openDuplicateFile(file)}
                       >
                         <span className="search-result-main">
-                          <strong>{driveDisplayName(file.driveId, file.driveName)}</strong>
-                          <span>{file.relativePath}</span>
+                          <strong>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</strong>
                         </span>
                         <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
                         <span>{formatBytes(file.sizeBytes)}</span>
@@ -1464,7 +1491,7 @@ function App() {
               >
                 <span className="search-result-main">
                   <strong>{file.name}</strong>
-                  <span>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), file.relativePath)}</span>
+                  <span>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</span>
                 </span>
                 <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
                 <span>{formatBytes(file.sizeBytes)}</span>
