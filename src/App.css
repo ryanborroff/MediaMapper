@@ -1079,20 +1079,21 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 
 /* Add-to-plan actions and destination folder picker. */
-.row-action button {
-  margin: -5px 0;
-  border: 1px solid var(--text);
-  border-radius: 8px;
-  padding: 6px 10px;
-  background: var(--text);
-  color: var(--surface);
-  font-weight: 600;
-  text-decoration: none;
+.row-action {
+  text-align: right;
 }
-.row-action button:hover {
-  background: var(--text-body);
-  color: var(--surface);
-  text-decoration: none;
+.row-action button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.row-action button:hover,
+.row-action button:focus-visible {
+  text-decoration: underline;
 }
 
 .folder-picker-button,
