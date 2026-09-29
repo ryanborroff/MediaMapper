@@ -235,12 +235,15 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 // main thread, so a longer wait would freeze the window for that long.
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
-// Opens a connection and makes sure the schema is current.
+// Databases whose schema this process has already brought up to date.
+static MIGRATED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+// Opens a connection, bringing the schema up to date the first time each
+// database is opened in this run of the app.
 //
 // Every command calls this, including read-only ones, so it must not write
-// during normal use. The schema statements below only write when a table,
-// index or column is missing; once the schema exists they need no write lock.
-// Routine location synchronisation lives in `sync_drive_locations`.
+// during normal use. Migrations only write when a table, index or column is
+// missing. Routine location synchronisation lives in `sync_drive_locations`.
 fn open_database(path: &Path) -> Result<Connection, String> {
     let mut connection = Connection::open(path)
         .map_err(|error| format!("Unable to open catalogue database: {error}"))?;
@@ -250,7 +253,30 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
     register_search_function(&connection)
         .map_err(|error| format!("Unable to configure catalogue search: {error}"))?;
+    // Foreign keys are a per-connection setting, so every connection sets it.
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
 
+    // The lock is held while migrating, so two commands opening the database
+    // at the same moment cannot both run the same migration. A failed
+    // migration is not recorded, so the next open tries again.
+    let mut migrated = MIGRATED_DATABASES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map_err(|_| "Unable to access catalogue migration state.".to_string())?;
+    if !migrated.contains(path) {
+        migrate_database(&mut connection)?;
+        migrated.insert(path.to_path_buf());
+    }
+
+    Ok(connection)
+}
+
+// Creates any missing tables, indexes and columns, and upgrades data from
+// older schema versions. Every step checks first, so it is safe to run on a
+// database that is already current.
+fn migrate_database(connection: &mut Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "
@@ -603,7 +629,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         }
     }
 
-    Ok(connection)
+    Ok(())
 }
 
 // Every catalogued external drive is also a Media Mapper location.
@@ -2900,6 +2926,50 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn schema_is_migrated_once_per_database() {
+        let database = TestDatabase::new("migrate-once");
+        open_database(&database.0).unwrap();
+
+        // Remove something migrations would create. A later open must not
+        // run them again, so it stays missing until the next app run.
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_files_drive_parent;")
+            .unwrap();
+        let connection = open_database(&database.0).unwrap();
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_files_drive_parent')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!index_exists);
+    }
+
+    #[test]
+    fn concurrent_first_opens_migrate_an_old_database_once() {
+        let database = TestDatabase::new("migrate-concurrently");
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch(LEGACY_SCHEMA)
+            .unwrap();
+
+        let path = database.0.clone();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || open_database(&path).map(|_| ()))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().expect("every open must succeed");
+        }
+
+        assert_planned_moves_migrated(&database.0);
     }
 
     #[test]
