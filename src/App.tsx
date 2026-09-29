@@ -1320,7 +1320,7 @@ function App() {
           </div>
           {/* At the drive root the breadcrumb would only repeat the title. */}
           {pathParts.length > 0 && <nav className="breadcrumbs" aria-label="Folder path">
-            <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, "")}>{liveDriveName}</button>
+            <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, ""); }}>{liveDriveName}</button>
             {pathParts.map((part, index) => {
               const path = pathParts.slice(0, index + 1).join("/");
               const current = index === pathParts.length - 1;
@@ -1329,7 +1329,7 @@ function App() {
                   <span className="crumb-separator">/</span>
                   {current
                     ? <span className="crumb-current" aria-current="page">{part}</span>
-                    : <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, path)}>{part}</button>}
+                    : <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, path); }}>{part}</button>}
                 </span>
               );
             })}
