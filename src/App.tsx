@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
@@ -75,6 +76,14 @@ type DuplicateGroup = {
 };
 
 
+type Location = {
+  id: string;
+  kind: "external_drive" | "local_folder";
+  displayName: string;
+  driveId: string | null;
+  localPath: string | null;
+};
+
 type PlannedMove = {
   id: number;
   sourceDriveId: string;
@@ -130,11 +139,20 @@ function App() {
   const [showDuplicates, setShowDuplicates] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
+  const [locations, setLocations] = useState<Location[]>([]);
   const [selectedPlanFile, setSelectedPlanFile] = useState<CatalogueEntry | null>(null);
-  const [planDestinationDriveId, setPlanDestinationDriveId] = useState("");
+  const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
   const [savingPlan, setSavingPlan] = useState(false);
   const [planConfirmation, setPlanConfirmation] = useState<string | null>(null);
+
+  const loadLocations = useCallback(async () => {
+    try {
+      setLocations(await invoke<Location[]>("list_locations"));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }, []);
 
   const loadPlannedMoves = useCallback(async () => {
     try {
@@ -164,6 +182,7 @@ function App() {
   useEffect(() => {
     void refresh();
     void loadPlannedMoves();
+    void loadLocations();
   }, [refresh, loadPlannedMoves]);
 
   useEffect(() => {
@@ -332,7 +351,9 @@ function App() {
     if (entry.isDirectory) return;
     setPlanConfirmation(null);
     setSelectedPlanFile(entry);
-    setPlanDestinationDriveId(browserDrive?.persistentIdentifier ?? "");
+    setPlanDestinationLocationId(
+      browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
+    );
 
     // Start from the file's current folder. This makes the proposed
     // destination explicit and prevents the UI from making a root-level
@@ -346,7 +367,7 @@ function App() {
   };
 
   const savePlannedMove = async () => {
-    if (!browserDrive || !selectedPlanFile || !planDestinationDriveId) return;
+    if (!browserDrive || !selectedPlanFile || !planDestinationLocationId) return;
 
     const folder = planDestinationFolder.trim().replace(/^\/+|\/+$/g, "");
     const destinationRelativePath = folder
@@ -360,22 +381,45 @@ function App() {
       await invoke<number>("create_planned_move", {
         sourceDriveId: browserDrive.persistentIdentifier,
         sourceRelativePath: selectedPlanFile.relativePath,
-        destinationDriveId: planDestinationDriveId,
+        destinationLocationId: planDestinationLocationId,
         destinationRelativePath,
       });
       await loadPlannedMoves();
 
-      const destinationDriveName =
-        catalogued.find((drive) => drive.persistentIdentifier === planDestinationDriveId)?.name
+      const destinationName =
+        locations.find((location) => location.id === planDestinationLocationId)?.displayName
         ?? "Destination";
 
-      setPlanConfirmation(`${destinationDriveName} / ${destinationRelativePath}`);
+      setPlanConfirmation(`${destinationName} / ${destinationRelativePath}`);
       setSelectedPlanFile(null);
       setPlanDestinationFolder("");
     } catch (cause) {
       setError(String(cause));
     } finally {
       setSavingPlan(false);
+    }
+  };
+
+  const addFolderOnThisMac = async () => {
+    setError(null);
+
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose a Media Mapper destination folder",
+      });
+
+      if (!selected || Array.isArray(selected)) return;
+
+      const location = await invoke<Location>("add_local_folder_location", {
+        path: selected,
+      });
+
+      await loadLocations();
+      setPlanDestinationLocationId(location.id);
+    } catch (cause) {
+      setError(String(cause));
     }
   };
 
@@ -461,7 +505,7 @@ function App() {
 
     const planIsCurrentLocation =
       selectedPlanFile !== null &&
-      planDestinationDriveId === liveDrive.persistentIdentifier &&
+      planDestinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
       proposedDestinationPath === selectedPlanFile.relativePath;
 
     return (
@@ -566,18 +610,46 @@ function App() {
 
           <div className="plan-fields">
             <label>
-              <span>Destination drive</span>
+              <span>Destination</span>
               <select
-                value={planDestinationDriveId}
-                onChange={(event) => setPlanDestinationDriveId(event.target.value)}
+                value={planDestinationLocationId}
+                onChange={(event) => setPlanDestinationLocationId(event.target.value)}
               >
-                <option value="">Choose a drive</option>
-                {catalogued.map((drive) => (
-                  <option key={drive.persistentIdentifier} value={drive.persistentIdentifier}>
-                    {drive.name}{connectedIds.has(drive.persistentIdentifier) ? " · Connected" : " · Offline"}
-                  </option>
-                ))}
+                <option value="">Choose a location</option>
+
+                <optgroup label="External drives">
+                  {locations
+                    .filter((location) => location.kind === "external_drive")
+                    .map((location) => (
+                      <option key={location.id} value={location.id}>
+                        {location.displayName}
+                        {location.driveId && connectedIds.has(location.driveId)
+                          ? " · Connected"
+                          : " · Offline"}
+                      </option>
+                    ))}
+                </optgroup>
+
+                {locations.some((location) => location.kind === "local_folder") && (
+                  <optgroup label="This Mac">
+                    {locations
+                      .filter((location) => location.kind === "local_folder")
+                      .map((location) => (
+                        <option key={location.id} value={location.id}>
+                          {location.displayName}
+                        </option>
+                      ))}
+                  </optgroup>
+                )}
               </select>
+
+              <button
+                type="button"
+                className="plan-add-location"
+                onClick={() => void addFolderOnThisMac()}
+              >
+                Add folder on this Mac
+              </button>
             </label>
 
             <label>
@@ -593,7 +665,7 @@ function App() {
           <div className="plan-preview">
             <span>Planned</span>
             <strong>
-              {(catalogued.find((drive) => drive.persistentIdentifier === planDestinationDriveId)?.name ?? "Choose a drive")}
+              {(locations.find((location) => location.id === planDestinationLocationId)?.displayName ?? "Choose a location")}
               {" / "}
               {planDestinationFolder.trim() ? `${planDestinationFolder.trim().replace(/^\/+|\/+$/g, "")}/` : ""}
               {selectedPlanFile.name}
@@ -608,7 +680,7 @@ function App() {
             </span>
             <button
               className="browse-button"
-              disabled={!planDestinationDriveId || savingPlan || planIsCurrentLocation}
+              disabled={!planDestinationLocationId || savingPlan || planIsCurrentLocation}
               onClick={() => void savePlannedMove()}
             >
               {savingPlan ? "Saving…" : "Plan move"}
@@ -863,7 +935,9 @@ function App() {
                   <div><span className="status-dot offline-dot" /><span className="offline-label">OFFLINE</span><h3>{drive.name}</h3></div>
                   <div className="drive-actions">
                     <span className="capacity">{formatBytes(drive.totalBytes)}</span>
-                    <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
+                    <div className="button-row">
+                      <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
+                    </div>
                   </div>
                 </div>
                 <dl className="drive-details offline-details">

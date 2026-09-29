@@ -397,3 +397,18 @@ dd { margin: 0; overflow-wrap: anywhere; color: #3c3c3c; font-size: 13px; line-h
   color: #a86400;
   font-weight: 600;
 }
+
+.plan-add-location {
+  align-self: flex-start;
+  border: 0;
+  padding: 2px 0;
+  background: transparent;
+  color: #666;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plan-add-location:hover {
+  color: #111;
+}
