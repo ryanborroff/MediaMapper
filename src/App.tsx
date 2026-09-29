@@ -853,21 +853,14 @@ function App() {
 
   const beginPlanMove = (entry: CatalogueEntry) => {
     setSelectedPlanEntry(entry);
-    setPlanDestinationLocationId(
-      browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
-    );
-
-    // Start from the item's current folder. This makes the proposed
-    // destination explicit and prevents the UI from making a root-level
-    // destination look like the file's existing catalogue location.
-    const separator = entry.relativePath.lastIndexOf("/");
-    const currentFolder =
-      separator >= 0 ? entry.relativePath.slice(0, separator) : "";
-    setPlanDestinationFolder(currentFolder);
+    // Do not preselect the source drive. Planning should begin with an
+    // intentional destination choice rather than an immediate invalid state.
+    setPlanDestinationLocationId("");
+    setPlanDestinationFolder("");
     setFolderPickerOpen(false);
     setFolderPickerPath("");
     setFolderPickerEntries([]);
-
+    setPlanError(null);
     setError(null);
   };
 
@@ -1705,24 +1698,18 @@ function App() {
           )}
         </section>}
 
-        {selectedPlanEntry && <section className="plan-move-panel" ref={planPanel}>
+        {selectedPlanEntry && <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
           <div className="plan-move-heading">
             <div>
-              <p className="eyebrow">PLANNED LOCATION</p>
               <h2>Add to plan</h2>
-              <p className="section-description">
-                {selectedPlanEntry.name} remains at its current location until a future transfer is explicitly executed.
+              <p className="plan-file-summary" title={selectedPlanEntry.name}>
+                {selectedPlanEntry.name}
               </p>
             </div>
             <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
           </div>
 
-          <div className="plan-source">
-            <span>Current</span>
-            <strong>{liveDriveName} / {selectedPlanEntry.relativePath}</strong>
-          </div>
-
-          <div className="plan-fields">
+          <div className="plan-fields compact-plan-fields">
             <label>
               <span>Location</span>
               <select
@@ -1736,6 +1723,7 @@ function App() {
                   setPlanDestinationLocationId(event.target.value);
                   setPlanDestinationFolder("");
                   setFolderPickerOpen(false);
+                  setPlanError(null);
                 }}
               >
                 <option value="">Choose a location</option>
@@ -1766,8 +1754,6 @@ function App() {
                   </optgroup>
                 )}
               </select>
-
-
             </label>
 
             <label>
@@ -1790,8 +1776,10 @@ function App() {
                       void openDestinationFolderPicker(planDestinationFolder);
                     }}
                   >
-                    {planDestinationFolder || "Top level"}
-                    <span>Choose…</span>
+                    <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
+                      {planDestinationFolder || "Top level"}
+                    </span>
+                    <span className="folder-picker-choose">Choose…</span>
                   </button>
                 ) : (
                   <div className="folder-picker-readonly">
@@ -1869,30 +1857,36 @@ function App() {
             );
           })()}
 
-          <div className="plan-preview">
-            <span>Planned</span>
-            <strong>
-              {(() => {
+          {planDestinationLocationId && (
+            <div className="plan-destination-preview">
+              <span>Will be copied to</span>
+              <strong title={(() => {
                 const destination = locations.find(
                   (location) => location.id === planDestinationLocationId,
                 );
-                return destination?.userLabel ?? destination?.displayName ?? "Choose a location";
-              })()}
-              {" / "}
-              {normalisedPlanFolder ? `${normalisedPlanFolder}/` : ""}
-              {selectedPlanEntry.name}
-            </strong>
-          </div>
+                const destinationName =
+                  destination?.userLabel ?? destination?.displayName ?? "Destination";
+                return formatLocationPath(destinationName, normalisedPlanFolder);
+              })()}>
+                {(() => {
+                  const destination = locations.find(
+                    (location) => location.id === planDestinationLocationId,
+                  );
+                  const destinationName =
+                    destination?.userLabel ?? destination?.displayName ?? "Destination";
+                  return formatLocationPath(destinationName, normalisedPlanFolder);
+                })()}
+              </strong>
+            </div>
+          )}
 
-          <div className="plan-actions">
+          <div className="plan-actions compact-plan-actions">
             {planError ? (
               <span className="plan-location-warning" role="alert">{planError}</span>
+            ) : planIsCurrentLocation ? (
+              <span className="plan-location-warning">Choose a different destination.</span>
             ) : (
-              <span className={planIsCurrentLocation ? "plan-location-warning" : undefined}>
-                {planIsCurrentLocation
-                  ? "Already at this location."
-                  : "This changes the Media Mapper plan only. No files are moved."}
-              </span>
+              <span>Nothing is copied until you run the plan.</span>
             )}
             <button
               className="browse-button"
