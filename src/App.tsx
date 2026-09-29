@@ -925,6 +925,7 @@ function App() {
     id ? catalogued.find((item) => item.persistentIdentifier === id) : undefined;
 
   const pathParts = browserPath ? browserPath.split("/") : [];
+  let showLegacyDashboard: boolean = false;
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
@@ -1688,7 +1689,7 @@ function App() {
 
       {error && <div className="notice error">{error}</div>}
 
-      {false && catalogued.length > 0 && <section className="section-block">
+      {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Search all drives</h2></div>
         <div className="catalogue-search">
           <input
@@ -1885,7 +1886,7 @@ function App() {
         )}
       </section>
 
-      {false && executionProgress && (() => {
+      {showLegacyDashboard && executionProgress && (() => {
         const { moves, completed } = executionProgress;
         const current = moves[Math.min(completed, moves.length - 1)];
         const paths = plannedMovePaths(current);
@@ -1908,7 +1909,7 @@ function App() {
         );
       })()}
 
-      {false && !executionProgress && executionResult && <section className="section-block">
+      {showLegacyDashboard && !executionProgress && executionResult && <section className="section-block">
         <div className="section-heading">
           <h2>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</h2>
           <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
@@ -1918,7 +1919,7 @@ function App() {
         </p>
       </section>}
 
-      {false && showTransfers && <section className="section-block">
+      {showLegacyDashboard && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Waiting to transfer</h2>
           <span>{plannedMoves.length}</span>
@@ -2094,7 +2095,7 @@ function App() {
         </>}
       </section>}
 
-      {false && showTransfers && <section className="section-block">
+      {showLegacyDashboard && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Transfer history</h2>
           {transfers.length > 0 && <span>{transfers.length}</span>}
@@ -2140,7 +2141,7 @@ function App() {
         </>}
       </section>}
 
-      {false && catalogued.length > 0 && <section className="section-block">
+      {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
         <div className="tool-row">
           <div>
