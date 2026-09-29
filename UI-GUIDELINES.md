@@ -316,6 +316,12 @@ Use for secondary metadata, inactive states and offline information.
 
 Keep most of the interface neutral so semantic colour retains meaning.
 
+### Colour tokens and dark mode
+
+Every colour is a token defined on `:root` in `src/App.css`, with a dark palette that follows the macOS appearance setting.
+
+Use an existing token rather than a new hex value. If a genuinely new colour is needed, add a token with both a light and a dark value, and check both against a 4.5:1 contrast ratio for text.
+
 ## 13. Status and microcopy
 
 Status copy should state what happened or what the user needs to know.
