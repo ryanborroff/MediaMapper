@@ -301,6 +301,7 @@ function App() {
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [activeView, setActiveView] = useState<"drives" | "browse">("drives");
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
   const [entries, setEntries] = useState<CatalogueEntry[]>([]);
@@ -928,7 +929,89 @@ function App() {
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
 
-  if (browserDrive) {
+  if (activeView === "browse" && !browserDrive) {
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
+            <button className="sidebar-item" type="button" disabled>Plan</button>
+            <button className="sidebar-item" type="button" disabled>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content browse-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">BROWSE</p>
+              <h1>All files</h1>
+              <p className="intro">Search and browse every catalogued drive, even when it is offline.</p>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          <section className="browse-search-block">
+            <input
+              className="browse-global-search"
+              type="search"
+              value={libraryQuery}
+              placeholder="Search all files"
+              aria-label="Search all catalogued files"
+              autoFocus
+              onChange={(event) => void searchLibrary(event.target.value)}
+            />
+            <label className="hidden-items-toggle">
+              <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
+              Show hidden items
+            </label>
+          </section>
+
+          {libraryQuery.trim() ? (
+            <section className="browse-results" aria-live="polite">
+              <div className="browse-results-heading">
+                <span>{librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} results`}</span>
+              </div>
+              {librarySearching ? <div className="browser-message">Searching catalogues…</div>
+              : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+              : visibleLibraryResults.map((result) => (
+                <button className="browse-result-row" key={`${result.driveId}:${result.relativePath}`} onClick={() => void openLibraryResult(result)}>
+                  <span className="browse-result-name">
+                    <strong>{result.name}</strong>
+                    <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), parentFolder(result.relativePath))}</span>
+                  </span>
+                  <span className={connectedIds.has(result.driveId) ? "browse-drive-state connected" : "browse-drive-state"}>
+                    {connectedIds.has(result.driveId) ? "Connected" : "Offline"}
+                  </span>
+                  <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
+                </button>
+              ))}
+            </section>
+          ) : (
+            <section className="browse-drives">
+              <div className="section-heading"><h2>Browse by drive</h2></div>
+              <div className="browse-drive-grid">
+                {catalogued.map((drive) => (
+                  <button className="browse-drive-card" key={drive.persistentIdentifier} onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>
+                    <span className="browse-drive-card-top">
+                      <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
+                      <span>{connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
+                    </span>
+                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)}</span>
+                    <span>Scanned {formatDate(drive.lastScannedAt)}</span>
+                  </button>
+                ))}
+              </div>
+              {catalogued.length === 0 && <div className="empty-state compact"><h3>No catalogued drives</h3><p>Scan a drive first, then its files will appear here.</p></div>}
+            </section>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+    if (browserDrive) {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
     const online = connectedIds.has(liveDrive.persistentIdentifier);
     const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
@@ -995,7 +1078,7 @@ function App() {
           </div>
           {/* At the drive root the breadcrumb would only repeat the title. */}
           {pathParts.length > 0 && <nav className="breadcrumbs" aria-label="Folder path">
-            <button onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
+            <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, "")}>{liveDriveName}</button>
             {pathParts.map((part, index) => {
               const path = pathParts.slice(0, index + 1).join("/");
               const current = index === pathParts.length - 1;
@@ -1004,7 +1087,7 @@ function App() {
                   <span className="crumb-separator">/</span>
                   {current
                     ? <span className="crumb-current" aria-current="page">{part}</span>
-                    : <button onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
+                    : <button onClick={() => { setActiveView("browse"); void openFolder(liveDrive, path)}>{part}</button>}
                 </span>
               );
             })}
@@ -1344,10 +1427,7 @@ function App() {
         <div className="sidebar-brand">MediaMapper</div>
         <nav className="sidebar-navigation" aria-label="Main navigation">
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
-          <button className="sidebar-item" type="button" onClick={() => {
-            const first = catalogued[0];
-            if (first) void openFolder(first, "");
-          }}>Browse</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
           <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Plan</button>
           <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Transfers</button>
         </nav>
@@ -1453,7 +1533,7 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse</button>}
+                      {catalogue && <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}>Browse</button>}
                       <button className="scan-button" disabled={scanningId !== null || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
                         {scanning ? "Scanning…" : "Scan"}
                       </button>
@@ -1545,7 +1625,7 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse</button>
+                      <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>Browse</button>
                     </div>
                   </div>
                 </div>
