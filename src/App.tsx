@@ -1096,7 +1096,7 @@ function App() {
 
         {!searchQuery.trim() && <section className="file-browser">
           <div className="file-browser-head">
-            <span>Name</span><span>Modified</span><span>Size</span><span />
+            <span>Name</span><span>Modified</span><span>Size</span><span>Action</span>
           </div>
           {browserLoading ? (
             <div className="browser-message">Loading catalogue…</div>
@@ -1107,11 +1107,9 @@ function App() {
               {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
 
-                const openOrPlan = () => {
+                const openEntry = () => {
                   if (entry.isDirectory) {
                     void openFolder(liveDrive, entry.relativePath);
-                  } else {
-                    beginPlanMove(entry);
                   }
                 };
 
@@ -1174,11 +1172,11 @@ function App() {
 
                       void planEntryToFolder(source, entry.relativePath);
                     }}
-                    onClick={openOrPlan}
+                    onClick={openEntry}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
+                      if (entry.isDirectory && (event.key === "Enter" || event.key === " ")) {
                         event.preventDefault();
-                        openOrPlan();
+                        openEntry();
                       }
                     }}
                   >
@@ -1204,17 +1202,18 @@ function App() {
                         ? (dragOverFolderPath === entry.relativePath ? "Drop to move here" : "Folder")
                         : formatBytes(entry.sizeBytes)}
                     </span>
-                    {/* The one place a move is planned from, for files and folders alike. */}
                     <span className="row-action">
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          beginPlanMove(entry);
-                        }}
-                      >
-                        Add to plan
-                      </button>
+                      {!entry.isDirectory && !plannedMove && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            beginPlanMove(entry);
+                          }}
+                        >
+                          Add to plan
+                        </button>
+                      )}
                     </span>
                   </div>
                 );
