@@ -1484,7 +1484,7 @@ function App() {
       </section>}
 
       <section className="section-block">
-        <div className="section-heading"><h2>Connected</h2>{connected.length > 0 && <span>{connected.length}</span>}</div>
+        <div className="section-heading"><h2>Connected</h2>{connected.length > 0 && <span className="count-badge">{connected.length}</span>}</div>
         {!loading && connected.length === 0 && (
           <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive and it will appear here.</p></div>
         )}
@@ -1581,7 +1581,7 @@ function App() {
       </section>
 
       <section className="section-block">
-        <div className="section-heading"><h2>Offline</h2>{offline.length > 0 && <span>{offline.length}</span>}</div>
+        <div className="section-heading"><h2>Offline</h2>{offline.length > 0 && <span className="count-badge count-badge-muted">{offline.length}</span>}</div>
         {offline.length === 0 ? (
           <p className="section-empty">No catalogued drives are offline.</p>
         ) : (
