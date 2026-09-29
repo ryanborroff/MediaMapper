@@ -447,12 +447,217 @@ fn try_lock_transfers(connection: &Connection) -> Result<Option<TransferLock>, S
 }
 
 const INTERRUPTED_TRANSFER_MESSAGE: &str = "Interrupted before verification completed.";
+const MISMATCHED_DESTINATION_MESSAGE: &str =
+    "Interrupted after copying. The file now at the destination does not match the source.";
+const UNCONFIRMED_DESTINATION_MESSAGE: &str =
+    "Interrupted after copying. The source is no longer available to confirm the file at the destination.";
 
 #[derive(Debug, Default, PartialEq)]
 struct TransferRecovery {
     // Unfinished records resolved to failed.
     interrupted: usize,
+    // Unfinished records whose copy had already been finalised, confirmed
+    // byte for byte against the source and resolved to completed.
+    completed: usize,
     temporary_files_removed: usize,
+}
+
+// What a transfer left in `verifying` actually reached before it stopped.
+enum VerifyingOutcome {
+    // The drives needed to tell are not available yet.
+    Undetermined,
+    Failed(&'static str),
+    // The final file is in place and identical to the source.
+    Finalised(i64),
+}
+
+// The rename into place happens only after verification succeeds, so a
+// record left in `verifying` either stopped before the rename, leaving its
+// temporary file, or stopped after it, before `completed` was recorded. In
+// the second case the file at the destination is compared with the source
+// again rather than trusted, since something else could have put it there.
+fn verifying_outcome(
+    source: Option<&Path>,
+    destination: &Path,
+    temporary: &Path,
+    copied_bytes: i64,
+) -> VerifyingOutcome {
+    match fs::symlink_metadata(temporary) {
+        Ok(_) => return VerifyingOutcome::Failed(INTERRUPTED_TRANSFER_MESSAGE),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return VerifyingOutcome::Undetermined,
+    }
+
+    let destination_length = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+        Ok(_) => return VerifyingOutcome::Failed(INTERRUPTED_TRANSFER_MESSAGE),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return VerifyingOutcome::Failed(INTERRUPTED_TRANSFER_MESSAGE)
+        }
+        Err(_) => return VerifyingOutcome::Undetermined,
+    };
+
+    let Some(source) = source else {
+        return VerifyingOutcome::Undetermined;
+    };
+    match fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return VerifyingOutcome::Failed(UNCONFIRMED_DESTINATION_MESSAGE),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return VerifyingOutcome::Failed(UNCONFIRMED_DESTINATION_MESSAGE)
+        }
+        Err(_) => return VerifyingOutcome::Undetermined,
+    }
+
+    if i64::try_from(destination_length).ok() != Some(copied_bytes) {
+        return VerifyingOutcome::Failed(MISMATCHED_DESTINATION_MESSAGE);
+    }
+
+    match files_are_identical(source, destination) {
+        Ok(true) => VerifyingOutcome::Finalised(copied_bytes),
+        Ok(false) => VerifyingOutcome::Failed(MISMATCHED_DESTINATION_MESSAGE),
+        Err(error) => {
+            eprintln!("Media Mapper transfer recovery: {error}");
+            VerifyingOutcome::Undetermined
+        }
+    }
+}
+
+// The folder a location's relative paths start from, if it is available now.
+fn connected_location_root(
+    kind: Option<&str>,
+    drive_id: Option<&str>,
+    local_path: Option<&str>,
+    connected_drives: &[DriveInfo],
+) -> Option<PathBuf> {
+    match kind {
+        Some("external_drive") => drive_id.and_then(|drive_id| {
+            connected_drives
+                .iter()
+                .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id))
+                .map(|drive| PathBuf::from(&drive.mount_point))
+        }),
+        Some("local_folder") => local_path.map(PathBuf::from),
+        _ => None,
+    }
+}
+
+// Resolves each record left in `verifying` whose outcome can be determined
+// with the drives connected now. The rest stay unresolved until it can.
+fn resolve_verifying_transfers(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+    recovery: &mut TransferRecovery,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT t.id,
+                    t.created_at,
+                    t.planned_move_id,
+                    t.source_drive_id,
+                    t.source_relative_path,
+                    t.destination_location_id,
+                    t.destination_relative_path,
+                    t.copied_bytes,
+                    l.kind,
+                    l.drive_id,
+                    l.local_path
+             FROM transfers t
+             LEFT JOIN locations l ON l.id = t.destination_location_id
+             WHERE t.status = 'verifying'",
+        )
+        .map_err(|error| format!("Unable to find unverified transfers: {error}"))?;
+    let verifying = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to find unverified transfers: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read unverified transfers: {error}"))?;
+
+    for (
+        id,
+        created_at,
+        planned_move_id,
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_relative_path,
+        copied_bytes,
+        kind,
+        drive_id,
+        local_path,
+    ) in verifying
+    {
+        let Some(root) = connected_location_root(
+            kind.as_deref(),
+            drive_id.as_deref(),
+            local_path.as_deref(),
+            connected_drives,
+        ) else {
+            continue;
+        };
+        let destination = root.join(&destination_relative_path);
+        let Ok(temporary) = transfer_temporary_path(&destination, id, created_at) else {
+            continue;
+        };
+        let source = connected_drives
+            .iter()
+            .find(|drive| drive.persistent_identifier.as_deref() == Some(&source_drive_id))
+            .map(|drive| PathBuf::from(&drive.mount_point).join(&source_relative_path));
+
+        match verifying_outcome(source.as_deref(), &destination, &temporary, copied_bytes) {
+            VerifyingOutcome::Undetermined => {}
+            VerifyingOutcome::Failed(message) => {
+                update_transfer_status(connection, id, "failed", None, Some(message))?;
+                recovery.interrupted += 1;
+            }
+            VerifyingOutcome::Finalised(bytes) => {
+                // Record the completion and clear the plan together, as a
+                // normal completed transfer does. Only the plan this transfer
+                // came from is removed, and only if it still describes it.
+                let transaction = connection
+                    .unchecked_transaction()
+                    .map_err(|error| format!("Unable to record recovered transfer: {error}"))?;
+                update_transfer_status(&transaction, id, "completed", Some(bytes), None)?;
+                transaction
+                    .execute(
+                        "DELETE FROM planned_moves
+                         WHERE id = ?1
+                           AND source_drive_id = ?2
+                           AND source_relative_path = ?3
+                           AND destination_location_id = ?4
+                           AND destination_relative_path = ?5",
+                        params![
+                            planned_move_id,
+                            source_drive_id,
+                            source_relative_path,
+                            destination_location_id,
+                            destination_relative_path
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to clear recovered plan: {error}"))?;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("Unable to record recovered transfer: {error}"))?;
+                recovery.completed += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Removes one transfer's temporary file. Only a regular file at exactly this
@@ -474,11 +679,16 @@ fn remove_transfer_temporary(temporary: &Path) -> Result<bool, String> {
 // temporary files of failed transfers. The caller must hold the transfer
 // lock, so nothing resolved here can still be running.
 //
-// Without connected drives it only resolves records. With them it also
-// removes the exact temporary file of each failed transfer whose destination
-// is available, optionally limited to one destination. Temporary file paths
-// are derived from each record, so no folder is scanned and no other file is
-// touched. Running it again changes nothing.
+// Records still `pending` or `copying` never reached the rename into place,
+// so they are resolved to failed without needing any drive. Records left in
+// `verifying` need the drives to tell whether their copy was finalised, so
+// they are resolved only when drives are given.
+//
+// With connected drives it also removes the exact temporary file of each
+// failed transfer whose destination is available, optionally limited to one
+// destination. Temporary file paths are derived from each record, so no
+// folder is scanned and no other file is touched. Running it again changes
+// nothing.
 fn recover_interrupted_transfers(
     connection: &Connection,
     connected_drives: Option<&[DriveInfo]>,
@@ -488,19 +698,21 @@ fn recover_interrupted_transfers(
         .execute(
             "UPDATE transfers
              SET status = 'failed', error_message = ?1, completed_at = ?2
-             WHERE status IN ('pending', 'copying', 'verifying')",
+             WHERE status IN ('pending', 'copying')",
             params![INTERRUPTED_TRANSFER_MESSAGE, now_unix()],
         )
         .map_err(|error| format!("Unable to recover interrupted transfers: {error}"))?;
 
     let mut recovery = TransferRecovery {
         interrupted,
-        temporary_files_removed: 0,
+        ..TransferRecovery::default()
     };
 
     let Some(connected_drives) = connected_drives else {
         return Ok(recovery);
     };
+
+    resolve_verifying_transfers(connection, connected_drives, &mut recovery)?;
 
     let (location_filter, path_filter) = only_destination.unzip();
     let mut statement = connection
@@ -536,18 +748,15 @@ fn recover_interrupted_transfers(
         .map_err(|error| format!("Unable to read failed transfers: {error}"))?;
 
     for (id, created_at, relative_path, kind, drive_id, local_path) in failed {
-        let root = match kind.as_deref() {
-            Some("external_drive") => drive_id.as_deref().and_then(|drive_id| {
-                connected_drives
-                    .iter()
-                    .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id))
-                    .map(|drive| PathBuf::from(&drive.mount_point))
-            }),
-            Some("local_folder") => local_path.map(PathBuf::from),
-            _ => None,
-        };
         // An unavailable destination is cleaned up when it is next available.
-        let Some(root) = root else { continue };
+        let Some(root) = connected_location_root(
+            kind.as_deref(),
+            drive_id.as_deref(),
+            local_path.as_deref(),
+            connected_drives,
+        ) else {
+            continue;
+        };
         let Ok(temporary) = transfer_temporary_path(&root.join(&relative_path), id, created_at)
         else {
             continue;
@@ -564,10 +773,12 @@ fn recover_interrupted_transfers(
     Ok(recovery)
 }
 
-// Runs once at launch. Records are resolved immediately, so the first history
-// the window shows is already accurate. Temporary files need the connected
-// drives, which are slow to list, so they are removed on a background thread.
-// Both steps are skipped while another copy of the app is transferring.
+// Runs once at launch. Records that need no drive are resolved immediately,
+// so the first history the window shows is as accurate as it can be. Records
+// left in `verifying`, and temporary files, need the connected drives, which
+// are slow to list, so they are handled on a background thread that tells the
+// window when history has changed. Both steps are skipped while another copy
+// of the app is transferring.
 fn recover_transfers_at_startup(app: &tauri::AppHandle) -> Result<(), String> {
     let database = database_path(app)?;
     let connection = open_database(&database)?;
@@ -576,17 +787,22 @@ fn recover_transfers_at_startup(app: &tauri::AppHandle) -> Result<(), String> {
         recover_interrupted_transfers(&connection, None, None)?;
     }
 
+    let app = app.clone();
     std::thread::spawn(move || {
-        let cleanup = || -> Result<(), String> {
+        let cleanup = || -> Result<TransferRecovery, String> {
             let drives = external_drives()?;
             let connection = open_database(&database)?;
-            if let Some(_lock) = try_lock_transfers(&connection)? {
-                recover_interrupted_transfers(&connection, Some(&drives), None)?;
+            match try_lock_transfers(&connection)? {
+                Some(_lock) => recover_interrupted_transfers(&connection, Some(&drives), None),
+                None => Ok(TransferRecovery::default()),
             }
-            Ok(())
         };
-        if let Err(error) = cleanup() {
-            eprintln!("Media Mapper transfer recovery failed: {error}");
+        match cleanup() {
+            Ok(recovery) if recovery.interrupted > 0 || recovery.completed > 0 => {
+                let _ = app.emit("transfers-recovered", ());
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("Media Mapper transfer recovery failed: {error}"),
         }
     });
 
@@ -626,6 +842,42 @@ fn execute_planned_transfer(
         )?,
         None => recover_interrupted_transfers(connection, None, None)?,
     };
+
+    // An earlier attempt at this plan may turn out to have been finalised
+    // before it was interrupted. Recovery then confirmed it and cleared the
+    // plan, so report that transfer rather than copying again.
+    if destination.is_some() {
+        let recovered = connection
+            .query_row(
+                "SELECT
+                    id,
+                    planned_move_id,
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    total_bytes,
+                    copied_bytes,
+                    status,
+                    error_message,
+                    created_at,
+                    started_at,
+                    completed_at
+                 FROM transfers
+                 WHERE planned_move_id = ?1
+                   AND status = 'completed'
+                   AND NOT EXISTS (SELECT 1 FROM planned_moves WHERE id = ?1)
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![planned_move_id],
+                read_transfer,
+            )
+            .optional()
+            .map_err(|error| format!("Unable to read recovered transfer: {error}"))?;
+        if let Some(recovered) = recovered {
+            return Ok(recovered);
+        }
+    }
 
     let validation = validate_plan_live(connection, connected_drives)?;
 
@@ -6264,6 +6516,7 @@ mod tests {
             recovery,
             TransferRecovery {
                 interrupted: 1,
+                completed: 0,
                 temporary_files_removed: 0
             }
         );
@@ -6284,6 +6537,7 @@ mod tests {
             recovery,
             TransferRecovery {
                 interrupted: 0,
+                completed: 0,
                 temporary_files_removed: 1
             }
         );
@@ -6337,6 +6591,7 @@ mod tests {
             recovery,
             TransferRecovery {
                 interrupted: 1,
+                completed: 0,
                 temporary_files_removed: 1
             }
         );
@@ -6391,14 +6646,147 @@ mod tests {
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
     }
 
+    // The state a crash leaves between the final rename and recording
+    // `completed`: the record says `verifying`, the temporary file is gone and
+    // the copy is at the destination.
+    fn simulate_crash_after_rename(fixture: &TransferFixture) -> TransferRecord {
+        let (transfer, temporary) =
+            simulate_interrupted_transfer(fixture, "verifying", fixture.contents.len());
+        fs::rename(&temporary, &fixture.destination).unwrap();
+        transfer
+    }
+
+    fn planned_move_exists(connection: &Connection, id: i64) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM planned_moves WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn copy_finalised_before_a_crash_is_confirmed_and_completed() {
+        let fixture = transfer_fixture("recover-finalised");
+        let transfer = simulate_crash_after_rename(&fixture);
+
+        // Launch, before drives are listed: the record cannot be judged yet,
+        // so it is left alone rather than called failed.
+        let recovery = recover_interrupted_transfers(&fixture.connection, None, None).unwrap();
+        assert_eq!(recovery, TransferRecovery::default());
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id),
+            ("verifying".to_string(), None)
+        );
+
+        // With drives, the copy is compared with the source and completed.
+        let recovery =
+            recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                .unwrap();
+        assert_eq!(
+            recovery,
+            TransferRecovery {
+                interrupted: 0,
+                completed: 1,
+                temporary_files_removed: 0
+            }
+        );
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "completed");
+        assert_eq!(history[0].error_message, None);
+        assert_eq!(history[0].copied_bytes, fixture.contents.len() as i64);
+        assert!(history[0].completed_at.is_some());
+        assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert_eq!(
+            folder_names(fixture.destination.parent().unwrap()),
+            vec!["film.mov"]
+        );
+
+        let recovery =
+            recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                .unwrap();
+        assert_eq!(recovery, TransferRecovery::default());
+    }
+
+    #[test]
+    fn retry_reports_a_finalised_copy_instead_of_copying_again() {
+        let fixture = transfer_fixture("retry-finalised");
+        let transfer = simulate_crash_after_rename(&fixture);
+
+        // No launch recovery ran; the retry itself finds the finished copy.
+        let result =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_eq!(result.id, transfer.id);
+        assert_eq!(result.status, "completed");
+        assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
+        assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[test]
+    fn finalised_copy_waits_until_its_source_can_confirm_it() {
+        let fixture = transfer_fixture("finalised-source-offline");
+        let transfer = simulate_crash_after_rename(&fixture);
+        let destination_only = vec![fixture.drives[1].clone()];
+
+        let recovery =
+            recover_interrupted_transfers(&fixture.connection, Some(&destination_only), None)
+                .unwrap();
+        assert_eq!(recovery, TransferRecovery::default());
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id).0,
+            "verifying"
+        );
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+
+        let recovery =
+            recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                .unwrap();
+        assert_eq!(recovery.completed, 1);
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id).0,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn finalised_copy_is_not_completed_once_its_source_is_gone() {
+        let fixture = transfer_fixture("finalised-source-gone");
+        let transfer = simulate_crash_after_rename(&fixture);
+        fs::remove_file(&fixture.source).unwrap();
+
+        let recovery =
+            recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                .unwrap();
+
+        assert_eq!(recovery.interrupted, 1);
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id),
+            (
+                "failed".to_string(),
+                Some(UNCONFIRMED_DESTINATION_MESSAGE.to_string())
+            )
+        );
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
     #[test]
     fn recovery_never_removes_a_destination_or_anything_but_a_file() {
         let fixture = transfer_fixture("recover-keeps-destination");
-        let (finalised, finalised_temporary) =
-            simulate_interrupted_transfer(&fixture, "verifying", fixture.contents.len());
-        // The copy was finalised just before the crash, so the record never
-        // reached `completed`.
-        fs::rename(&finalised_temporary, &fixture.destination).unwrap();
+        let finalised = simulate_crash_after_rename(&fixture);
+        // Something else then replaced the file at the destination with
+        // different bytes of the same length.
+        let replaced: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+        fs::remove_file(&fixture.destination).unwrap();
+        fs::write(&fixture.destination, &replaced).unwrap();
 
         // Another interrupted attempt whose temporary path is now a folder.
         let (odd, odd_temporary) = simulate_interrupted_transfer(&fixture, "copying", 10);
@@ -6414,15 +6802,19 @@ mod tests {
             recovery,
             TransferRecovery {
                 interrupted: 2,
+                completed: 0,
                 temporary_files_removed: 0
             }
         );
         assert_eq!(
-            transfer_status(&fixture.connection, finalised.id).0,
-            "failed"
+            transfer_status(&fixture.connection, finalised.id),
+            (
+                "failed".to_string(),
+                Some(MISMATCHED_DESTINATION_MESSAGE.to_string())
+            )
         );
         assert_eq!(transfer_status(&fixture.connection, odd.id).0, "failed");
-        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
         assert_eq!(fs::read(odd_temporary.join("keep.txt")).unwrap(), b"keep");
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
 
@@ -6430,7 +6822,7 @@ mod tests {
         let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
             .unwrap_err();
         assert!(error.contains("already exists"), "{error}");
-        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
     }
 
     #[test]
