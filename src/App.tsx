@@ -1339,12 +1339,22 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell app-navigation-shell">
+      <aside className="app-sidebar" aria-label="Media Mapper">
+        <div className="sidebar-brand">MediaMapper</div>
+        <nav className="sidebar-navigation" aria-label="Main navigation">
+          <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
+          <button className="sidebar-item" type="button" disabled>Browse</button>
+          <button className="sidebar-item" type="button" disabled>Plan</button>
+          <button className="sidebar-item" type="button" disabled>Transfers</button>
+        </nav>
+      </aside>
+      <div className="app-content">
       <header className="app-header">
         <div>
-          <p className="eyebrow">MEDIA MAPPER</p>
-          <h1>Drive catalogue</h1>
-          <p className="intro">Catalogue external drives once, then keep browsing them while they're offline.</p>
+          <p className="eyebrow">DRIVES</p>
+          <h1>Your storage</h1>
+          <p className="intro">See what's connected and keep catalogued drives available when they're offline.</p>
         </div>
         <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
           {loading ? "Checking…" : "Refresh"}
@@ -1453,8 +1463,6 @@ function App() {
                   {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
                   {catalogue && <div><dt>Catalogued</dt><dd>{formatBytes(catalogue.cataloguedBytes)}</dd></div>}
                   <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
-                  <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
-                  <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
                   {catalogue && catalogue.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
                 </dl>
                 <div className="scan-status-slot" aria-live="polite">
@@ -1544,7 +1552,6 @@ function App() {
                   <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
                   <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
                   <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
-                  <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
                   {drive.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
                 </dl>
               </article>
@@ -1904,6 +1911,7 @@ function App() {
       </section>}
 
       <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only and does not open, rename, move, copy or delete files.</footer>
+      </div>
     </main>
   );
 }
