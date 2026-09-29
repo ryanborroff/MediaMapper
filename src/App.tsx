@@ -159,6 +159,11 @@ type PlanPreflight = {
   issues: PlanPreflightIssue[];
 };
 
+type PlanLiveValidation = {
+  ready: boolean;
+  issues: PlanPreflightIssue[];
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -278,6 +283,7 @@ function App() {
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
+  const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
@@ -300,12 +306,14 @@ function App() {
 
   const loadPlannedMoves = useCallback(async () => {
     try {
-      const [moves, preflight] = await Promise.all([
+      const [moves, preflight, validation] = await Promise.all([
         invoke<PlannedMove[]>("list_planned_moves"),
         invoke<PlanPreflight>("get_plan_preflight"),
+        invoke<PlanLiveValidation>("validate_plan"),
       ]);
       setPlannedMoves(moves);
       setPlanPreflight(preflight);
+      setPlanValidation(validation);
     } catch (cause) {
       setError(String(cause));
     }
@@ -1419,6 +1427,26 @@ function App() {
         <p className="section-description">Virtual locations only. No files have been moved.</p>
 
         {planPreflight && <div className="plan-summary" aria-live="polite">
+          {planValidation && (
+            <div className={`plan-validation ${planValidation.ready ? "ready" : "blocked"}`}>
+              <strong>{planValidation.ready ? "Current checks passed" : "Plan needs attention"}</strong>
+              <span>
+                {planValidation.ready
+                  ? "Connected sources and destinations have passed the current checks."
+                  : `${planValidation.issues.length.toLocaleString()} ${planValidation.issues.length === 1 ? "live issue needs" : "live issues need"} attention.`}
+              </span>
+              {!planValidation.ready && (
+                <ul>
+                  {planValidation.issues.map((issue, index) => (
+                    <li key={`live:${issue.code}:${issue.moveId ?? "plan"}:${index}`}>
+                      {issue.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
           <div className="plan-summary-total">
             <strong>
               {planPreflight.moveCount.toLocaleString()} {planPreflight.moveCount === 1 ? "move" : "moves"}

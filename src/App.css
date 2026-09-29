@@ -812,3 +812,67 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   align-self: flex-start;
   margin-top: 0;
 }
+
+.plan-validation {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--divider);
+  font-size: 12px;
+}
+
+.plan-validation strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.plan-validation > span {
+  color: var(--text-muted);
+}
+
+.plan-validation.blocked strong {
+  color: var(--amber);
+}
+
+.plan-validation ul {
+  margin: 5px 0 0;
+  padding-left: 18px;
+  color: var(--text-body);
+}
+
+.plan-validation li + li {
+  margin-top: 3px;
+}
+
+.plan-validation {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--divider);
+  font-size: 12px;
+}
+
+.plan-validation strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.plan-validation > span {
+  color: var(--text-muted);
+}
+
+.plan-validation.blocked strong {
+  color: var(--amber);
+}
+
+.plan-validation ul {
+  margin: 5px 0 0;
+  padding-left: 18px;
+  color: var(--text-body);
+}
+
+.plan-validation li + li {
+  margin-top: 3px;
+}

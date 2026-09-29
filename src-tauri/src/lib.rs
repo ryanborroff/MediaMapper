@@ -244,6 +244,13 @@ struct PlanPreflight {
     issues: Vec<PlanPreflightIssue>,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct PlanLiveValidation {
+    ready: bool,
+    issues: Vec<PlanPreflightIssue>,
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2351,6 +2358,195 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
     })
 }
 
+fn validate_plan_live(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+) -> Result<PlanLiveValidation, String> {
+    let mut issues = Vec::new();
+
+    let connected_by_id: HashMap<&str, &DriveInfo> = connected_drives
+        .iter()
+        .filter_map(|drive| drive.persistent_identifier.as_deref().map(|id| (id, drive)))
+        .collect();
+
+    let mut statement = connection
+        .prepare(
+            "SELECT p.id,
+                    p.source_drive_id,
+                    p.source_relative_path,
+                    p.destination_location_id,
+                    l.kind,
+                    l.drive_id,
+                    l.local_path
+             FROM planned_moves p
+             LEFT JOIN locations l ON l.id = p.destination_location_id
+             ORDER BY p.id",
+        )
+        .map_err(|error| format!("Unable to prepare live plan validation: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to validate live plan: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read live plan validation: {error}"))?;
+
+    for (
+        move_id,
+        source_drive_id,
+        source_relative_path,
+        destination_location_id,
+        destination_kind,
+        destination_drive_id,
+        destination_local_path,
+    ) in rows
+    {
+        match connected_by_id.get(source_drive_id.as_str()) {
+            None => issues.push(PlanPreflightIssue {
+                code: "source_drive_offline".to_string(),
+                message: format!(
+                    "The source drive for {} is not connected.",
+                    source_relative_path
+                ),
+                move_id: Some(move_id),
+            }),
+            Some(source_drive) => {
+                let source_path = Path::new(&source_drive.mount_point).join(&source_relative_path);
+
+                if !source_path.exists() {
+                    issues.push(PlanPreflightIssue {
+                        code: "source_missing_on_disk".to_string(),
+                        message: format!(
+                            "{} is in the catalogue but is not currently present on the connected source drive.",
+                            source_relative_path
+                        ),
+                        move_id: Some(move_id),
+                    });
+                }
+            }
+        }
+
+        match destination_kind.as_deref() {
+            Some("external_drive") => {
+                let connected = destination_drive_id
+                    .as_deref()
+                    .and_then(|drive_id| connected_by_id.get(drive_id));
+
+                if connected.is_none() {
+                    issues.push(PlanPreflightIssue {
+                        code: "destination_drive_offline".to_string(),
+                        message: format!(
+                            "Destination {} is not currently connected.",
+                            destination_location_id
+                        ),
+                        move_id: Some(move_id),
+                    });
+                }
+            }
+            Some("local_folder") => match destination_local_path.as_deref() {
+                Some(path) => {
+                    let destination = Path::new(path);
+                    if !destination.exists() {
+                        issues.push(PlanPreflightIssue {
+                            code: "destination_folder_missing".to_string(),
+                            message: format!(
+                                "The destination folder {} is no longer available.",
+                                path
+                            ),
+                            move_id: Some(move_id),
+                        });
+                    } else if !destination.is_dir() {
+                        issues.push(PlanPreflightIssue {
+                            code: "destination_not_folder".to_string(),
+                            message: format!("The destination {} is no longer a folder.", path),
+                            move_id: Some(move_id),
+                        });
+                    }
+                }
+                None => issues.push(PlanPreflightIssue {
+                    code: "destination_folder_missing".to_string(),
+                    message: "The planned local destination no longer has a folder path."
+                        .to_string(),
+                    move_id: Some(move_id),
+                }),
+            },
+            _ => issues.push(PlanPreflightIssue {
+                code: "destination_missing".to_string(),
+                message: format!(
+                    "Destination {} is no longer available.",
+                    destination_location_id
+                ),
+                move_id: Some(move_id),
+            }),
+        }
+    }
+
+    // Capacity is checked once per external destination using current diskutil
+    // free space, rather than the value stored at the last catalogue scan.
+    let preflight = plan_preflight(connection)?;
+    for destination in &preflight.destinations {
+        if destination.kind != "external_drive" {
+            continue;
+        }
+
+        let drive_id = destination
+            .location_id
+            .strip_prefix("drive:")
+            .unwrap_or(&destination.location_id);
+
+        let Some(drive) = connected_by_id.get(drive_id) else {
+            continue;
+        };
+
+        if destination.unknown_size_count > 0 {
+            issues.push(PlanPreflightIssue {
+                code: "live_capacity_unknown".to_string(),
+                message: format!(
+                    "{} contains planned files with unknown sizes, so current free-space requirements cannot be confirmed.",
+                    destination.display_name
+                ),
+                move_id: None,
+            });
+        } else if let Some(available) = drive.available_bytes {
+            if destination.known_bytes as u64 > available {
+                issues.push(PlanPreflightIssue {
+                    code: "live_insufficient_capacity".to_string(),
+                    message: format!(
+                        "{} does not currently have enough free space for the planned data.",
+                        destination.display_name
+                    ),
+                    move_id: None,
+                });
+            }
+        }
+    }
+
+    Ok(PlanLiveValidation {
+        ready: issues.is_empty(),
+        issues,
+    })
+}
+
+#[tauri::command]
+async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, String> {
+    let drives = external_drives()?;
+
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        validate_plan_live(&connection, &drives)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
     run_blocking(move || {
@@ -2631,6 +2827,7 @@ pub fn run() {
             create_planned_move,
             list_planned_moves,
             get_plan_preflight,
+            validate_plan,
             list_planned_folder_entries,
             remove_planned_move
         ])
@@ -3531,6 +3728,192 @@ mod tests {
         assert_eq!(local.destinations[0].available_bytes, None);
         assert_eq!(local.destinations[0].projected_available_bytes, None);
         assert_eq!(local.destinations[0].capacity_sufficient, None);
+    }
+
+    fn test_drive(id: &str, name: &str, mount_point: &Path, available: u64) -> DriveInfo {
+        DriveInfo {
+            name: name.to_string(),
+            mount_point: mount_point.to_string_lossy().into_owned(),
+            filesystem: Some("APFS".to_string()),
+            total_bytes: Some(1_000),
+            available_bytes: Some(available),
+            persistent_identifier: Some(id.to_string()),
+            device_identifier: None,
+        }
+    }
+
+    #[test]
+    fn live_validation_reports_offline_source_and_destination() {
+        let database = TestDatabase::new("live-offline");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let result = validate_plan_live(&connection, &[]).unwrap();
+
+        assert!(!result.ready);
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_drive_offline"));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "destination_drive_offline"));
+    }
+
+    #[test]
+    fn live_validation_checks_source_disk_and_current_capacity() {
+        let database = TestDatabase::new("live-disk-capacity");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&source.0).unwrap();
+        fs::create_dir_all(&destination.0).unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 50),
+        ];
+
+        let missing = validate_plan_live(&connection, &drives).unwrap();
+        assert!(!missing.ready);
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "source_missing_on_disk"));
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "live_insufficient_capacity"));
+
+        fs::write(source.0.join("film.mov"), vec![0_u8; 100]).unwrap();
+
+        let enough_space = vec![
+            test_drive("UUID-A", "Source", &source.0, 1_000),
+            test_drive("UUID-B", "Backup", &destination.0, 500),
+        ];
+
+        let valid = validate_plan_live(&connection, &enough_space).unwrap();
+        assert!(valid.ready, "{:?}", valid.issues);
+        assert!(valid.issues.is_empty());
+    }
+
+    #[test]
+    fn live_validation_checks_local_destination_folder() {
+        let database = TestDatabase::new("live-local-folder");
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+
+        let source = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-live-local-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&source.0).unwrap();
+        fs::write(source.0.join("film.mov"), b"film").unwrap();
+
+        let local_path = std::env::temp_dir().join(format!(
+            "media-mapper-live-local-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = fs::remove_dir_all(&local_path);
+
+        connection
+            .execute_batch(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 4);",
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO locations
+                    (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES ('local:test-live', 'local_folder', 'Local', NULL, ?1, 0)",
+                params![local_path.to_string_lossy()],
+            )
+            .unwrap();
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "local:test-live",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![test_drive("UUID-A", "Source", &source.0, 1_000)];
+
+        let missing = validate_plan_live(&connection, &drives).unwrap();
+        assert!(!missing.ready);
+        assert!(missing
+            .issues
+            .iter()
+            .any(|issue| issue.code == "destination_folder_missing"));
+
+        fs::create_dir_all(&local_path).unwrap();
+
+        let valid = validate_plan_live(&connection, &drives).unwrap();
+        assert!(valid.ready, "{:?}", valid.issues);
+
+        fs::remove_dir_all(&local_path).unwrap();
     }
 
     #[test]
