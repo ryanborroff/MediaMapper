@@ -187,7 +187,35 @@ function App() {
     void refresh();
     void loadPlannedMoves();
     void loadLocations();
-  }, [refresh, loadPlannedMoves]);
+  }, [refresh, loadPlannedMoves, loadLocations]);
+
+  // Keep physical drive availability current while the app is open.
+  // This only asks macOS which external drives are mounted. It does not
+  // scan, catalogue, or read file contents.
+  useEffect(() => {
+    let active = true;
+
+    const refreshConnectedDrives = async () => {
+      try {
+        const drives = await invoke<DriveInfo[]>("list_external_drives");
+        if (active) {
+          setConnected(drives);
+        }
+      } catch {
+        // The main Refresh action remains responsible for surfacing errors.
+        // A transient background check should not interrupt the user.
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      void refreshConnectedDrives();
+    }, 2000);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
