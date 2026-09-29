@@ -649,7 +649,7 @@ function App() {
 
           <div className="plan-fields">
             <label>
-              <span>Destination</span>
+              <span>Move to</span>
               <select
                 value={planDestinationLocationId}
                 onChange={(event) => setPlanDestinationLocationId(event.target.value)}
@@ -687,12 +687,12 @@ function App() {
                 className="plan-add-location"
                 onClick={() => void addFolderOnThisMac()}
               >
-                Add folder on this Mac
+                Choose folder on this Mac…
               </button>
             </label>
 
             <label>
-              <span>Destination folder</span>
+              <span>Folder</span>
               <input
                 value={planDestinationFolder}
                 placeholder="e.g. Video/Archive"
