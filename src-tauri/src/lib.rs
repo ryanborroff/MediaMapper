@@ -2591,6 +2591,11 @@ pub fn run() {
             if let Err(error) = initialise_database(app.handle()) {
                 eprintln!("Media Mapper database initialisation failed: {error}");
             }
+
+            if let Some(window) = app.get_webview_window("main") {
+                window.show()?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -133,6 +133,32 @@ type PlannedFolderEntry = {
   isNewFolder: boolean;
 };
 
+type PlanPreflightDestination = {
+  locationId: string;
+  displayName: string;
+  kind: string;
+  moveCount: number;
+  knownBytes: number;
+  unknownSizeCount: number;
+  availableBytes: number | null;
+  projectedAvailableBytes: number | null;
+  capacitySufficient: boolean | null;
+};
+
+type PlanPreflightIssue = {
+  code: string;
+  message: string;
+  moveId: number | null;
+};
+
+type PlanPreflight = {
+  moveCount: number;
+  knownBytes: number;
+  unknownSizeCount: number;
+  destinations: PlanPreflightDestination[];
+  issues: PlanPreflightIssue[];
+};
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -251,6 +277,7 @@ function App() {
   const [showDuplicates, setShowDuplicates] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
+  const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
@@ -273,7 +300,12 @@ function App() {
 
   const loadPlannedMoves = useCallback(async () => {
     try {
-      setPlannedMoves(await invoke<PlannedMove[]>("list_planned_moves"));
+      const [moves, preflight] = await Promise.all([
+        invoke<PlannedMove[]>("list_planned_moves"),
+        invoke<PlanPreflight>("get_plan_preflight"),
+      ]);
+      setPlannedMoves(moves);
+      setPlanPreflight(preflight);
     } catch (cause) {
       setError(String(cause));
     }
@@ -1385,6 +1417,56 @@ function App() {
           <span>{plannedMoves.length}</span>
         </div>
         <p className="section-description">Virtual locations only. No files have been moved.</p>
+
+        {planPreflight && <div className="plan-summary" aria-live="polite">
+          <div className="plan-summary-total">
+            <strong>
+              {planPreflight.moveCount.toLocaleString()} {planPreflight.moveCount === 1 ? "move" : "moves"}
+              {" · "}
+              {planPreflight.unknownSizeCount > 0 ? "at least " : ""}
+              {formatBytes(planPreflight.knownBytes)}
+            </strong>
+            {planPreflight.unknownSizeCount > 0 && (
+              <span>
+                {planPreflight.unknownSizeCount.toLocaleString()} {planPreflight.unknownSizeCount === 1 ? "file has" : "files have"} unknown size
+              </span>
+            )}
+          </div>
+
+          <div className="plan-destinations">
+            {planPreflight.destinations.map((destination) => (
+              <div className="plan-destination" key={destination.locationId}>
+                <strong>{destination.displayName}</strong>
+                <span>
+                  {destination.unknownSizeCount > 0 ? "At least " : ""}
+                  {formatBytes(destination.knownBytes)} planned
+                  {destination.projectedAvailableBytes !== null
+                    ? ` · ${formatBytes(destination.projectedAvailableBytes)} free after`
+                    : " · capacity unknown"}
+                </span>
+                {destination.capacitySufficient === false && (
+                  <span className="plan-summary-warning">Not enough catalogued free space</span>
+                )}
+                {destination.capacitySufficient === null && destination.availableBytes !== null && (
+                  <span className="plan-summary-note">Final capacity cannot be confirmed while some file sizes are unknown.</span>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {planPreflight.issues.length > 0 && (
+            <div className="plan-issues">
+              <strong>
+                {planPreflight.issues.length.toLocaleString()} {planPreflight.issues.length === 1 ? "issue needs" : "issues need"} attention
+              </strong>
+              <ul>
+                {planPreflight.issues.map((issue, index) => (
+                  <li key={`${issue.code}:${issue.moveId ?? "plan"}:${index}`}>{issue.message}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>}
 
         <div className="planned-move-list">
           {plannedMoves.map((move) => (
