@@ -979,6 +979,74 @@ fn rename_exclusive(_source: &Path, _destination: &Path) -> Result<(), String> {
     Err("Exclusive transfer finalisation is not supported on this platform.".to_string())
 }
 
+// Carries the source's details onto the copy: permissions, modification and
+// creation dates, and extended attributes such as Finder tags. A raw byte copy
+// would otherwise date every copy to the moment it was made, which matters
+// for media sorted and archived by date.
+#[cfg(target_os = "macos")]
+fn copy_file_details(source: &Path, copy: &Path) -> Result<(), String> {
+    use std::os::macos::fs::FileTimesExt;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    const COPYFILE_STAT: u32 = 1 << 1;
+    const COPYFILE_XATTR: u32 = 1 << 2;
+
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const c_char,
+            to: *const c_char,
+            state: *mut c_void,
+            flags: u32,
+        ) -> c_int;
+    }
+
+    let details_error = |error: std::io::Error| {
+        format!("Unable to copy the file's dates, permissions and tags: {error}")
+    };
+
+    // Opened before copyfile, which may copy a read-only mode onto the copy
+    // and would then stop it being reopened to set its dates.
+    let copy_file = fs::OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .map_err(details_error)?;
+
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "Source path contains an invalid null byte.".to_string())?;
+    let copy_c = CString::new(copy.as_os_str().as_bytes())
+        .map_err(|_| "Temporary path contains an invalid null byte.".to_string())?;
+    let result = unsafe {
+        copyfile(
+            source_c.as_ptr(),
+            copy_c.as_ptr(),
+            std::ptr::null_mut(),
+            COPYFILE_STAT | COPYFILE_XATTR,
+        )
+    };
+    if result != 0 {
+        return Err(details_error(std::io::Error::last_os_error()));
+    }
+
+    // copyfile does not carry the creation date over, so set both dates
+    // from the source explicitly.
+    let metadata = fs::metadata(source).map_err(details_error)?;
+    let mut times = fs::FileTimes::new()
+        .set_accessed(metadata.accessed().map_err(details_error)?)
+        .set_modified(metadata.modified().map_err(details_error)?);
+    if let Ok(created) = metadata.created() {
+        times = times.set_created(created);
+    }
+    copy_file.set_times(times).map_err(details_error)?;
+    copy_file.sync_all().map_err(details_error)?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_file_details(_source: &Path, _copy: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 // The temporary file for one transfer record. It is named from the record
 // alone, so recovery after a crash can derive this exact path again and never
 // has to guess which hidden files belong to Media Mapper.
@@ -1059,6 +1127,8 @@ where
             .map_err(|error| format!("Unable to sync copied file: {error}"))?;
 
         drop(writer);
+
+        copy_file_details(source, temporary)?;
 
         on_verifying(copied)?;
 
@@ -5086,6 +5156,67 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), contents);
         assert_eq!(fs::read(&destination).unwrap(), contents);
         assert!(source.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_copy_keeps_dates_permissions_and_finder_tags() {
+        use std::os::macos::fs::{FileTimesExt, MetadataExt};
+        use std::os::unix::fs::PermissionsExt;
+
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-details-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("clip.mov");
+        let destination = volume.0.join("Archive/clip.mov");
+        fs::write(&source, vec![7_u8; 4096]).unwrap();
+
+        // Created 1 Jan 2019, modified 1 Jan 2020, tagged Red, read-only.
+        let created = UNIX_EPOCH + Duration::from_secs(1_546_300_800);
+        let modified = UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_created(created)
+                    .set_modified(modified)
+                    .set_accessed(modified),
+            )
+            .unwrap();
+        let tagged = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.metadata:_kMDItemUserTags", "Red"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(tagged.success());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_file_verified(&source, &destination).unwrap();
+
+        let copied = fs::metadata(&destination).unwrap();
+        assert_eq!(copied.modified().unwrap(), modified);
+        assert_eq!(copied.created().unwrap(), created);
+        assert_eq!(copied.st_mode() & 0o777, 0o444);
+        let tag = std::process::Command::new("xattr")
+            .args(["-p", "com.apple.metadata:_kMDItemUserTags"])
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tag.stdout).trim(), "Red");
+
+        // The original is untouched.
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+
+        // Let the test folder be removed.
+        for path in [&source, &destination] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
     }
 
     #[test]

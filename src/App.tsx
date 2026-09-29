@@ -1737,7 +1737,7 @@ function App() {
                     <div>
                       <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
                       <span>
-                        Media Mapper will run final checks again, copy each file, verify it byte for byte, and leave every original untouched.
+                        Media Mapper will run final checks again, copy each file with its dates and tags, verify it byte for byte, and leave every original untouched.
                       </span>
                     </div>
                     <div className="plan-copy-actions">
