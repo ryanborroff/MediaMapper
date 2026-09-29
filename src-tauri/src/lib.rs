@@ -2,8 +2,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
+    ffi::CString,
     fs,
     io::{BufReader, BufWriter, Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -688,6 +690,52 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn rename_exclusive(source: &Path, destination: &Path) -> Result<(), String> {
+    // Darwin's RENAME_EXCL flag. renamex_np returns EEXIST rather than
+    // replacing an existing destination. If the filesystem does not support
+    // exclusive rename, the operation fails safely instead of falling back
+    // to overwrite semantics.
+    const RENAME_EXCL: u32 = 0x00000004;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::os::raw::c_char,
+            to: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> std::os::raw::c_int;
+    }
+
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "Temporary path contains an invalid null byte.".to_string())?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| "Destination path contains an invalid null byte.".to_string())?;
+
+    let result = unsafe { renamex_np(source_c.as_ptr(), destination_c.as_ptr(), RENAME_EXCL) };
+
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(format!(
+            "Destination already exists: {}",
+            destination.display()
+        ));
+    }
+
+    Err(format!(
+        "Unable to finalise copied file without overwrite: {error}"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_exclusive(_source: &Path, _destination: &Path) -> Result<(), String> {
+    Err("Exclusive transfer finalisation is not supported on this platform.".to_string())
+}
+
 fn copy_file_verified_with_stage<F>(
     source: &Path,
     destination: &Path,
@@ -758,16 +806,9 @@ where
             return Err("Copied file failed byte-for-byte verification.".to_string());
         }
 
-        // Refuse a late collision that appeared while the copy was running.
-        if destination.exists() {
-            return Err(format!(
-                "Destination appeared while copying: {}",
-                destination.display()
-            ));
-        }
-
-        fs::rename(&temporary, destination)
-            .map_err(|error| format!("Unable to finalise copied file: {error}"))?;
+        // Finalise with no-overwrite semantics. A destination created after
+        // preflight or during the copy must never be replaced.
+        rename_exclusive(&temporary, destination)?;
 
         Ok(copied)
     })();
@@ -4775,6 +4816,30 @@ mod tests {
         assert_eq!(verifying_bytes, Some(contents.len() as u64));
         assert_eq!(fs::read(&destination).unwrap(), contents);
         assert!(source.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn exclusive_rename_never_replaces_existing_destination() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-exclusive-rename-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+
+        let temporary = volume.0.join("temporary.partial");
+        let destination = volume.0.join("destination.mov");
+
+        fs::write(&temporary, b"new contents").unwrap();
+        fs::write(&destination, b"existing contents").unwrap();
+
+        let error = rename_exclusive(&temporary, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing contents");
+        assert_eq!(fs::read(&temporary).unwrap(), b"new contents");
     }
 
     #[test]
