@@ -108,6 +108,8 @@ type PlannedFolderEntry = {
   isDirectory: boolean;
   sizeBytes: number | null;
   destinationRelativePath: string;
+  // A folder that exists only in the plan, created by moves planned into it.
+  isNewFolder: boolean;
 };
 
 function formatBytes(bytes: number | null) {
@@ -955,7 +957,9 @@ function App() {
                       </span>
                       <span className="file-name-text">
                         <span className="file-name-primary">{planned.name}</span>
-                        {plannedFromPath(planned)}
+                        {planned.isNewFolder
+                          ? <span className="planned-path">New folder in the plan</span>
+                          : plannedFromPath(planned)}
                       </span>
                     </span>
                     <span>Planned</span>

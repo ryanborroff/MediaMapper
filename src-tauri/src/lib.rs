@@ -198,6 +198,9 @@ struct PlannedFolderEntry {
     is_directory: bool,
     size_bytes: Option<i64>,
     destination_relative_path: String,
+    // A folder that exists only in the plan: some planned destination sits
+    // inside it, but it is not in the catalogue. It has no single source move.
+    is_new_folder: bool,
 }
 
 fn now_unix() -> i64 {
@@ -1779,6 +1782,37 @@ async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, S
     .await
 }
 
+// Planned destinations can sit inside folders that do not exist yet, such as
+// `New Folder/film.mp4` planned from the drive root. Returns the next folder
+// below `parent_path` on the way to each such destination, so the planned view
+// can show it and the user can open it. Items directly inside `parent_path`
+// are not folders on the way to anything and are left out.
+fn planned_intermediate_folders<'a>(
+    destinations: impl IntoIterator<Item = &'a str>,
+    parent_path: &str,
+) -> Vec<String> {
+    let prefix = if parent_path.is_empty() {
+        String::new()
+    } else {
+        format!("{parent_path}/")
+    };
+
+    let mut folders = Vec::new();
+    for destination in destinations {
+        let Some(remainder) = destination.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((next_folder, _)) = remainder.split_once('/') else {
+            continue;
+        };
+        let folder = format!("{prefix}{next_folder}");
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders
+}
+
 #[tauri::command]
 async fn list_planned_folder_entries(
     app: tauri::AppHandle,
@@ -1837,6 +1871,7 @@ async fn list_planned_folder_entries(
                         is_directory: row.get::<_, i64>(5)? != 0,
                         size_bytes: row.get(6)?,
                         destination_relative_path: row.get(7)?,
+                        is_new_folder: false,
                     })
                 })
                 .map_err(|error| format!("Unable to read planned folder: {error}"))?;
@@ -1844,6 +1879,11 @@ async fn list_planned_folder_entries(
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("Unable to read planned folder rows: {error}"))?
         };
+
+        let new_folders = planned_intermediate_folders(
+            roots.iter().map(|root| root.destination_relative_path.as_str()),
+            &parent_path,
+        );
 
         let mut entries = Vec::new();
 
@@ -1928,8 +1968,32 @@ async fn list_planned_folder_entries(
                     is_directory,
                     size_bytes,
                     destination_relative_path,
+                    is_new_folder: false,
                 });
             }
+        }
+
+        // A planned folder move can already be the folder itself; only add
+        // folders that nothing else in this listing represents.
+        for folder in new_folders {
+            if entries
+                .iter()
+                .any(|entry| entry.destination_relative_path == folder)
+            {
+                continue;
+            }
+            let name = folder.rsplit('/').next().unwrap_or(&folder).to_owned();
+            entries.push(PlannedFolderEntry {
+                move_id: 0,
+                source_drive_id: String::new(),
+                source_drive_name: String::new(),
+                source_relative_path: String::new(),
+                name,
+                is_directory: true,
+                size_bytes: None,
+                destination_relative_path: folder,
+                is_new_folder: true,
+            });
         }
 
         entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
@@ -2396,5 +2460,36 @@ mod tests {
 
         // Two files of 4 bytes, two folders, and nothing counted as skipped.
         assert_eq!(counters, (2, 2, 8, 0));
+    }
+
+    #[test]
+    fn planned_view_shows_folders_that_exist_only_in_the_plan() {
+        let destinations = [
+            "New Folder/film.mp4",
+            "New Folder/Extras/clip.mp4",
+            "Archive/2024/Deep/scan.tif",
+            "top.mp4",
+        ];
+
+        // At the drive root: the first folder on the way to each destination,
+        // once each, and nothing for items that sit directly at the root.
+        assert_eq!(
+            planned_intermediate_folders(destinations, ""),
+            ["New Folder", "Archive"]
+        );
+
+        // Inside a new folder: its planned subfolders, but not its own files.
+        assert_eq!(
+            planned_intermediate_folders(destinations, "New Folder"),
+            ["New Folder/Extras"]
+        );
+        assert_eq!(
+            planned_intermediate_folders(destinations, "Archive/2024"),
+            ["Archive/2024/Deep"]
+        );
+
+        // A folder name that only shares a prefix is not a parent.
+        assert!(planned_intermediate_folders(destinations, "New").is_empty());
+        assert!(planned_intermediate_folders(destinations, "Archive/2024/Deep").is_empty());
     }
 }
