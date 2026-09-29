@@ -1086,3 +1086,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     grid-column: 1 / -1;
   }
 }
+
+/* Why a planned file will be skipped when copying. Amber: a blocked action
+   (UI guidelines section 12). */
+.plan-blocked-note {
+  display: block;
+  margin-top: 3px;
+  color: var(--amber);
+  font-size: 12px;
+}

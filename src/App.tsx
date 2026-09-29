@@ -149,7 +149,19 @@ type PlanPreflightIssue = {
   code: string;
   message: string;
   moveId: number | null;
+  // The destination an issue is about when it is not about one move.
+  locationId: string | null;
 };
+
+// The issues that stop one planned move from being copied, by the same rule
+// the backend applies before each copy: issues about that move, issues about
+// its destination, and any issue that names neither.
+function blockingIssues(move: PlannedMove, issues: PlanPreflightIssue[]) {
+  return issues.filter((issue) =>
+    issue.moveId !== null ? issue.moveId === move.id
+      : issue.locationId !== null ? issue.locationId === move.destinationLocationId
+        : true);
+}
 
 type PlanPreflight = {
   moveCount: number;
@@ -390,14 +402,19 @@ function App() {
   }, []);
 
   const copyPlannedFiles = useCallback(async () => {
-    const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+    if (!planValidation || !planPreflight) return;
 
-    if (
-      fileMoves.length === 0 ||
-      executionRunning.current ||
-      !planValidation?.ready ||
-      (planPreflight?.issues.length ?? 0) > 0
-    ) {
+    // Blocked files are skipped; a problem with one file no longer stops
+    // the others.
+    const issues = [...planValidation.issues, ...planPreflight.issues];
+    const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+    const readyMoves = fileMoves.filter((move) => blockingIssues(move, issues).length === 0);
+    const skipped = fileMoves.length - readyMoves.length;
+    const skippedNote = skipped > 0
+      ? ` ${skipped.toLocaleString()} blocked ${skipped === 1 ? "file was" : "files were"} skipped.`
+      : "";
+
+    if (readyMoves.length === 0 || executionRunning.current) {
       return;
     }
 
@@ -405,33 +422,33 @@ function App() {
     setExecutingPlan(true);
     setExecutionResult(null);
     setShowCopyConfirmation(false);
-    setExecutionProgress({ moves: fileMoves, completed: 0 });
+    setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
 
     try {
       // The backend reruns final live validation immediately before every
       // individual copy. UI validation is informative, not the safety gate.
-      for (const move of fileMoves) {
+      for (const move of readyMoves) {
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
         });
 
         completed += 1;
-        setExecutionProgress({ moves: fileMoves, completed });
+        setExecutionProgress({ moves: readyMoves, completed });
       }
 
       setExecutionResult({
         stopped: false,
-        message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.`,
+        message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
       });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
       setExecutionResult({
         stopped: true,
         message: completed > 0
-          ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}`
-          : `Nothing was copied. ${String(cause)}`,
+          ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
+          : `Nothing was copied. ${String(cause)}${skippedNote}`,
       });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
@@ -1705,14 +1722,15 @@ function App() {
           </div>}
 
           {(() => {
-            const fileMoveCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
-            const folderMoveCount = plannedMoves.length - fileMoveCount;
-            const planReady =
-              planValidation?.ready === true &&
-              (planPreflight?.issues.length ?? 0) === 0;
+            const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+            const folderMoveCount = plannedMoves.length - fileMoves.length;
+            const checksLoaded = planValidation !== null && planPreflight !== null;
+            const issues = [...(planValidation?.issues ?? []), ...(planPreflight?.issues ?? [])];
+            const readyCount = fileMoves.filter((move) => blockingIssues(move, issues).length === 0).length;
+            const blockedCount = fileMoves.length - readyCount;
             // Copying and scanning never overlap: a scan holds the catalogue's
             // write lock, so a copy could not record its own completion.
-            const canCopy = planReady && fileMoveCount > 0 && !executingPlan && scanningId === null;
+            const canCopy = checksLoaded && readyCount > 0 && !executingPlan && scanningId === null;
 
             return (
               <div className="plan-copy">
@@ -1726,6 +1744,11 @@ function App() {
                       {folderMoveCount > 0 && (
                         <span>
                           {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
+                        </span>
+                      )}
+                      {checksLoaded && blockedCount > 0 && (
+                        <span>
+                          {blockedCount.toLocaleString()} planned {blockedCount === 1 ? "file needs" : "files need"} attention and will be skipped.
                         </span>
                       )}
                       {scanningId !== null && (
@@ -1746,10 +1769,15 @@ function App() {
                 ) : (
                   <div className="plan-copy-confirmation">
                     <div>
-                      <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
+                      <strong>Copy {readyCount.toLocaleString()} {readyCount === 1 ? "file" : "files"}?</strong>
                       <span>
                         Media Mapper will run final checks again, copy each file with its dates and tags, verify it byte for byte, and leave every original untouched.
                       </span>
+                      {blockedCount > 0 && (
+                        <span>
+                          {blockedCount.toLocaleString()} blocked {blockedCount === 1 ? "file" : "files"} will be skipped.
+                        </span>
+                      )}
                     </div>
                     <div className="plan-copy-actions">
                       <button
@@ -1789,6 +1817,15 @@ function App() {
                   <div className="transfer-item">
                     <strong>{move.sourceName}</strong>
                     <TransferPaths from={paths.from} to={paths.to} />
+                    {!executingPlan && !move.sourceIsDirectory && (() => {
+                      const blocking = blockingIssues(move, [
+                        ...(planValidation?.issues ?? []),
+                        ...(planPreflight?.issues ?? []),
+                      ]);
+                      return blocking.length > 0 && (
+                        <span className="plan-blocked-note">{blocking[0].message}</span>
+                      );
+                    })()}
                   </div>
                   <span>{formatBytes(move.sourceSizeBytes)}</span>
                   {executingPlan ? (
