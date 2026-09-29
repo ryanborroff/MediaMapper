@@ -1760,12 +1760,37 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 
 .transfer-history-new-row .transfer-outcome {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.35;
   white-space: normal;
   overflow-wrap: normal;
   word-break: normal;
+}
+
+.transfer-history-new-row .transfer-status {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.transfer-history-new-row.completed .transfer-status {
+  color: var(--green);
+}
+
+.transfer-history-new-row.failed .transfer-status {
+  color: var(--error-text);
+}
+
+.transfer-history-new-row.incomplete .transfer-status {
+  color: var(--amber);
+}
+
+.transfer-history-new-row .transfer-outcome > span:last-child {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .transfer-history-empty {
