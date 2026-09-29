@@ -2231,7 +2231,6 @@ async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), Strin
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // A failure here must not stop the app from opening. Commands
             // open the database themselves and will report the same error.
