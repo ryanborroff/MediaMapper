@@ -418,10 +418,12 @@ fn resolve_transfer_paths(
     Ok((source, destination))
 }
 
-// Only one transfer runs at a time, across threads and across a second copy of
-// the app. The lock is an exclusive OS file lock on a file beside the
-// database. Closing the file releases it, and so does the process ending, so
-// a crash never leaves it held.
+// Only one transfer or drive scan runs at a time, across threads and across a
+// second copy of the app. A scan holds the database's write lock for its whole
+// run, so a transfer during a scan could copy and finalise a file but then fail
+// to record it, leaving a finished copy recorded as interrupted. The lock is an
+// exclusive OS file lock on a file beside the database. Closing the file
+// releases it, and so does the process ending, so a crash never leaves it held.
 struct TransferLock {
     _file: fs::File,
 }
@@ -816,7 +818,7 @@ fn execute_planned_transfer(
 ) -> Result<TransferRecord, String> {
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
-            "Another transfer is already running. Wait for it to finish, then try again."
+            "Another transfer or a drive scan is running. Wait for it to finish, then try again."
                 .to_string(),
         );
     };
@@ -901,12 +903,22 @@ fn execute_planned_transfer(
     execute_transfer_paths(connection, planned_move_id, &source, &destination)
 }
 
+// How long transfer bookkeeping waits for the database. Once a copy has been
+// finalised it must be recorded, so waiting out brief contention is far
+// better than failing. Transfers run on a background thread, so the wait
+// never freezes the window.
+const TRANSFER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
     source: &Path,
     destination: &Path,
 ) -> Result<TransferRecord, String> {
+    connection
+        .busy_timeout(TRANSFER_BUSY_TIMEOUT)
+        .map_err(|error| format!("Unable to configure transfer database: {error}"))?;
+
     let transfer = create_transfer_record(connection, planned_move_id)?;
 
     let temporary = match transfer_temporary_path(destination, transfer.id, transfer.created_at) {
@@ -940,18 +952,21 @@ fn execute_transfer_paths(
             let copied_bytes = i64::try_from(copied_bytes)
                 .map_err(|_| "Copied file is too large to record.".to_string())?;
 
+            // Recording the completion and clearing the plan happen together,
+            // so a finished copy never keeps an active plan item. The transfer
+            // record contains its own source/destination snapshot, so removing
+            // the plan does not remove execution history.
+            let completion = connection
+                .unchecked_transaction()
+                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
             update_transfer_status(
-                connection,
+                &completion,
                 transfer.id,
                 "completed",
                 Some(copied_bytes),
                 None,
             )?;
-
-            // A verified transfer is no longer an active plan item. The
-            // transfer record contains its own source/destination snapshot,
-            // so removing the plan does not remove execution history.
-            connection
+            completion
                 .execute(
                     "DELETE FROM planned_moves WHERE id = ?1",
                     params![planned_move_id],
@@ -959,6 +974,9 @@ fn execute_transfer_paths(
                 .map_err(|error| {
                     format!("Transfer completed, but the plan could not be cleared: {error}")
                 })?;
+            completion
+                .commit()
+                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
         }
         Err(error) => {
             // The transfer snapshot survives the failure and records why it
@@ -1213,6 +1231,74 @@ fn rename_exclusive(_source: &Path, _destination: &Path) -> Result<(), String> {
     Err("Exclusive transfer finalisation is not supported on this platform.".to_string())
 }
 
+// Carries the source's details onto the copy: permissions, modification and
+// creation dates, and extended attributes such as Finder tags. A raw byte copy
+// would otherwise date every copy to the moment it was made, which matters
+// for media sorted and archived by date.
+#[cfg(target_os = "macos")]
+fn copy_file_details(source: &Path, copy: &Path) -> Result<(), String> {
+    use std::os::macos::fs::FileTimesExt;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    const COPYFILE_STAT: u32 = 1 << 1;
+    const COPYFILE_XATTR: u32 = 1 << 2;
+
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const c_char,
+            to: *const c_char,
+            state: *mut c_void,
+            flags: u32,
+        ) -> c_int;
+    }
+
+    let details_error = |error: std::io::Error| {
+        format!("Unable to copy the file's dates, permissions and tags: {error}")
+    };
+
+    // Opened before copyfile, which may copy a read-only mode onto the copy
+    // and would then stop it being reopened to set its dates.
+    let copy_file = fs::OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .map_err(details_error)?;
+
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "Source path contains an invalid null byte.".to_string())?;
+    let copy_c = CString::new(copy.as_os_str().as_bytes())
+        .map_err(|_| "Temporary path contains an invalid null byte.".to_string())?;
+    let result = unsafe {
+        copyfile(
+            source_c.as_ptr(),
+            copy_c.as_ptr(),
+            std::ptr::null_mut(),
+            COPYFILE_STAT | COPYFILE_XATTR,
+        )
+    };
+    if result != 0 {
+        return Err(details_error(std::io::Error::last_os_error()));
+    }
+
+    // copyfile does not carry the creation date over, so set both dates
+    // from the source explicitly.
+    let metadata = fs::metadata(source).map_err(details_error)?;
+    let mut times = fs::FileTimes::new()
+        .set_accessed(metadata.accessed().map_err(details_error)?)
+        .set_modified(metadata.modified().map_err(details_error)?);
+    if let Ok(created) = metadata.created() {
+        times = times.set_created(created);
+    }
+    copy_file.set_times(times).map_err(details_error)?;
+    copy_file.sync_all().map_err(details_error)?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_file_details(_source: &Path, _copy: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 // The temporary file for one transfer record. It is named from the record
 // alone, so recovery after a crash can derive this exact path again and never
 // has to guess which hidden files belong to Media Mapper.
@@ -1293,6 +1379,8 @@ where
             .map_err(|error| format!("Unable to sync copied file: {error}"))?;
 
         drop(writer);
+
+        copy_file_details(source, temporary)?;
 
         on_verifying(copied)?;
 
@@ -2241,6 +2329,12 @@ async fn scan_drive(
         }
 
         let mut connection = open_database(&database)?;
+        // Held for the whole scan, so no transfer can run until it finishes.
+        let Some(_transfer_lock) = try_lock_transfers(&connection)? else {
+            return Err(
+                "A transfer is running. Wait for it to finish, then scan the drive.".to_string(),
+            );
+        };
         let transaction = connection
             .transaction()
             .map_err(|error| format!("Unable to start catalogue transaction: {error}"))?;
@@ -5316,6 +5410,67 @@ mod tests {
         assert!(source.exists());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_copy_keeps_dates_permissions_and_finder_tags() {
+        use std::os::macos::fs::{FileTimesExt, MetadataExt};
+        use std::os::unix::fs::PermissionsExt;
+
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-details-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("clip.mov");
+        let destination = volume.0.join("Archive/clip.mov");
+        fs::write(&source, vec![7_u8; 4096]).unwrap();
+
+        // Created 1 Jan 2019, modified 1 Jan 2020, tagged Red, read-only.
+        let created = UNIX_EPOCH + Duration::from_secs(1_546_300_800);
+        let modified = UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_created(created)
+                    .set_modified(modified)
+                    .set_accessed(modified),
+            )
+            .unwrap();
+        let tagged = std::process::Command::new("xattr")
+            .args(["-w", "com.apple.metadata:_kMDItemUserTags", "Red"])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(tagged.success());
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_file_verified(&source, &destination).unwrap();
+
+        let copied = fs::metadata(&destination).unwrap();
+        assert_eq!(copied.modified().unwrap(), modified);
+        assert_eq!(copied.created().unwrap(), created);
+        assert_eq!(copied.st_mode() & 0o777, 0o444);
+        let tag = std::process::Command::new("xattr")
+            .args(["-p", "com.apple.metadata:_kMDItemUserTags"])
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tag.stdout).trim(), "Red");
+
+        // The original is untouched.
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+
+        // Let the test folder be removed.
+        for path in [&source, &destination] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
     #[test]
     fn verified_copy_reports_verifying_after_full_copy() {
         let volume = TestVolume(std::env::temp_dir().join(format!(
@@ -5711,6 +5866,65 @@ mod tests {
             destination,
             PathBuf::from("/Users/test/Media/Archive/source.mov")
         );
+    }
+
+    #[test]
+    fn transfer_records_its_completion_despite_brief_database_contention() {
+        let database = TestDatabase::new("transfer-contention");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-contention-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("source.mov");
+        let destination = volume.0.join("Archive/film.mov");
+        fs::write(&source, b"contents").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'source.mov', 'source.mov', '', 0, 8)",
+                [],
+            )
+            .unwrap();
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "source.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        // Another connection holds the write lock for longer than the normal
+        // two-second wait, as a short write elsewhere might.
+        let (locked, wait_for_lock) = std::sync::mpsc::channel();
+        let path = database.0.clone();
+        let holder = std::thread::spawn(move || {
+            let other = Connection::open(&path).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        wait_for_lock.recv().unwrap();
+
+        let transfer = execute_transfer_paths(&connection, move_id, &source, &destination)
+            .expect("the transfer waits out the contention instead of failing");
+        holder.join().unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(fs::read(&destination).unwrap(), b"contents");
+        let planned: i64 = connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(planned, 0);
     }
 
     #[test]
@@ -6860,7 +7074,7 @@ mod tests {
         let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
             .unwrap_err();
         assert!(
-            error.contains("Another transfer is already running"),
+            error.contains("Another transfer or a drive scan is running"),
             "{error}"
         );
         assert!(list_transfer_records(&fixture.connection)
