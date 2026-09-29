@@ -316,13 +316,6 @@ function App() {
     ? libraryResults
     : libraryResults.filter((result) => !isHiddenPath(result.relativePath));
   const [librarySearching, setLibrarySearching] = useState(false);
-  const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
-  const [largestFilesLoading, setLargestFilesLoading] = useState(false);
-  const [showLargestFiles, setShowLargestFiles] = useState(false);
-  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
-  const [duplicatesLoading, setDuplicatesLoading] = useState(false);
-  const [showDuplicates, setShowDuplicates] = useState(false);
-  const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
   const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
@@ -656,179 +649,6 @@ function App() {
     }
   }, []);
 
-  const loadDuplicates = useCallback(async () => {
-    if (showDuplicates) {
-      setShowDuplicates(false);
-      setExpandedDuplicate(null);
-      return;
-    }
-
-    setDuplicatesLoading(true);
-    setError(null);
-
-    try {
-      const results = await invoke<DuplicateGroup[]>("probable_duplicates");
-      setDuplicateGroups(results);
-      setShowDuplicates(true);
-    } catch (cause) {
-      setError(String(cause));
-      setDuplicateGroups([]);
-    } finally {
-      setDuplicatesLoading(false);
-    }
-  }, [showDuplicates]);
-
-  const loadLargestFiles = useCallback(async () => {
-    if (showLargestFiles) {
-      setShowLargestFiles(false);
-      return;
-    }
-
-    setLargestFilesLoading(true);
-    setError(null);
-
-    try {
-      const results = await invoke<LargestFile[]>("largest_files");
-      setLargestFiles(results);
-      setShowLargestFiles(true);
-    } catch (cause) {
-      setError(String(cause));
-      setLargestFiles([]);
-    } finally {
-      setLargestFilesLoading(false);
-    }
-  }, [showLargestFiles]);
-
-  const containingFolder = (relativePath: string) => {
-    const separator = relativePath.lastIndexOf("/");
-    return separator === -1 ? "" : relativePath.slice(0, separator);
-  };
-
-  const openSearchResult = async (drive: CataloguedDrive, entry: CatalogueEntry) => {
-    const destination = entry.isDirectory ? entry.relativePath : containingFolder(entry.relativePath);
-    setSearchQuery(""); setSearchResults([]);
-    await openFolder(drive, destination);
-  };
-
-  const openLibraryResult = async (result: LibrarySearchResult) => {
-    const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
-    if (!drive) {
-      setError("That drive catalogue is no longer available.");
-      return;
-    }
-    setLibraryQuery("");
-    setLibraryResults([]);
-    await openSearchResult(drive, result);
-  };
-
-  const openDuplicateFile = async (file: DuplicateFile) => {
-    const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
-
-    if (!drive) {
-      setError("That drive catalogue is no longer available.");
-      return;
-    }
-
-    await openSearchResult(drive, {
-      relativePath: file.relativePath,
-      name: file.name,
-      isDirectory: false,
-      sizeBytes: file.sizeBytes,
-      modifiedAt: file.modifiedAt,
-    });
-  };
-
-  const openLargestFile = async (file: LargestFile) => {
-    const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
-
-    if (!drive) {
-      setError("That drive catalogue is no longer available.");
-      return;
-    }
-
-    await openSearchResult(drive, {
-      relativePath: file.relativePath,
-      name: file.name,
-      isDirectory: false,
-      sizeBytes: file.sizeBytes,
-      modifiedAt: file.modifiedAt,
-    });
-  };
-
-  const beginPlanMove = (entry: CatalogueEntry) => {
-    setSelectedPlanEntry(entry);
-    setPlanDestinationLocationId(
-      browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
-    );
-
-    // Start from the item's current folder. This makes the proposed
-    // destination explicit and prevents the UI from making a root-level
-    // destination look like the file's existing catalogue location.
-    const separator = entry.relativePath.lastIndexOf("/");
-    const currentFolder =
-      separator >= 0 ? entry.relativePath.slice(0, separator) : "";
-    setPlanDestinationFolder(currentFolder);
-
-    setError(null);
-  };
-
-  const savePlannedMove = async () => {
-    if (!browserDrive || !selectedPlanEntry || !planDestinationLocationId) return;
-
-    const folder = normaliseFolderInput(planDestinationFolder);
-    const destinationRelativePath = folder
-      ? `${folder}/${selectedPlanEntry.name}`
-      : selectedPlanEntry.name;
-
-    setSavingPlan(true);
-    setError(null);
-
-    try {
-      await invoke<number>("create_planned_move", {
-        sourceDriveId: browserDrive.persistentIdentifier,
-        sourceRelativePath: selectedPlanEntry.relativePath,
-        destinationLocationId: planDestinationLocationId,
-        destinationRelativePath,
-      });
-      await loadPlannedMoves();
-      await openFolder(browserDrive, browserPath);
-
-      setSelectedPlanEntry(null);
-      setPlanDestinationFolder("");
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setSavingPlan(false);
-    }
-  };
-
-  const planEntryToFolder = async (
-    entry: CatalogueEntry,
-    destinationFolder: string,
-  ) => {
-    if (!browserDrive) return;
-
-    const destinationRelativePath = destinationFolder
-      ? `${destinationFolder}/${entry.name}`
-      : entry.name;
-
-    setError(null);
-
-    try {
-      await invoke<number>("create_planned_move", {
-        sourceDriveId: browserDrive.persistentIdentifier,
-        sourceRelativePath: entry.relativePath,
-        destinationLocationId: `drive:${browserDrive.persistentIdentifier}`,
-        destinationRelativePath,
-      });
-
-      await loadPlannedMoves();
-      await openFolder(browserDrive, browserPath);
-    } catch (cause) {
-      setError(String(cause));
-    }
-  };
-
   const addFolderOnThisMac = async () => {
     setError(null);
 
@@ -926,9 +746,6 @@ function App() {
 
   const pathParts = browserPath ? browserPath.split("/") : [];
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
-  const showTransfers =
-    plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
-
   if (activeView === "transfers" && !browserDrive) {
     return (
       <main className="app-shell app-navigation-shell">
