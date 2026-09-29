@@ -1140,11 +1140,44 @@ fn list_transfer_records(connection: &Connection) -> Result<Vec<TransferRecord>,
     Ok(transfers)
 }
 
+// Bypasses the memory cache for reads and writes through this file. A copy is
+// written this way so none of it stays cached, and read back this way so
+// verification has to read what the drive actually stored. Without it, the
+// check compared the source with the copy still held in memory, which could
+// not catch a drive or cable corrupting data on its way to the disk.
+#[cfg(target_os = "macos")]
+fn bypass_cache(file: &fs::File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::raw::c_int;
+
+    const F_NOCACHE: c_int = 48;
+
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+
+    if unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 1 as c_int) } == -1 {
+        return Err(format!(
+            "Unable to bypass the file cache: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bypass_cache(_file: &fs::File) -> Result<(), String> {
+    Ok(())
+}
+
+// Compares a source with its copy byte for byte. The copy is read with the
+// cache bypassed, so its bytes come from the drive.
 fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
     let first_file = fs::File::open(first)
         .map_err(|error| format!("Unable to open source for verification: {error}"))?;
     let second_file = fs::File::open(second)
         .map_err(|error| format!("Unable to open copied file for verification: {error}"))?;
+    bypass_cache(&second_file)?;
 
     if first_file
         .metadata()
@@ -1364,7 +1397,9 @@ where
             .open(temporary)
             .map_err(|error| format!("Unable to create temporary destination file: {error}"))?;
         created_temporary = true;
-        let mut writer = BufWriter::new(temporary_file);
+        bypass_cache(&temporary_file)?;
+        // Uncached writes go straight to the drive, so write in large chunks.
+        let mut writer = BufWriter::with_capacity(1024 * 1024, temporary_file);
 
         let copied = std::io::copy(&mut reader, &mut writer)
             .map_err(|error| format!("Unable to copy file: {error}"))?;
@@ -5408,6 +5443,80 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), contents);
         assert_eq!(fs::read(&destination).unwrap(), contents);
         assert!(source.exists());
+    }
+
+    // The fraction of a file's pages currently held in the memory cache.
+    #[cfg(target_os = "macos")]
+    fn cached_fraction(path: &Path) -> f64 {
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_char, c_int, c_void};
+
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: c_int,
+                flags: c_int,
+                fd: c_int,
+                offset: i64,
+            ) -> *mut c_void;
+            fn mincore(addr: *const c_void, len: usize, vec: *mut c_char) -> c_int;
+            fn munmap(addr: *mut c_void, len: usize) -> c_int;
+            fn getpagesize() -> c_int;
+        }
+        const PROT_READ: c_int = 1;
+        const MAP_SHARED: c_int = 1;
+
+        let file = fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len() as usize;
+        let page = unsafe { getpagesize() } as usize;
+        let pages = len.div_ceil(page);
+        let mut residency = vec![0 as c_char; pages];
+        unsafe {
+            let mapping = mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            );
+            assert_ne!(mapping as isize, -1, "mmap failed");
+            assert_eq!(mincore(mapping, len, residency.as_mut_ptr()), 0);
+            munmap(mapping, len);
+        }
+        residency.iter().filter(|page| **page & 1 != 0).count() as f64 / pages as f64
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_copy_is_checked_against_the_drive_not_memory() {
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-uncached-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("clip.mov");
+        let destination = volume.0.join("Archive/clip.mov");
+        let contents: Vec<u8> = (0..32 * 1024 * 1024_u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&source, &contents).unwrap();
+
+        // Control: a file written normally stays cached, so the measurement
+        // can see cached pages.
+        assert!(cached_fraction(&source) > 0.9);
+
+        copy_file_verified(&source, &destination).unwrap();
+
+        // Neither writing the copy nor verifying it left it cached, so the
+        // verification read the copy from the drive. Measured before anything
+        // else reads the copy, which would cache it again.
+        assert!(
+            cached_fraction(&destination) < 0.05,
+            "the verified copy should not be held in memory"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), contents);
     }
 
     #[cfg(target_os = "macos")]
