@@ -530,8 +530,21 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             // key, so those locations must exist before the rows are copied.
             sync_drive_locations(&transaction)?;
 
+            // Tables created before locations existed only have
+            // `destination_drive_id`. Referencing `destination_location_id`
+            // there fails with "no such column", so only use it when present.
+            let destination_location_expression =
+                if planned_move_columns.contains("destination_location_id") {
+                    "COALESCE(
+                        NULLIF(destination_location_id, ''),
+                        'drive:' || destination_drive_id
+                    )"
+                } else {
+                    "'drive:' || destination_drive_id"
+                };
+
             transaction
-                .execute_batch(
+                .execute_batch(&format!(
                     "CREATE TABLE planned_moves_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         source_drive_id TEXT NOT NULL,
@@ -560,10 +573,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
                         id,
                         source_drive_id,
                         source_relative_path,
-                        COALESCE(
-                            NULLIF(destination_location_id, ''),
-                            'drive:' || destination_drive_id
-                        ),
+                        {destination_location_expression},
                         destination_relative_path,
                         created_at
                     FROM planned_moves;
@@ -577,7 +587,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
                             destination_location_id,
                             destination_relative_path
                         );",
-                )
+                ))
                 .map_err(|error| {
                     format!("Unable to migrate planned moves to locations: {error}")
                 })?;
@@ -2017,5 +2027,197 @@ mod tests {
         assert_eq!(display_name, "Backup 2");
         assert_eq!(user_label.as_deref(), Some("Mars"));
         assert_eq!(location_count(&connection), 1);
+    }
+
+    // The catalogue and planned-move schema as created by 7b80a78, before
+    // locations existed. Planned moves pointed straight at a drive.
+    const LEGACY_SCHEMA: &str = "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE drives (
+            persistent_identifier TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            filesystem TEXT,
+            total_bytes INTEGER,
+            available_bytes INTEGER,
+            last_mount_point TEXT,
+            last_seen_at INTEGER NOT NULL,
+            last_scanned_at INTEGER,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            directory_count INTEGER NOT NULL DEFAULT 0,
+            catalogued_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent_path TEXT NOT NULL DEFAULT '',
+            is_directory INTEGER NOT NULL,
+            size_bytes INTEGER,
+            modified_at INTEGER,
+            UNIQUE(drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE TABLE planned_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_drive_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(source_drive_id, source_relative_path),
+            FOREIGN KEY(source_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            FOREIGN KEY(destination_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_planned_moves_destination
+            ON planned_moves(destination_drive_id, destination_relative_path);
+
+        INSERT INTO drives (persistent_identifier, name, last_seen_at)
+            VALUES ('UUID-A', 'Source', 0), ('UUID-B', 'Archive', 0);
+        INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+            VALUES ('UUID-A', 'film.mp4', 'film.mp4', '', 0, 100);
+        INSERT INTO planned_moves (
+            id, source_drive_id, source_relative_path,
+            destination_drive_id, destination_relative_path, created_at
+        ) VALUES (7, 'UUID-A', 'film.mp4', 'UUID-B', 'Video/film.mp4', 123);
+    ";
+
+    // c77c108 added a locations table (without user labels) but had not yet
+    // migrated planned moves to it.
+    const LEGACY_LOCATIONS_SCHEMA: &str = "
+        CREATE TABLE locations (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('external_drive', 'local_folder')),
+            display_name TEXT NOT NULL,
+            drive_id TEXT,
+            local_path TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            CHECK(
+                (kind = 'external_drive' AND drive_id IS NOT NULL AND local_path IS NULL)
+                OR
+                (kind = 'local_folder' AND drive_id IS NULL AND local_path IS NOT NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX idx_locations_drive
+            ON locations(drive_id)
+            WHERE drive_id IS NOT NULL;
+
+        CREATE UNIQUE INDEX idx_locations_local_path
+            ON locations(local_path)
+            WHERE local_path IS NOT NULL;
+
+        INSERT INTO locations (id, kind, display_name, drive_id, local_path, created_at)
+            VALUES
+                ('drive:UUID-A', 'external_drive', 'Source', 'UUID-A', NULL, 0),
+                ('drive:UUID-B', 'external_drive', 'Archive', 'UUID-B', NULL, 0);
+    ";
+
+    fn assert_planned_moves_migrated(path: &Path) {
+        let connection = open_database(path).expect("legacy database must migrate");
+
+        let columns: HashSet<String> = connection
+            .prepare("PRAGMA table_info(planned_moves)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains("destination_location_id"));
+        assert!(!columns.contains("destination_drive_id"));
+
+        let row: (i64, String, String, String, String, i64) = connection
+            .query_row(
+                "SELECT id, source_drive_id, source_relative_path,
+                        destination_location_id, destination_relative_path, created_at
+                 FROM planned_moves",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                7,
+                "UUID-A".to_string(),
+                "film.mp4".to_string(),
+                "drive:UUID-B".to_string(),
+                "Video/film.mp4".to_string(),
+                123
+            )
+        );
+
+        let index_columns: Vec<String> = connection
+            .prepare("PRAGMA index_info(idx_planned_moves_destination)")
+            .unwrap()
+            .query_map([], |row| row.get(2))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            index_columns,
+            ["destination_location_id", "destination_relative_path"]
+        );
+
+        let broken_references: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken_references, 0);
+
+        // The migrated plan is readable the same way the commands read it.
+        let destination_name: String = connection
+            .query_row(
+                "SELECT COALESCE(NULLIF(dl.user_label, ''), dl.display_name)
+                 FROM planned_moves p
+                 JOIN locations dl ON dl.id = p.destination_location_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(destination_name, "Archive");
+
+        // Opening again must not try to migrate a second time.
+        drop(connection);
+        open_database(path).expect("migrated database must reopen");
+    }
+
+    #[test]
+    fn migrates_planned_moves_from_before_locations_existed() {
+        let database = TestDatabase::new("legacy-7b80a78");
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch(LEGACY_SCHEMA)
+            .unwrap();
+
+        assert_planned_moves_migrated(&database.0);
+    }
+
+    #[test]
+    fn migrates_planned_moves_when_locations_table_already_exists() {
+        let database = TestDatabase::new("legacy-c77c108");
+        {
+            let legacy = Connection::open(&database.0).unwrap();
+            legacy.execute_batch(LEGACY_SCHEMA).unwrap();
+            legacy.execute_batch(LEGACY_LOCATIONS_SCHEMA).unwrap();
+        }
+
+        assert_planned_moves_migrated(&database.0);
     }
 }
