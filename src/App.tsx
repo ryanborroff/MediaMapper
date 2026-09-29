@@ -662,7 +662,9 @@ function App() {
     try {
       const result = await invoke<ScanProgress>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
-      await refresh();
+      // A scan can add a drive's location or rename it, and changes the names
+      // and sizes planned moves show, so reload those alongside the drives.
+      await Promise.all([refresh(), loadLocations(), loadPlannedMoves()]);
 
       // A successful rescan replaces the SQLite snapshot. If this drive is
       // currently open, reload the visible folder/search from that new snapshot
