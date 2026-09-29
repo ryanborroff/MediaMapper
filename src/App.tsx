@@ -145,6 +145,14 @@ type PlanPreflightDestination = {
   capacitySufficient: boolean | null;
 };
 
+// Sent by the backend as a file is copied and then verified.
+type TransferProgress = {
+  plannedMoveId: number;
+  stage: "copying" | "verifying";
+  bytes: number;
+  totalBytes: number;
+};
+
 type PlanPreflightIssue = {
   code: string;
   message: string;
@@ -313,6 +321,7 @@ function App() {
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [activeView, setActiveView] = useState<"drives" | "browse" | "plan" | "transfers">("drives");
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
   const [browserPath, setBrowserPath] = useState("");
   const [entries, setEntries] = useState<CatalogueEntry[]>([]);
@@ -346,6 +355,10 @@ function App() {
   // Set synchronously so a second click cannot start another run before
   // React re-renders with the button disabled.
   const executionRunning = useRef(false);
+  const [fileProgress, setFileProgress] = useState<TransferProgress | null>(null);
+  // Set by Cancel copy: stops the file in progress and any not yet started.
+  const cancelRequested = useRef(false);
+  const [cancellingCopy, setCancellingCopy] = useState(false);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [showAllTransfers, setShowAllTransfers] = useState(false);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
@@ -359,6 +372,10 @@ function App() {
   const [planError, setPlanError] = useState<string | null>(null);
   const [planDestinationLocationId, setPlanDestinationLocationId] = useState("");
   const [planDestinationFolder, setPlanDestinationFolder] = useState("");
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  const [folderPickerPath, setFolderPickerPath] = useState("");
+  const [folderPickerEntries, setFolderPickerEntries] = useState<CatalogueEntry[]>([]);
+  const [folderPickerLoading, setFolderPickerLoading] = useState(false);
   const [savingPlan, setSavingPlan] = useState(false);
   const [draggedEntry, setDraggedEntry] = useState<CatalogueEntry | null>(null);
   const [dragOverFolderPath, setDragOverFolderPath] = useState<string | null>(null);
@@ -419,17 +436,24 @@ function App() {
     }
 
     executionRunning.current = true;
+    cancelRequested.current = false;
+    setCancellingCopy(false);
     setExecutingPlan(true);
     setExecutionResult(null);
     setShowCopyConfirmation(false);
     setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
+    const copiedSoFar = () => completed === 0
+      ? "Nothing was copied."
+      : `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified.`;
 
     try {
       // The backend reruns final live validation immediately before every
       // individual copy. UI validation is informative, not the safety gate.
       for (const move of readyMoves) {
+        if (cancelRequested.current) break;
+        setFileProgress(null);
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
         });
@@ -438,21 +462,32 @@ function App() {
         setExecutionProgress({ moves: readyMoves, completed });
       }
 
-      setExecutionResult({
-        stopped: false,
-        message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
-      });
+      setExecutionResult(cancelRequested.current && completed < readyMoves.length
+        ? {
+          stopped: true,
+          message: `Copy cancelled. ${copiedSoFar()} The rest stay planned.${skippedNote}`,
+        }
+        : {
+          stopped: false,
+          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
+        });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
+      const cancelled = String(cause).includes("Copy cancelled.");
       setExecutionResult({
         stopped: true,
-        message: completed > 0
-          ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
-          : `Nothing was copied. ${String(cause)}${skippedNote}`,
+        message: cancelled
+          ? `Copy cancelled. ${copiedSoFar()} The file being copied was not finished; it and the rest stay planned.${skippedNote}`
+          : completed > 0
+            ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
+            : `Nothing was copied. ${String(cause)}${skippedNote}`,
       });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
       executionRunning.current = false;
+      cancelRequested.current = false;
+      setCancellingCopy(false);
+      setFileProgress(null);
       setExecutingPlan(false);
       setExecutionProgress(null);
     }
@@ -463,6 +498,16 @@ function App() {
     planValidation,
     plannedMoves,
   ]);
+
+  const cancelCopy = async () => {
+    cancelRequested.current = true;
+    setCancellingCopy(true);
+    try {
+      await invoke("cancel_transfer");
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -552,6 +597,13 @@ function App() {
   useEffect(() => {
     let dispose: (() => void) | undefined;
     void listen<ScanProgress>("scan-progress", (event) => setScanProgress(event.payload))
+      .then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, []);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<TransferProgress>("transfer-progress", (event) => setFileProgress(event.payload))
       .then((unlisten) => { dispose = unlisten; });
     return () => { dispose?.(); };
   }, []);
@@ -801,19 +853,42 @@ function App() {
 
   const beginPlanMove = (entry: CatalogueEntry) => {
     setSelectedPlanEntry(entry);
-    setPlanDestinationLocationId(
-      browserDrive ? `drive:${browserDrive.persistentIdentifier}` : ""
-    );
-
-    // Start from the item's current folder. This makes the proposed
-    // destination explicit and prevents the UI from making a root-level
-    // destination look like the file's existing catalogue location.
-    const separator = entry.relativePath.lastIndexOf("/");
-    const currentFolder =
-      separator >= 0 ? entry.relativePath.slice(0, separator) : "";
-    setPlanDestinationFolder(currentFolder);
-
+    // Do not preselect the source drive. Planning should begin with an
+    // intentional destination choice rather than an immediate invalid state.
+    setPlanDestinationLocationId("");
+    setPlanDestinationFolder("");
+    setFolderPickerOpen(false);
+    setFolderPickerPath("");
+    setFolderPickerEntries([]);
+    setPlanError(null);
     setError(null);
+  };
+
+  const openDestinationFolderPicker = async (path = "") => {
+    const location = locations.find((item) => item.id === planDestinationLocationId);
+    if (!location || location.kind !== "external_drive" || !location.driveId) {
+      setError("Choose a catalogued external drive before choosing a folder.");
+      return;
+    }
+
+    setFolderPickerOpen(true);
+    setFolderPickerPath(path);
+    setFolderPickerEntries([]);
+    setFolderPickerLoading(true);
+    setError(null);
+
+    try {
+      const results = await invoke<CatalogueEntry[]>("list_catalogue_entries", {
+        persistentIdentifier: location.driveId,
+        parentPath: path,
+      });
+      setFolderPickerEntries(results.filter((entry) => entry.isDirectory));
+    } catch (cause) {
+      setError(String(cause));
+      setFolderPickerEntries([]);
+    } finally {
+      setFolderPickerLoading(false);
+    }
   };
 
   const savePlannedMove = async () => {
@@ -969,11 +1044,331 @@ function App() {
     id ? catalogued.find((item) => item.persistentIdentifier === id) : undefined;
 
   const pathParts = browserPath ? browserPath.split("/") : [];
+  let showLegacyDashboard: boolean = false;
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
 
-  if (browserDrive) {
+  if (activeView === "transfers" && !browserDrive) {
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("plan")}>Plan</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content transfers-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">TRANSFERS</p>
+              <h1>Transfers</h1>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          {executionProgress && (() => {
+            const { moves, completed } = executionProgress;
+            const current = moves[Math.min(completed, moves.length - 1)];
+            const paths = plannedMovePaths(current);
+            return (
+              <section className="transfer-active-card" aria-live="polite">
+                <span className="transfer-active-label">COPYING</span>
+                <h2>{current.sourceName}</h2>
+                <TransferPaths from={paths.from} to={paths.to} />
+                <div className="transfer-file-progress">
+                  <span style={{ width: `${moves.length ? (completed / moves.length) * 100 : 0}%` }} />
+                </div>
+                <p>{Math.min(completed + 1, moves.length)} of {moves.length} files · Each file is verified before the next begins.</p>
+              </section>
+            );
+          })()}
+
+          {!executionProgress && executionResult && (
+            <section className={`transfer-result-card ${executionResult.stopped ? "failed" : "completed"}`}>
+              <div>
+                <strong>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
+                <p>{executionResult.message}</p>
+              </div>
+              <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+            </section>
+          )}
+
+          {!executionProgress && !executionResult && plannedMoves.length > 0 && (
+            <section className="transfer-waiting-card">
+              <div>
+                <span className="transfer-active-label">PLANNED</span>
+                <h2>{plannedMoves.length} {plannedMoves.length === 1 ? "transfer" : "transfers"} waiting</h2>
+                <p>Open Plan to see what is required before copying can begin.</p>
+              </div>
+              <button className="browse-button" onClick={() => setActiveView("plan")}>View plan</button>
+            </section>
+          )}
+
+          <section className="transfer-history-section">
+            <div className="section-heading">
+              <h2>Recent transfers</h2>
+            </div>
+            {transfers.length === 0 ? (
+              <div className="transfer-history-empty">
+                <h3>No transfers yet</h3>
+                <p>Copied and verified files will appear here.</p>
+              </div>
+            ) : (
+              <>
+                <div className="transfer-history-new">
+                  {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
+                    const outcome = transferOutcome(transfer.status);
+                    const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
+                    const location = locations.find((item) => item.id === transfer.destinationLocationId);
+                    return (
+                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id}>
+                        <span className="transfer-history-mark" aria-hidden="true">{outcome.tone === "completed" ? "✓" : outcome.tone === "failed" ? "×" : "–"}</span>
+                        <div className="transfer-item">
+                          <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                          <TransferPaths
+                            from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
+                            to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
+                          />
+                          {transfer.status === "failed" && transfer.errorMessage && <p className="transfer-error">{transfer.errorMessage}</p>}
+                        </div>
+                        <span className="transfer-history-size">{size === null ? "" : formatBytes(size)}</span>
+                        <div className="transfer-outcome">
+                          <span className="transfer-status">{outcome.label}</span>
+                          <span>{formatDate(transfer.completedAt ?? transfer.startedAt ?? transfer.createdAt)}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {transfers.length > RECENT_TRANSFER_COUNT && (
+                  <button className="transfer-more-button" onClick={() => setShowAllTransfers((value) => !value)}>
+                    {showAllTransfers ? "Show recent only" : `Show all ${transfers.length.toLocaleString()}`}
+                  </button>
+                )}
+              </>
+            )}
+          </section>
+        </div>
+      </main>
+    );
+  }
+
+    if (activeView === "plan" && !browserDrive) {
+    const fileMoves = plannedMoves.filter((move) => !move.sourceIsDirectory);
+    const folderMoveCount = plannedMoves.length - fileMoves.length;
+    const knownBytes = planPreflight?.knownBytes ?? fileMoves.reduce((sum, move) => sum + (move.sourceSizeBytes ?? 0), 0);
+    const sourceIds = Array.from(new Set(plannedMoves.map((move) => move.sourceDriveId)));
+    const destinationIds = Array.from(new Set(plannedMoves.map((move) => move.destinationLocationId)));
+    const missingNames = Array.from(new Set([
+      ...sourceIds
+        .filter((id) => !connectedIds.has(id))
+        .map((id) => sourceDriveName(id)),
+      ...destinationIds.flatMap((id) => {
+        const location = locations.find((item) => item.id === id);
+        if (!location || location.kind === "local_folder") return [];
+        return location.driveId && !connectedIds.has(location.driveId)
+          ? [location.userLabel ?? location.displayName]
+          : [];
+      }),
+    ]));
+    const planReady = plannedMoves.length > 0 && planValidation?.ready === true && (planPreflight?.issues.length ?? 0) === 0;
+    const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
+
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content plan-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">PLAN</p>
+              <h1>Planned transfers</h1>
+              <p className="intro">Organise your files. Decide what goes where. Copy only when you’re ready.</p>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          {plannedMoves.length === 0 ? (
+            <section className="plan-empty">
+              <h2>Nothing planned yet</h2>
+              <p>Browse your catalogued files and choose Plan move to add files here.</p>
+              <button className="browse-button" type="button" onClick={() => setActiveView("browse")}>Browse files</button>
+            </section>
+          ) : (
+            <>
+              <section className="plan-overview">
+                <div>
+                  <span>Planned</span>
+                  <strong>{plannedMoves.length.toLocaleString()} {plannedMoves.length === 1 ? "item" : "items"} · {formatBytes(knownBytes)}</strong>
+                </div>
+                <div>
+                  <span>Status</span>
+                  <strong className={planReady ? "plan-ready-text" : "plan-waiting-text"}>
+                    {planReady ? "Ready to transfer" : missingNames.length > 0 ? `Waiting for ${missingNames.join(" and ")}` : "Needs attention"}
+                  </strong>
+                </div>
+              </section>
+
+              {missingNames.length > 0 && (
+                <section className="connect-instruction">
+                  <span className="connect-instruction-label">NEXT STEP</span>
+                  <h2>Connect {missingNames.join(" and ")}</h2>
+                  <p>{missingNames.length === 1 ? "This location is" : "These locations are"} required before the planned transfer can run. No files will be staged on this Mac.</p>
+                </section>
+              )}
+
+              {planReady && (
+                <section className="connect-instruction ready">
+                  <span className="connect-instruction-label">READY</span>
+                  <h2>Required locations are connected</h2>
+                  <p>MediaMapper will copy directly from source to destination and verify each file.</p>
+                </section>
+              )}
+
+              {(planPreflight?.issues.length ?? 0) > 0 && missingNames.length === 0 && (
+                <section className="plan-attention">
+                  <strong>Plan needs attention</strong>
+                  <ul>{planPreflight!.issues.map((issue, index) => <li key={`${issue.code}:${index}`}>{issue.message}</li>)}</ul>
+                </section>
+              )}
+
+              <section className="plan-file-list">
+                {plannedMoves.map((move) => {
+                  const paths = plannedMovePaths(move);
+                  return (
+                    <div className="plan-file-row" key={move.id}>
+                      <div className="transfer-item">
+                        <strong>{move.sourceName}</strong>
+                        <TransferPaths from={paths.from} to={paths.to} />
+                      </div>
+                      <span>{formatBytes(move.sourceSizeBytes)}</span>
+                      <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                    </div>
+                  );
+                })}
+              </section>
+
+              <section className="plan-review">
+                <div>
+                  <strong>{fileMoves.length.toLocaleString()} {fileMoves.length === 1 ? "file" : "files"} · {formatBytes(knownBytes)}</strong>
+                  <span>Originals remain untouched.</span>
+                  {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
+                </div>
+                {!showCopyConfirmation ? (
+                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Review copy</button>
+                ) : (
+                  <div className="plan-copy-actions">
+                    <button className="secondary-button" disabled={executingPlan} onClick={() => setShowCopyConfirmation(false)}>Cancel</button>
+                    <button className="section-action" disabled={!canCopy} onClick={() => void copyPlannedFiles()}>
+                      {executingPlan ? "Copying…" : "Copy and verify"}
+                    </button>
+                  </div>
+                )}
+              </section>
+
+              {showCopyConfirmation && (
+                <p className="plan-confirmation-note">Final checks run again immediately before each copy. MediaMapper copies directly between locations and verifies the result byte for byte.</p>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+    if (activeView === "browse" && !browserDrive) {
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content browse-home">
+          <header className="app-header">
+            <div>
+              <p className="eyebrow">BROWSE</p>
+              <h1>All files</h1>
+            </div>
+          </header>
+
+          {error && <div className="notice error">{error}</div>}
+
+          <section className="browse-search-block">
+            <input
+              className="browse-global-search"
+              type="search"
+              value={libraryQuery}
+              placeholder="Search files"
+              aria-label="Search all catalogued files"
+              autoFocus
+              onChange={(event) => void searchLibrary(event.target.value)}
+            />
+            <label className="hidden-items-toggle">
+              <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
+              Show hidden items
+            </label>
+          </section>
+
+          {libraryQuery.trim() ? (
+            <section className="browse-results" aria-live="polite">
+              <div className="browse-results-heading">
+                <span>{librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} results`}</span>
+              </div>
+              {librarySearching ? <div className="browser-message">Searching catalogues…</div>
+              : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
+              : visibleLibraryResults.map((result) => (
+                <button className="browse-result-row" key={`${result.driveId}:${result.relativePath}`} onClick={() => void openLibraryResult(result)}>
+                  <span className="browse-result-name">
+                    <strong>{result.name}</strong>
+                    <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), parentFolder(result.relativePath))}</span>
+                  </span>
+                  <span className={connectedIds.has(result.driveId) ? "browse-drive-state connected" : "browse-drive-state"}>
+                    {connectedIds.has(result.driveId) ? "Connected" : "Offline"}
+                  </span>
+                  <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
+                </button>
+              ))}
+            </section>
+          ) : (
+            <section className="browse-drives">
+              <div className="section-heading"><h2>Browse by drive</h2></div>
+              <div className="browse-drive-grid">
+                {catalogued.map((drive) => (
+                  <button className="browse-drive-card" key={drive.persistentIdentifier} onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>
+                    <span className="browse-drive-card-top">
+                      <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
+                    </span>
+                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
+                  </button>
+                ))}
+              </div>
+              {catalogued.length === 0 && <div className="empty-state compact"><h3>No catalogued drives</h3><p>Scan a drive first, then its files will appear here.</p></div>}
+            </section>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+    if (browserDrive) {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
     const online = connectedIds.has(liveDrive.persistentIdentifier);
     const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
@@ -1025,53 +1420,66 @@ function App() {
       : searchResults.filter((entry) => !isHiddenPath(entry.relativePath));
 
     return (
-      <main className="app-shell browser-shell">
-        <header className="browser-header">
-          <button className="back-button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>
-            Back to drives
-          </button>
-          <div className="browser-title">
-            <div className="browser-status">
-              <span className={online ? "status-dot" : "status-dot offline-dot"} />
-              <span className={online ? "online-label" : "offline-label"}>{online ? "CONNECTED" : "OFFLINE"}</span>
+      <main className="app-navigation-shell">
+        <aside className="app-sidebar">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("browse"); }}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
+          </nav>
+        </aside>
+        <div className="app-content browse-detail">
+          <header className="app-header browse-detail-header">
+            <div>
+              <p className="eyebrow">BROWSE</p>
+              <nav className="browse-detail-breadcrumb" aria-label="Browse path">
+                <button type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>All files</button>
+                <span>/</span>
+                <button type="button" className={pathParts.length === 0 ? "current" : undefined} onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
+                {pathParts.map((part, index) => {
+                  const path = pathParts.slice(0, index + 1).join("/");
+                  const current = index === pathParts.length - 1;
+                  return (
+                    <span className="browse-detail-crumb" key={path}>
+                      <span>/</span>
+                      {current
+                        ? <span className="current">{part}</span>
+                        : <button type="button" onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
+                    </span>
+                  );
+                })}
+              </nav>
+              <h1>{pathParts.length > 0 ? pathParts[pathParts.length - 1] : liveDriveName}</h1>
+              {pathParts.length === 0 && liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
             </div>
-            <h1>{liveDriveName}</h1>
-            {liveDriveHasLabel && <div className="drive-volume-name">{liveDrive.name}</div>}
-          </div>
-          {/* At the drive root the breadcrumb would only repeat the title. */}
-          {pathParts.length > 0 && <nav className="breadcrumbs" aria-label="Folder path">
-            <button onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
-            {pathParts.map((part, index) => {
-              const path = pathParts.slice(0, index + 1).join("/");
-              const current = index === pathParts.length - 1;
-              return (
-                <span key={path}>
-                  <span className="crumb-separator">/</span>
-                  {current
-                    ? <span className="crumb-current" aria-current="page">{part}</span>
-                    : <button onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
-                </span>
-              );
-            })}
-          </nav>}
-          <div className="catalogue-search">
-            <input type="search" value={searchQuery} placeholder={`Search ${liveDriveName}`}
-              aria-label={`Search ${liveDriveName} catalogue`}
-              onChange={(event) => void searchCatalogue(liveDrive, event.target.value)} />
-            {searchQuery.trim() && <span className="search-summary">
-              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} result${visibleSearchResults.length === 1 ? "" : "s"}`}
-            </span>}
+          </header>
+
+          <section className="browse-search-block browse-detail-search">
+            <input
+              className="browse-global-search"
+              type="search"
+              value={searchQuery}
+              placeholder={`Search ${liveDriveName}`}
+              aria-label={`Search ${liveDriveName}`}
+              onChange={(event) => void searchCatalogue(liveDrive, event.target.value)}
+            />
             <label className="hidden-items-toggle">
               <input type="checkbox" checked={showHiddenItems} onChange={(event) => setShowHiddenItems(event.target.checked)} />
               Show hidden items
             </label>
-          </div>
-        </header>
+          </section>
+          {searchQuery.trim() && (
+            <div className="browse-results-heading">
+              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} results`}
+            </div>
+          )}
 
         {error && <div className="notice error">{error}</div>}
         {searchQuery.trim() && <section className="file-browser" aria-live="polite">
           <div className="file-browser-head">
-            <span>Name</span><span>Modified</span><span>Size</span><span />
+            <span>Name</span><span>Modified</span><span>Size</span><span>Action</span>
           </div>
           {searching ? <div className="browser-message">Searching catalogue…</div>
           : visibleSearchResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
@@ -1085,7 +1493,7 @@ function App() {
                   onClick={() => void openSearchResult(liveDrive, entry)}
                 >
                   <span className="file-name">
-                    <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+
                     <span className="file-name-text">
                       <span className="file-name-primary">{entry.name}</span>
                       <span className="file-location">{formatLocationPath(liveDriveName, parentFolder(entry.relativePath))}</span>
@@ -1122,11 +1530,22 @@ function App() {
               {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
 
-                const openOrPlan = () => {
+                const openRow = () => {
                   if (entry.isDirectory) {
                     void openFolder(liveDrive, entry.relativePath);
-                  } else {
-                    beginPlanMove(entry);
+                  }
+                };
+
+                const openFile = () => {
+                  if (!entry.isDirectory) {
+                    if (!online) {
+                      setError(`Connect ${liveDriveName} to open this file.`);
+                      return;
+                    }
+                    void invoke("open_catalogued_file", {
+                      driveId: liveDrive.persistentIdentifier,
+                      relativePath: entry.relativePath,
+                    }).catch((reason) => setError(String(reason)));
                   }
                 };
 
@@ -1190,16 +1609,17 @@ function App() {
 
                       void planEntryToFolder(source, entry.relativePath);
                     }}
-                    onClick={openOrPlan}
+                    onClick={openRow}
+                    onDoubleClick={openFile}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
+                      if (event.key === "Enter" && entry.isDirectory) {
                         event.preventDefault();
-                        openOrPlan();
+                        openRow();
                       }
                     }}
                   >
                     <span className="file-name">
-                      <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+
                       <span className="file-name-text">
                         <span className="file-name-primary">{entry.name}</span>
                         {entry.unreadable && (
@@ -1225,17 +1645,18 @@ function App() {
                         ? (dragOverFolderPath === entry.relativePath ? "Drop to move here" : "Folder")
                         : formatBytes(entry.sizeBytes)}
                     </span>
-                    {/* The one place a move is planned from, for files and folders alike. */}
                     <span className="row-action">
-                      <button
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          beginPlanMove(entry);
-                        }}
-                      >
-                        Plan move
-                      </button>
+                      {!entry.isDirectory && !plannedMove && (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            beginPlanMove(entry);
+                          }}
+                        >
+                          Add to plan
+                        </button>
+                      )}
                     </span>
                   </div>
                 );
@@ -1258,9 +1679,7 @@ function App() {
                     }}
                   >
                     <span className="file-name">
-                      <span className="file-kind" aria-hidden="true">
-                        {planned.isDirectory ? "▸" : ""}
-                      </span>
+
                       <span className="file-name-text">
                         <span className="file-name-primary">
                           <span className="planned-tag">Planned</span>{planned.name}
@@ -1279,32 +1698,36 @@ function App() {
           )}
         </section>}
 
-        {selectedPlanEntry && <section className="plan-move-panel" ref={planPanel}>
+        {selectedPlanEntry && <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
           <div className="plan-move-heading">
             <div>
-              <p className="eyebrow">PLANNED LOCATION</p>
-              <h2>Plan move</h2>
-              <p className="section-description">
-                {selectedPlanEntry.name} remains at its current location until a future transfer is explicitly executed.
+              <h2>Add to plan</h2>
+              <p className="plan-file-summary" title={selectedPlanEntry.name}>
+                {selectedPlanEntry.name}
               </p>
             </div>
             <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
           </div>
 
-          <div className="plan-source">
-            <span>Current</span>
-            <strong>{liveDriveName} / {selectedPlanEntry.relativePath}</strong>
-          </div>
-
-          <div className="plan-fields">
+          <div className="plan-fields compact-plan-fields">
             <label>
-              <span>Move to</span>
+              <span>Location</span>
               <select
                 ref={planLocationSelect}
                 value={planDestinationLocationId}
-                onChange={(event) => setPlanDestinationLocationId(event.target.value)}
+                onChange={(event) => {
+                  if (event.target.value === "__choose_mac__") {
+                    void addFolderOnThisMac();
+                    return;
+                  }
+                  setPlanDestinationLocationId(event.target.value);
+                  setPlanDestinationFolder("");
+                  setFolderPickerOpen(false);
+                  setPlanError(null);
+                }}
               >
                 <option value="">Choose a location</option>
+                <option value="__choose_mac__">Choose a folder on this Mac…</option>
 
                 <optgroup label="External drives">
                   {locations
@@ -1331,75 +1754,162 @@ function App() {
                   </optgroup>
                 )}
               </select>
-
-              <button
-                type="button"
-                className="plan-add-location"
-                onClick={() => void addFolderOnThisMac()}
-              >
-                Choose folder on this Mac…
-              </button>
             </label>
 
             <label>
               <span>Folder</span>
-              <input
-                value={planDestinationFolder}
-                placeholder="e.g. Video/Archive"
-                onChange={(event) => setPlanDestinationFolder(event.target.value)}
-              />
-            </label>
-          </div>
-
-          <div className="plan-preview">
-            <span>Planned</span>
-            <strong>
               {(() => {
                 const destination = locations.find(
                   (location) => location.id === planDestinationLocationId,
                 );
-                return destination?.userLabel ?? destination?.displayName ?? "Choose a location";
+                const canBrowseCatalogue =
+                  destination?.kind === "external_drive" && Boolean(destination.driveId);
+
+                return canBrowseCatalogue ? (
+                  <button
+                    type="button"
+                    className="folder-picker-button"
+                    aria-expanded={folderPickerOpen}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void openDestinationFolderPicker(planDestinationFolder);
+                    }}
+                  >
+                    <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
+                      {planDestinationFolder || "Top level"}
+                    </span>
+                    <span className="folder-picker-choose">Choose…</span>
+                  </button>
+                ) : (
+                  <div className="folder-picker-readonly">
+                    {destination?.kind === "local_folder"
+                      ? "Selected folder"
+                      : "Choose a location first"}
+                  </div>
+                );
               })()}
-              {" / "}
-              {normalisedPlanFolder ? `${normalisedPlanFolder}/` : ""}
-              {selectedPlanEntry.name}
-            </strong>
+            </label>
           </div>
 
-          <div className="plan-actions">
+          {folderPickerOpen && (() => {
+            const parts = folderPickerPath ? folderPickerPath.split("/") : [];
+
+            return (
+              <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
+                <div className="folder-picker-header">
+                  <strong>Choose folder</strong>
+                  <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
+                </div>
+                <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
+                  <button type="button" onClick={() => void openDestinationFolderPicker("")}>
+                    Top level
+                  </button>
+                  {parts.map((part, index) => {
+                    const path = parts.slice(0, index + 1).join("/");
+                    return (
+                      <span key={path}>
+                        <span>/</span>
+                        <button type="button" onClick={() => void openDestinationFolderPicker(path)}>
+                          {part}
+                        </button>
+                      </span>
+                    );
+                  })}
+                </nav>
+                <div className="folder-picker-list">
+                  {folderPickerLoading ? (
+                    <div className="folder-picker-empty">Loading folders…</div>
+                  ) : folderPickerEntries.length === 0 ? (
+                    <div className="folder-picker-empty">No folders inside this folder.</div>
+                  ) : folderPickerEntries.map((entry) => (
+                    <button
+                      type="button"
+                      key={entry.relativePath}
+                      onClick={() => void openDestinationFolderPicker(entry.relativePath)}
+                    >
+                      <span>{entry.name}</span><span>›</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="folder-picker-footer">
+                  <button
+                    type="button"
+                    className="browse-button"
+                    onClick={() => {
+                      setPlanDestinationFolder(folderPickerPath);
+                      setFolderPickerOpen(false);
+                    }}
+                  >
+                    Choose this folder
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {planDestinationLocationId && (
+            <div className="plan-destination-preview">
+              <span>Will be copied to</span>
+              <strong title={(() => {
+                const destination = locations.find(
+                  (location) => location.id === planDestinationLocationId,
+                );
+                const destinationName =
+                  destination?.userLabel ?? destination?.displayName ?? "Destination";
+                return formatLocationPath(destinationName, normalisedPlanFolder);
+              })()}>
+                {(() => {
+                  const destination = locations.find(
+                    (location) => location.id === planDestinationLocationId,
+                  );
+                  const destinationName =
+                    destination?.userLabel ?? destination?.displayName ?? "Destination";
+                  return formatLocationPath(destinationName, normalisedPlanFolder);
+                })()}
+              </strong>
+            </div>
+          )}
+
+          <div className="plan-actions compact-plan-actions">
             {planError ? (
               <span className="plan-location-warning" role="alert">{planError}</span>
+            ) : planIsCurrentLocation ? (
+              <span className="plan-location-warning">Choose a different destination.</span>
             ) : (
-              <span className={planIsCurrentLocation ? "plan-location-warning" : undefined}>
-                {planIsCurrentLocation
-                  ? "Already at this location."
-                  : "This changes the Media Mapper plan only. No files are moved."}
-              </span>
+              <span>Nothing is copied until you run the plan.</span>
             )}
             <button
               className="browse-button"
               disabled={!planDestinationLocationId || savingPlan || planIsCurrentLocation}
               onClick={() => void savePlannedMove()}
             >
-              {savingPlan ? "Saving…" : "Plan move"}
+              {savingPlan ? "Saving…" : "Add to plan"}
             </button>
           </div>
         </section>}
 
-        <footer className="safety-note">
-          This view comes from Media Mapper's local catalogue. Search and browsing do not read the drive.
-        </footer>
+        </div>
       </main>
     );
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell app-navigation-shell">
+      <aside className="app-sidebar" aria-label="Media Mapper">
+        <div className="sidebar-brand">MediaMapper</div>
+        <nav className="sidebar-navigation" aria-label="Main navigation">
+          <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("plan"); }}>Plan</button>
+          <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
+        </nav>
+      </aside>
+      <div className="app-content">
       <header className="app-header">
         <div>
-          <p className="eyebrow">MEDIA MAPPER</p>
-          <h1>Drive catalogue</h1>
-          <p className="intro">Catalogue external drives once, then keep browsing them while they're offline.</p>
+          <p className="eyebrow">DRIVES</p>
+          <h1>Your storage</h1>
         </div>
         <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
           {loading ? "Checking…" : "Refresh"}
@@ -1408,7 +1918,7 @@ function App() {
 
       {error && <div className="notice error">{error}</div>}
 
-      {catalogued.length > 0 && <section className="section-block">
+      {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Search all drives</h2></div>
         <div className="catalogue-search">
           <input
@@ -1446,7 +1956,7 @@ function App() {
       </section>}
 
       <section className="section-block">
-        <div className="section-heading"><h2>Connected</h2><span>{connected.length}</span></div>
+        <div className="section-heading"><h2>Connected</h2></div>
         {!loading && connected.length === 0 && (
           <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive and it will appear here.</p></div>
         )}
@@ -1485,7 +1995,7 @@ function App() {
                               </div>
                             ) : (
                               <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}>
-                                {label ? "Edit label" : "Add label"}
+                                {label ? "Edit name" : "Add label"}
                               </button>
                             )
                           )}
@@ -1495,23 +2005,25 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse catalogue</button>}
+                      {catalogue && <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}>Browse</button>}
                       <button className="scan-button" disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
-                        {scanning ? "Scanning…" : catalogue ? "Rescan drive" : "Scan drive"}
+                        {scanning ? "Scanning…" : catalogue ? "Rescan" : "Scan"}
                       </button>
                     </div>
                   </div>
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} />
-                <dl className="drive-details offline-details">
-                  {catalogue && <div><dt>Files</dt><dd>{catalogue.fileCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Folders</dt><dd>{catalogue.directoryCount.toLocaleString()}</dd></div>}
-                  {catalogue && <div><dt>Catalogued</dt><dd>{formatBytes(catalogue.cataloguedBytes)}</dd></div>}
-                  <div><dt>Last scanned</dt><dd>{formatDate(catalogue?.lastScannedAt ?? null)}</dd></div>
-                  <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
-                  <div><dt>Mount point</dt><dd>{drive.mountPoint}</dd></div>
-                  {catalogue && catalogue.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
-                </dl>
+                <div className="drive-meta">
+                  <span>
+                    {catalogue
+                      ? `${catalogue.fileCount.toLocaleString()} files · ${catalogue.directoryCount.toLocaleString()} folders · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
+                      : "Not catalogued yet"}
+                  </span>
+                  <span>{catalogue?.lastScannedAt ? `Scanned ${formatDate(catalogue.lastScannedAt)}` : "Not scanned yet"}</span>
+                  {catalogue && catalogue.unreadableFolderCount > 0 && (
+                    <span className="unreadable-note">Couldn't read {catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
+                  )}
+                </div>
                 <div className="scan-status-slot" aria-live="polite">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-progress">
@@ -1545,9 +2057,9 @@ function App() {
       </section>
 
       <section className="section-block">
-        <div className="section-heading"><h2>Offline catalogue</h2><span>{offline.length}</span></div>
+        <div className="section-heading"><h2>Offline</h2>{offline.length > 0 && <span className="count-badge count-badge-muted">{offline.length}</span>}</div>
         {offline.length === 0 ? (
-          <p className="section-empty">Scanned drives appear here when disconnected, and stay browsable.</p>
+          <p className="section-empty">No catalogued drives are offline.</p>
         ) : (
           <div className="drive-list">
             {offline.map((drive) => (
@@ -1580,7 +2092,7 @@ function App() {
                             </div>
                           ) : (
                             <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}>
-                              {label ? "Edit label" : "Add label"}
+                              {label ? "Edit name" : "Add label"}
                             </button>
                           )}
                         </>
@@ -1589,26 +2101,25 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
+                      <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>Browse</button>
                     </div>
                   </div>
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
-                <dl className="drive-details offline-details">
-                  <div><dt>Files</dt><dd>{drive.fileCount.toLocaleString()}</dd></div>
-                  <div><dt>Folders</dt><dd>{drive.directoryCount.toLocaleString()}</dd></div>
-                  <div><dt>Catalogued</dt><dd>{formatBytes(drive.cataloguedBytes)}</dd></div>
-                  <div><dt>Last scanned</dt><dd>{formatDate(drive.lastScannedAt)}</dd></div>
-                  <div><dt>Filesystem</dt><dd>{drive.filesystem ?? "Unknown"}</dd></div>
-                  {drive.unreadableFolderCount > 0 && <div><dt>Couldn't read</dt><dd className="unreadable-note">{drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</dd></div>}
-                </dl>
+                <div className="drive-meta">
+                  <span>{drive.fileCount.toLocaleString()} files · {drive.directoryCount.toLocaleString()} folders · {formatBytes(drive.cataloguedBytes)} catalogued</span>
+                  <span>{drive.lastScannedAt ? `Scanned ${formatDate(drive.lastScannedAt)}` : "Not scanned yet"}</span>
+                  {drive.unreadableFolderCount > 0 && (
+                    <span className="unreadable-note">Couldn't read {drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
+                  )}
+                </div>
               </article>
             ))}
           </div>
         )}
       </section>
 
-      {executionProgress && (() => {
+      {showLegacyDashboard && executionProgress && (() => {
         const { moves, completed } = executionProgress;
         const current = moves[Math.min(completed, moves.length - 1)];
         const paths = plannedMovePaths(current);
@@ -1625,13 +2136,41 @@ function App() {
                 <strong>{current.sourceName}</strong>
                 <TransferPaths from={paths.from} to={paths.to} />
               </div>
+              {fileProgress?.plannedMoveId === current.id && (() => {
+                const percent = fileProgress.totalBytes > 0
+                  ? Math.min(100, Math.floor((fileProgress.bytes / fileProgress.totalBytes) * 100))
+                  : 100;
+                return (
+                  <div className="transfer-file-progress">
+                    <span>
+                      {fileProgress.stage === "copying" ? "Copying" : "Verifying"}{" "}
+                      {formatBytes(fileProgress.bytes)} of {formatBytes(fileProgress.totalBytes)} · {percent}%
+                    </span>
+                    <div
+                      className="capacity-bar"
+                      role="progressbar"
+                      aria-label={fileProgress.stage === "copying" ? "Copying" : "Verifying"}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={percent}
+                    >
+                      <span style={{ width: `${percent}%` }} />
+                    </div>
+                  </div>
+                );
+              })()}
               <p>Each file is copied and verified before the next one starts. Originals stay in place.</p>
+              <div>
+                <button className="secondary-button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
+                  {cancellingCopy ? "Cancelling…" : "Cancel copy"}
+                </button>
+              </div>
             </div>
           </section>
         );
       })()}
 
-      {!executionProgress && executionResult && <section className="section-block">
+      {showLegacyDashboard && !executionProgress && executionResult && <section className="section-block">
         <div className="section-heading">
           <h2>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</h2>
           <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
@@ -1641,7 +2180,7 @@ function App() {
         </p>
       </section>}
 
-      {showTransfers && <section className="section-block">
+      {showLegacyDashboard && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Waiting to transfer</h2>
           <span>{plannedMoves.length}</span>
@@ -1842,7 +2381,7 @@ function App() {
         </>}
       </section>}
 
-      {showTransfers && <section className="section-block">
+      {showLegacyDashboard && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Transfer history</h2>
           {transfers.length > 0 && <span>{transfers.length}</span>}
@@ -1888,7 +2427,7 @@ function App() {
         </>}
       </section>}
 
-      {catalogued.length > 0 && <section className="section-block">
+      {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
         <div className="tool-row">
           <div>
@@ -1983,7 +2522,7 @@ function App() {
         </div>}
       </section>}
 
-      <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only and does not open, rename, move, copy or delete files.</footer>
+      </div>
     </main>
   );
 }

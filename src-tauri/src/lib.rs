@@ -7,7 +7,10 @@ use std::{
     io::{BufReader, BufWriter, Read, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
@@ -829,10 +832,27 @@ fn issue_blocks_move(
     }
 }
 
+#[cfg(test)]
 fn execute_planned_transfer(
     connection: &Connection,
     planned_move_id: i64,
     connected_drives: &[DriveInfo],
+) -> Result<TransferRecord, String> {
+    execute_planned_transfer_reporting(
+        connection,
+        planned_move_id,
+        connected_drives,
+        &|_| {},
+        &|| false,
+    )
+}
+
+fn execute_planned_transfer_reporting(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+    report: &dyn Fn(&TransferProgress),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
@@ -922,7 +942,42 @@ fn execute_planned_transfer(
     let (source, destination) =
         resolve_transfer_paths(connection, planned_move_id, connected_drives)?;
 
-    execute_transfer_paths(connection, planned_move_id, &source, &destination)
+    execute_transfer_paths_reporting(
+        connection,
+        planned_move_id,
+        &source,
+        &destination,
+        report,
+        is_cancelled,
+    )
+}
+
+// Which part of a transfer is running: copying the file, then reading both
+// files back to compare them.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TransferStage {
+    Copying,
+    Verifying,
+}
+
+// Sent to the window as a large file copies, so progress is visible.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferProgress {
+    planned_move_id: i64,
+    stage: TransferStage,
+    bytes: u64,
+    total_bytes: u64,
+}
+
+// Set by Cancel copy and checked as each chunk is copied or verified.
+static TRANSFER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+const TRANSFER_CANCELLED: &str = "Copy cancelled.";
+
+#[tauri::command]
+fn cancel_transfer() {
+    TRANSFER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 // How long transfer bookkeeping waits for the database. Once a copy has been
@@ -931,11 +986,30 @@ fn execute_planned_transfer(
 // never freezes the window.
 const TRANSFER_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
     source: &Path,
     destination: &Path,
+) -> Result<TransferRecord, String> {
+    execute_transfer_paths_reporting(
+        connection,
+        planned_move_id,
+        source,
+        destination,
+        &|_| {},
+        &|| false,
+    )
+}
+
+fn execute_transfer_paths_reporting(
+    connection: &Connection,
+    planned_move_id: i64,
+    source: &Path,
+    destination: &Path,
+    report: &dyn Fn(&TransferProgress),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
     connection
         .busy_timeout(TRANSFER_BUSY_TIMEOUT)
@@ -955,8 +1029,40 @@ fn execute_transfer_paths(
         return Err(error);
     }
 
-    let copy_result =
-        copy_file_verified_with_stage(source, destination, &temporary, |copied_bytes| {
+    // Progress goes to the window at most every 150 ms, and whenever the
+    // stage changes or a stage finishes. A cancel request stops the transfer
+    // at the next chunk.
+    let total_bytes = fs::metadata(source)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut last_report: Option<(TransferStage, Instant)> = None;
+    let mut on_progress = |stage: TransferStage, bytes: u64| -> Result<(), String> {
+        if is_cancelled() {
+            return Err(TRANSFER_CANCELLED.to_string());
+        }
+        let due = match last_report {
+            Some((last_stage, reported_at)) => {
+                last_stage != stage || reported_at.elapsed() >= Duration::from_millis(150)
+            }
+            None => true,
+        };
+        if due || bytes == total_bytes {
+            report(&TransferProgress {
+                planned_move_id,
+                stage,
+                bytes,
+                total_bytes,
+            });
+            last_report = Some((stage, Instant::now()));
+        }
+        Ok(())
+    };
+
+    let copy_result = copy_file_verified_with_progress(
+        source,
+        destination,
+        &temporary,
+        |copied_bytes| {
             let copied_bytes = i64::try_from(copied_bytes)
                 .map_err(|_| "Copied file is too large to record.".to_string())?;
 
@@ -967,7 +1073,9 @@ fn execute_transfer_paths(
                 Some(copied_bytes),
                 None,
             )
-        });
+        },
+        &mut on_progress,
+    );
 
     match copy_result {
         Ok(copied_bytes) => {
@@ -1195,6 +1303,16 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
 // Compares a source with its copy byte for byte. The copy is read with the
 // cache bypassed, so its bytes come from the drive.
 fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
+    files_are_identical_with_progress(first, second, &mut |_| Ok(()))
+}
+
+// As files_are_identical, reporting how many bytes have been compared.
+// Returning an error from on_progress stops the comparison.
+fn files_are_identical_with_progress(
+    first: &Path,
+    second: &Path,
+    on_progress: &mut dyn FnMut(u64) -> Result<(), String>,
+) -> Result<bool, String> {
     let first_file = fs::File::open(first)
         .map_err(|error| format!("Unable to open source for verification: {error}"))?;
     let second_file = fs::File::open(second)
@@ -1217,6 +1335,7 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
     let mut second_reader = BufReader::new(second_file);
     let mut first_buffer = vec![0_u8; 1024 * 1024];
     let mut second_buffer = vec![0_u8; 1024 * 1024];
+    let mut compared = 0_u64;
 
     loop {
         let first_count = first_reader
@@ -1237,6 +1356,9 @@ fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
         if first_buffer[..first_count] != second_buffer[..second_count] {
             return Ok(false);
         }
+
+        compared += first_count as u64;
+        on_progress(compared)?;
     }
 }
 
@@ -1376,11 +1498,30 @@ fn transfer_temporary_path(
     Ok(temporary)
 }
 
+#[cfg(test)]
 fn copy_file_verified_with_stage<F>(
     source: &Path,
     destination: &Path,
     temporary: &Path,
+    on_verifying: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64) -> Result<(), String>,
+{
+    copy_file_verified_with_progress(source, destination, temporary, on_verifying, &mut |_, _| {
+        Ok(())
+    })
+}
+
+// As copy_file_verified_with_stage, also reporting bytes copied and then
+// bytes verified as it goes. Returning an error from on_progress stops the
+// transfer; its temporary file is removed like any other failure.
+fn copy_file_verified_with_progress<F>(
+    source: &Path,
+    destination: &Path,
+    temporary: &Path,
     mut on_verifying: F,
+    on_progress: &mut dyn FnMut(TransferStage, u64) -> Result<(), String>,
 ) -> Result<u64, String>
 where
     F: FnMut(u64) -> Result<(), String>,
@@ -1423,8 +1564,21 @@ where
         // Uncached writes go straight to the drive, so write in large chunks.
         let mut writer = BufWriter::with_capacity(1024 * 1024, temporary_file);
 
-        let copied = std::io::copy(&mut reader, &mut writer)
-            .map_err(|error| format!("Unable to copy file: {error}"))?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("Unable to copy file: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            writer
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("Unable to copy file: {error}"))?;
+            copied += count as u64;
+            on_progress(TransferStage::Copying, copied)?;
+        }
 
         writer
             .flush()
@@ -1441,7 +1595,9 @@ where
 
         on_verifying(copied)?;
 
-        if !files_are_identical(source, temporary)? {
+        if !files_are_identical_with_progress(source, temporary, &mut |verified| {
+            on_progress(TransferStage::Verifying, verified)
+        })? {
             return Err("Copied file failed byte-for-byte verification.".to_string());
         }
 
@@ -3623,6 +3779,35 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
     })
 }
 
+// Space kept free when copying into a folder on this Mac, so a copy can never
+// fill the startup disk, which can leave macOS unstable.
+const LOCAL_FOLDER_FREE_SPACE_RESERVE: u64 = 1024 * 1024 * 1024;
+
+// Free bytes on the volume holding `path`, as `df` reports them.
+fn free_bytes_at(path: &Path) -> Result<u64, String> {
+    let output = std::process::Command::new("/bin/df")
+        .args(["-k", "-P"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Unable to check free space: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Unable to check free space at {}.", path.display()));
+    }
+    parse_df_available(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| format!("Unable to read free space at {}.", path.display()))
+}
+
+// Reads the available space from `df -k -P` output. The value sits just
+// before the capacity percentage; counting from there copes with filesystem
+// names that contain spaces.
+fn parse_df_available(text: &str) -> Option<u64> {
+    let line = text.lines().nth(1)?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let capacity = fields.iter().position(|field| field.ends_with('%'))?;
+    let kilobytes: u64 = fields.get(capacity.checked_sub(1)?)?.parse().ok()?;
+    kilobytes.checked_mul(1024)
+}
+
 fn validate_plan_live(
     connection: &Connection,
     connected_drives: &[DriveInfo],
@@ -3877,21 +4062,42 @@ fn validate_plan_live(
         }
     }
 
-    // Capacity is checked once per external destination using current diskutil
-    // free space, rather than the value stored at the last catalogue scan.
+    // Capacity is checked once per destination using current free space,
+    // rather than the value stored at the last catalogue scan: diskutil for
+    // external drives, df for folders on this Mac.
     let preflight = plan_preflight(connection)?;
     for destination in &preflight.destinations {
-        if destination.kind != "external_drive" {
-            continue;
-        }
-
-        let drive_id = destination
-            .location_id
-            .strip_prefix("drive:")
-            .unwrap_or(&destination.location_id);
-
-        let Some(drive) = connected_by_id.get(drive_id) else {
-            continue;
+        let local_folder = destination.kind == "local_folder";
+        let available = match destination.kind.as_str() {
+            "external_drive" => {
+                let drive_id = destination
+                    .location_id
+                    .strip_prefix("drive:")
+                    .unwrap_or(&destination.location_id);
+                let Some(drive) = connected_by_id.get(drive_id) else {
+                    continue;
+                };
+                drive.available_bytes
+            }
+            "local_folder" => {
+                let local_path: Option<String> = connection
+                    .query_row(
+                        "SELECT local_path FROM locations WHERE id = ?1",
+                        params![destination.location_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Unable to read destination folder: {error}"))?
+                    .flatten();
+                // A missing folder is reported by its own check above.
+                let Some(local_path) = local_path else {
+                    continue;
+                };
+                free_bytes_at(Path::new(&local_path))
+                    .ok()
+                    .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
+            }
+            _ => continue,
         };
 
         if destination.unknown_size_count > 0 {
@@ -3904,14 +4110,21 @@ fn validate_plan_live(
                 move_id: None,
                 location_id: Some(destination.location_id.clone()),
             });
-        } else if let Some(available) = drive.available_bytes {
+        } else if let Some(available) = available {
             if destination.known_bytes as u64 > available {
                 issues.push(PlanPreflightIssue {
                     code: "live_insufficient_capacity".to_string(),
-                    message: format!(
-                        "{} does not currently have enough free space for the planned data.",
-                        destination.display_name
-                    ),
+                    message: if local_folder {
+                        format!(
+                            "{} does not currently have enough free space for the planned data while keeping 1 GB free on this Mac.",
+                            destination.display_name
+                        )
+                    } else {
+                        format!(
+                            "{} does not currently have enough free space for the planned data.",
+                            destination.display_name
+                        )
+                    },
                     move_id: None,
                     location_id: Some(destination.location_id.clone()),
                 });
@@ -3949,6 +4162,9 @@ async fn execute_planned_move(
     app: tauri::AppHandle,
     planned_move_id: i64,
 ) -> Result<TransferRecord, String> {
+    // A cancel requested before this copy began belongs to an earlier one.
+    TRANSFER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+
     run_blocking(move || {
         // Discover the physical drives immediately before execution. This is
         // deliberately inside the blocking worker because diskutil and file
@@ -3956,7 +4172,15 @@ async fn execute_planned_move(
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
 
-        execute_planned_transfer(&connection, planned_move_id, &drives)
+        execute_planned_transfer_reporting(
+            &connection,
+            planned_move_id,
+            &drives,
+            &|progress| {
+                let _ = app.emit("transfer-progress", progress);
+            },
+            &|| TRANSFER_CANCEL_REQUESTED.load(Ordering::SeqCst),
+        )
     })
     .await
 }
@@ -4208,6 +4432,52 @@ async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), Strin
     .await
 }
 
+#[tauri::command]
+async fn open_catalogued_file(
+    app: tauri::AppHandle,
+    drive_id: String,
+    relative_path: String,
+) -> Result<(), String> {
+    run_blocking(move || {
+        validate_catalogue_relative_path(&relative_path)?;
+
+        let connection = open_database(&database_path(&app)?)?;
+        let is_directory: Option<i64> = connection
+            .query_row(
+                "SELECT is_directory FROM files WHERE drive_id = ?1 AND relative_path = ?2",
+                params![drive_id, relative_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to check the catalogue entry: {error}"))?;
+
+        match is_directory {
+            Some(0) => {}
+            Some(_) => return Err("That catalogue entry is a folder.".to_string()),
+            None => return Err("That file is no longer in the catalogue.".to_string()),
+        }
+
+        let drives = external_drives()?;
+        let drive = drives
+            .iter()
+            .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
+            .ok_or_else(|| "Connect this drive to open the file.".to_string())?;
+
+        let path = PathBuf::from(&drive.mount_point).join(&relative_path);
+        if !path.is_file() {
+            return Err("The file is not currently available at its catalogued location.".to_string());
+        }
+
+        std::process::Command::new("/usr/bin/open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("Unable to open the file: {error}"))?;
+
+        Ok(())
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4234,6 +4504,7 @@ pub fn run() {
             list_catalogued_drives,
             scan_drive,
             cancel_scan,
+            cancel_transfer,
             list_catalogue_entries,
             search_catalogue,
             search_all_catalogues,
@@ -4249,7 +4520,8 @@ pub fn run() {
             execute_planned_move,
             list_transfers,
             list_planned_folder_entries,
-            remove_planned_move
+            remove_planned_move,
+            open_catalogued_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -6111,6 +6383,244 @@ mod tests {
         assert_eq!(
             destination,
             PathBuf::from("/Users/test/Media/Archive/source.mov")
+        );
+    }
+
+    // A planned move from a 5 MB source file, ready to execute.
+    struct ProgressFixture {
+        database: TestDatabase,
+        volume: TestVolume,
+        connection: Connection,
+        move_id: i64,
+        source: PathBuf,
+        destination: PathBuf,
+        contents: Vec<u8>,
+    }
+
+    fn progress_fixture(name: &str) -> ProgressFixture {
+        let database = TestDatabase::new(name);
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-{name}-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(&volume.0).unwrap();
+        let source = volume.0.join("clip.mov");
+        let destination = volume.0.join("Archive/clip.mov");
+        let contents: Vec<u8> = (0..5 * 1024 * 1024_u32).map(|i| (i % 249) as u8).collect();
+        fs::write(&source, &contents).unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'clip.mov', 'clip.mov', '', 0, ?1)",
+                params![contents.len() as i64],
+            )
+            .unwrap();
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "clip.mov",
+            "drive:UUID-B",
+            "Archive/clip.mov",
+        )
+        .unwrap();
+
+        ProgressFixture {
+            database,
+            volume,
+            connection,
+            move_id,
+            source,
+            destination,
+            contents,
+        }
+    }
+
+    #[test]
+    fn transfer_reports_copy_then_verify_progress() {
+        let fixture = progress_fixture("transfer-progress");
+        let reports = std::cell::RefCell::new(Vec::new());
+
+        let transfer = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| reports.borrow_mut().push(progress.clone()),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(transfer.status, "completed");
+
+        let reports = reports.into_inner();
+        let total = fixture.contents.len() as u64;
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.total_bytes == total
+                    && report.planned_move_id == fixture.move_id)
+        );
+
+        // Copying first, then verifying, each rising to the full size.
+        let split = reports
+            .iter()
+            .position(|report| report.stage == TransferStage::Verifying)
+            .expect("verification progress was reported");
+        let (copying, verifying) = reports.split_at(split);
+        assert!(!copying.is_empty());
+        assert!(copying
+            .iter()
+            .all(|report| report.stage == TransferStage::Copying));
+        assert!(verifying
+            .iter()
+            .all(|report| report.stage == TransferStage::Verifying));
+        for stage in [copying, verifying] {
+            assert!(stage.windows(2).all(|pair| pair[0].bytes <= pair[1].bytes));
+            assert_eq!(stage.last().unwrap().bytes, total);
+        }
+    }
+
+    #[test]
+    fn cancelled_transfer_leaves_no_copy_and_keeps_the_plan() {
+        let fixture = progress_fixture("transfer-cancel");
+
+        // Cancel once the copy is under way.
+        let checks = std::cell::Cell::new(0);
+        let error = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|_| {},
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert!(!fixture.destination.exists());
+        let leftovers: Vec<_> = fs::read_dir(fixture.destination.parent().unwrap())
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "the temporary file was removed");
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history[0].status, "failed");
+        assert_eq!(
+            history[0].error_message.as_deref(),
+            Some(TRANSFER_CANCELLED)
+        );
+        let planned: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(planned, 1, "a cancelled copy stays planned");
+        let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn df_available_space_is_read_from_before_the_capacity_column() {
+        let apfs = "Filesystem   1024-blocks      Used Available Capacity  Mounted on
+/dev/disk3s5   482797652 196612856 260423516    44%    /System/Volumes/Data";
+        assert_eq!(parse_df_available(apfs), Some(260_423_516 * 1024));
+
+        // A filesystem name with spaces does not shift the columns read.
+        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on
+map auto_home 0 0 0 100% /System/Volumes/Data/home";
+        assert_eq!(parse_df_available(spaced), Some(0));
+
+        assert_eq!(parse_df_available("Filesystem\nnot a df line"), None);
+
+        assert!(free_bytes_at(&std::env::temp_dir()).unwrap() > 0);
+    }
+
+    #[test]
+    fn copies_into_a_folder_on_this_mac_check_its_free_space() {
+        let database = TestDatabase::new("local-space");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-space-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let folder = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-local-space-folder-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        for path in [&source_volume.0, &folder.0] {
+            let _ = fs::remove_dir_all(path);
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source_volume.0.join("small.mov"), b"small").unwrap();
+        let modified_at = system_time_unix(
+            fs::metadata(source_volume.0.join("small.mov"))
+                .unwrap()
+                .modified(),
+        );
+
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Media', ?1, 0)",
+                params![folder.0.to_string_lossy()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                 VALUES ('UUID-A', 'small.mov', 'small.mov', '', 0, 5, ?1),
+                        ('UUID-A', 'huge.mov', 'huge.mov', '', 0, 1000000000000000000, ?1)",
+                params![modified_at],
+            )
+            .unwrap();
+        let drives = vec![test_drive("UUID-A", "Source", &source_volume.0, 10_000)];
+        let capacity_issues = |connection: &Connection| {
+            validate_plan_live(connection, &drives)
+                .unwrap()
+                .issues
+                .into_iter()
+                .filter(|issue| issue.code == "live_insufficient_capacity")
+                .collect::<Vec<_>>()
+        };
+
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "small.mov",
+            "local:test",
+            "small.mov",
+        )
+        .unwrap();
+        assert!(capacity_issues(&connection).is_empty());
+
+        // An exabyte cannot fit on this Mac.
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "huge.mov",
+            "local:test",
+            "huge.mov",
+        )
+        .unwrap();
+        let issues = capacity_issues(&connection);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].location_id.as_deref(), Some("local:test"));
+        assert!(
+            issues[0].message.contains("keeping 1 GB free"),
+            "{}",
+            issues[0].message
         );
     }
 
