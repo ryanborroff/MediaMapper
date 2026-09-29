@@ -1574,7 +1574,9 @@ async fn set_drive_label(
     run_blocking(move || {
         let trimmed = label.trim();
 
-        if trimmed.chars().count() > 40 {
+        // Counted in UTF-16 units, as the label field's maxLength counts them,
+        // so the app and the field agree on what fits.
+        if trimmed.encode_utf16().count() > 40 {
             return Err("Drive labels can be up to 40 characters.".to_string());
         }
 
