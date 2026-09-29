@@ -1417,3 +1417,36 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     display: none;
   }
 }
+
+
+/* Compact drive counts */
+.section-heading .count-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #111;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.section-heading .count-badge-muted {
+  background: var(--text-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .section-heading .count-badge {
+    background: #f2f2f2;
+    color: #161616;
+  }
+
+  .section-heading .count-badge-muted {
+    background: var(--text-muted);
+    color: var(--surface);
+  }
+}
