@@ -759,53 +759,70 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
     Err("External drive discovery is implemented for macOS in this milestone.".to_string())
 }
 
-#[tauri::command]
-fn list_external_drives() -> Result<Vec<DriveInfo>, String> {
-    external_drives()
+// Tauri runs non-async commands on the main thread, which also drives the
+// window, so a slow query or `diskutil` call would freeze the interface.
+// Commands that touch SQLite or the filesystem are async and hand their work
+// to the blocking thread pool through this helper, as `scan_drive` does.
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("Background task failed: {error}"))?
 }
 
 #[tauri::command]
-fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>, String> {
-    let connection = open_database(&database_path(&app)?)?;
-    let mut statement = connection
-        .prepare(
-            "
-            SELECT
-                d.persistent_identifier,
-                d.name,
-                d.filesystem,
-                d.total_bytes,
-                d.available_bytes,
-                d.last_mount_point,
-                d.last_scanned_at,
-                d.file_count,
-                d.directory_count,
-                d.catalogued_bytes
-            FROM drives d
-            ORDER BY lower(d.name)
-            ",
-        )
-        .map_err(|error| format!("Unable to query catalogue: {error}"))?;
+async fn list_external_drives() -> Result<Vec<DriveInfo>, String> {
+    run_blocking(external_drives).await
+}
 
-    let rows = statement
-        .query_map([], |row| {
-            Ok(CataloguedDrive {
-                persistent_identifier: row.get(0)?,
-                name: row.get(1)?,
-                filesystem: row.get(2)?,
-                total_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                available_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-                last_mount_point: row.get(5)?,
-                last_scanned_at: row.get(6)?,
-                file_count: row.get(7)?,
-                directory_count: row.get(8)?,
-                catalogued_bytes: row.get(9)?,
+#[tauri::command]
+async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                    d.persistent_identifier,
+                    d.name,
+                    d.filesystem,
+                    d.total_bytes,
+                    d.available_bytes,
+                    d.last_mount_point,
+                    d.last_scanned_at,
+                    d.file_count,
+                    d.directory_count,
+                    d.catalogued_bytes
+                FROM drives d
+                ORDER BY lower(d.name)
+                ",
+            )
+            .map_err(|error| format!("Unable to query catalogue: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(CataloguedDrive {
+                    persistent_identifier: row.get(0)?,
+                    name: row.get(1)?,
+                    filesystem: row.get(2)?,
+                    total_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                    available_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                    last_mount_point: row.get(5)?,
+                    last_scanned_at: row.get(6)?,
+                    file_count: row.get(7)?,
+                    directory_count: row.get(8)?,
+                    catalogued_bytes: row.get(9)?,
+                })
             })
-        })
-        .map_err(|error| format!("Unable to read catalogue: {error}"))?;
+            .map_err(|error| format!("Unable to read catalogue: {error}"))?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read catalogue rows: {error}"))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read catalogue rows: {error}"))
+    })
+    .await
 }
 
 fn scan_directory(
@@ -1067,39 +1084,42 @@ async fn scan_drive(
 }
 
 #[tauri::command]
-fn list_catalogue_entries(
+async fn list_catalogue_entries(
     app: tauri::AppHandle,
     persistent_identifier: String,
     parent_path: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    let connection = open_database(&database_path(&app)?)?;
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
 
-    let mut statement = connection
-        .prepare(
-            "
-            SELECT relative_path, name, is_directory, size_bytes, modified_at
-            FROM files
-            WHERE drive_id = ?1
-              AND parent_path = ?2
-            ORDER BY is_directory DESC, lower(name), name
-            ",
-        )
-        .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT relative_path, name, is_directory, size_bytes, modified_at
+                FROM files
+                WHERE drive_id = ?1
+                  AND parent_path = ?2
+                ORDER BY is_directory DESC, lower(name), name
+                ",
+            )
+            .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
 
-    let rows = statement
-        .query_map(params![persistent_identifier, parent_path], |row| {
-            Ok(CatalogueEntry {
-                relative_path: row.get(0)?,
-                name: row.get(1)?,
-                is_directory: row.get::<_, i64>(2)? != 0,
-                size_bytes: row.get(3)?,
-                modified_at: row.get(4)?,
+        let rows = statement
+            .query_map(params![persistent_identifier, parent_path], |row| {
+                Ok(CatalogueEntry {
+                    relative_path: row.get(0)?,
+                    name: row.get(1)?,
+                    is_directory: row.get::<_, i64>(2)? != 0,
+                    size_bytes: row.get(3)?,
+                    modified_at: row.get(4)?,
+                })
             })
-        })
-        .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
+            .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+    })
+    .await
 }
 
 fn normalised_search_expression(column: &str) -> String {
@@ -1115,193 +1135,255 @@ fn search_tokens(query: &str) -> Vec<String> {
 }
 
 #[tauri::command]
-fn search_catalogue(
+async fn search_catalogue(
     app: tauri::AppHandle,
     persistent_identifier: String,
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    let tokens = search_tokens(query.trim());
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
+    run_blocking(move || {
+        let tokens = search_tokens(query.trim());
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    let connection = open_database(&database_path(&app)?)?;
+        let connection = open_database(&database_path(&app)?)?;
 
-    let name_expr = normalised_search_expression("name");
-    let path_expr = normalised_search_expression("relative_path");
+        let name_expr = normalised_search_expression("name");
+        let path_expr = normalised_search_expression("relative_path");
 
-    let conditions: Vec<String> = tokens
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let parameter = index + 2;
-            format!(
-                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-            )
-        })
-        .collect();
-
-    let sql = format!(
-        "SELECT relative_path, name, is_directory, size_bytes, modified_at
-         FROM files
-         WHERE drive_id = ?1
-           AND {}
-         ORDER BY is_directory DESC, lower(name), relative_path
-         LIMIT 200",
-        conditions.join(" AND ")
-    );
-
-    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
-    values.push(&persistent_identifier);
-    for token in &tokens {
-        values.push(token);
-    }
-
-    let mut statement = connection
-        .prepare(&sql)
-        .map_err(|error| format!("Unable to search catalogue: {error}"))?;
-
-    let rows = statement
-        .query_map(values.as_slice(), |row| {
-            Ok(CatalogueEntry {
-                relative_path: row.get(0)?,
-                name: row.get(1)?,
-                is_directory: row.get::<_, i64>(2)? != 0,
-                size_bytes: row.get(3)?,
-                modified_at: row.get(4)?,
+        let conditions: Vec<String> = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let parameter = index + 2;
+                format!(
+                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+                )
             })
-        })
-        .map_err(|error| format!("Unable to read search results: {error}"))?;
+            .collect();
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read search result rows: {error}"))
+        let sql = format!(
+            "SELECT relative_path, name, is_directory, size_bytes, modified_at
+             FROM files
+             WHERE drive_id = ?1
+               AND {}
+             ORDER BY is_directory DESC, lower(name), relative_path
+             LIMIT 200",
+            conditions.join(" AND ")
+        );
+
+        let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
+        values.push(&persistent_identifier);
+        for token in &tokens {
+            values.push(token);
+        }
+
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("Unable to search catalogue: {error}"))?;
+
+        let rows = statement
+            .query_map(values.as_slice(), |row| {
+                Ok(CatalogueEntry {
+                    relative_path: row.get(0)?,
+                    name: row.get(1)?,
+                    is_directory: row.get::<_, i64>(2)? != 0,
+                    size_bytes: row.get(3)?,
+                    modified_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("Unable to read search results: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read search result rows: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn search_all_catalogues(
+async fn search_all_catalogues(
     app: tauri::AppHandle,
     query: String,
 ) -> Result<Vec<LibrarySearchResult>, String> {
-    let tokens = search_tokens(query.trim());
-    if tokens.is_empty() {
-        return Ok(Vec::new());
-    }
+    run_blocking(move || {
+        let tokens = search_tokens(query.trim());
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    let connection = open_database(&database_path(&app)?)?;
+        let connection = open_database(&database_path(&app)?)?;
 
-    let name_expr = normalised_search_expression("f.name");
-    let path_expr = normalised_search_expression("f.relative_path");
+        let name_expr = normalised_search_expression("f.name");
+        let path_expr = normalised_search_expression("f.relative_path");
 
-    let conditions: Vec<String> = tokens
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let parameter = index + 1;
-            format!(
-                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-            )
-        })
-        .collect();
-
-    let sql = format!(
-        "SELECT f.drive_id, d.name, f.relative_path, f.name,
-                f.is_directory, f.size_bytes, f.modified_at
-         FROM files f
-         JOIN drives d ON d.persistent_identifier = f.drive_id
-         WHERE {}
-         ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
-         LIMIT 200",
-        conditions.join(" AND ")
-    );
-
-    let values: Vec<&dyn rusqlite::ToSql> = tokens
-        .iter()
-        .map(|token| token as &dyn rusqlite::ToSql)
-        .collect();
-
-    let mut statement = connection
-        .prepare(&sql)
-        .map_err(|error| format!("Unable to search library: {error}"))?;
-
-    let rows = statement
-        .query_map(values.as_slice(), |row| {
-            Ok(LibrarySearchResult {
-                drive_id: row.get(0)?,
-                drive_name: row.get(1)?,
-                relative_path: row.get(2)?,
-                name: row.get(3)?,
-                is_directory: row.get::<_, i64>(4)? != 0,
-                size_bytes: row.get(5)?,
-                modified_at: row.get(6)?,
+        let conditions: Vec<String> = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let parameter = index + 1;
+                format!(
+                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+                )
             })
-        })
-        .map_err(|error| format!("Unable to read library search results: {error}"))?;
+            .collect();
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read library search result rows: {error}"))
+        let sql = format!(
+            "SELECT f.drive_id, d.name, f.relative_path, f.name,
+                    f.is_directory, f.size_bytes, f.modified_at
+             FROM files f
+             JOIN drives d ON d.persistent_identifier = f.drive_id
+             WHERE {}
+             ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
+             LIMIT 200",
+            conditions.join(" AND ")
+        );
+
+        let values: Vec<&dyn rusqlite::ToSql> = tokens
+            .iter()
+            .map(|token| token as &dyn rusqlite::ToSql)
+            .collect();
+
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("Unable to search library: {error}"))?;
+
+        let rows = statement
+            .query_map(values.as_slice(), |row| {
+                Ok(LibrarySearchResult {
+                    drive_id: row.get(0)?,
+                    drive_name: row.get(1)?,
+                    relative_path: row.get(2)?,
+                    name: row.get(3)?,
+                    is_directory: row.get::<_, i64>(4)? != 0,
+                    size_bytes: row.get(5)?,
+                    modified_at: row.get(6)?,
+                })
+            })
+            .map_err(|error| format!("Unable to read library search results: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read library search result rows: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
-    let connection = open_database(&database_path(&app)?)?;
+async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
 
-    let mut groups_statement = connection
-        .prepare(
-            "SELECT MIN(f.name) AS display_name,
-                    f.size_bytes,
-                    COUNT(*) AS copies
-             FROM files f
-             WHERE f.is_directory = 0
-               AND f.size_bytes IS NOT NULL
-               AND f.size_bytes > 0
-             GROUP BY lower(f.name), f.size_bytes
-             HAVING COUNT(*) > 1
-             ORDER BY (f.size_bytes * (COUNT(*) - 1)) DESC,
-                      f.size_bytes DESC,
-                      lower(MIN(f.name))
-             LIMIT 100",
-        )
-        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+        let mut groups_statement = connection
+            .prepare(
+                "SELECT MIN(f.name) AS display_name,
+                        f.size_bytes,
+                        COUNT(*) AS copies
+                 FROM files f
+                 WHERE f.is_directory = 0
+                   AND f.size_bytes IS NOT NULL
+                   AND f.size_bytes > 0
+                 GROUP BY lower(f.name), f.size_bytes
+                 HAVING COUNT(*) > 1
+                 ORDER BY (f.size_bytes * (COUNT(*) - 1)) DESC,
+                          f.size_bytes DESC,
+                          lower(MIN(f.name))
+                 LIMIT 100",
+            )
+            .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
 
-    let group_rows = groups_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(|error| format!("Unable to read probable duplicate groups: {error}"))?;
+        let group_rows = groups_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| format!("Unable to read probable duplicate groups: {error}"))?;
 
-    let groups = group_rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read probable duplicate group rows: {error}"))?;
+        let groups = group_rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read probable duplicate group rows: {error}"))?;
 
-    let mut file_statement = connection
-        .prepare(
-            "SELECT f.drive_id,
-                    d.name,
-                    f.relative_path,
-                    f.name,
-                    f.size_bytes,
-                    f.modified_at
-             FROM files f
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE f.is_directory = 0
-               AND lower(f.name) = lower(?1)
-               AND f.size_bytes = ?2
-             ORDER BY lower(d.name), lower(f.relative_path)",
-        )
-        .map_err(|error| format!("Unable to prepare probable duplicate files query: {error}"))?;
+        let mut file_statement = connection
+            .prepare(
+                "SELECT f.drive_id,
+                        d.name,
+                        f.relative_path,
+                        f.name,
+                        f.size_bytes,
+                        f.modified_at
+                 FROM files f
+                 JOIN drives d ON d.persistent_identifier = f.drive_id
+                 WHERE f.is_directory = 0
+                   AND lower(f.name) = lower(?1)
+                   AND f.size_bytes = ?2
+                 ORDER BY lower(d.name), lower(f.relative_path)",
+            )
+            .map_err(|error| {
+                format!("Unable to prepare probable duplicate files query: {error}")
+            })?;
 
-    let mut results = Vec::with_capacity(groups.len());
+        let mut results = Vec::with_capacity(groups.len());
 
-    for (name, size_bytes, copies) in groups {
-        let file_rows = file_statement
-            .query_map(params![&name, size_bytes], |row| {
-                Ok(DuplicateFile {
+        for (name, size_bytes, copies) in groups {
+            let file_rows = file_statement
+                .query_map(params![&name, size_bytes], |row| {
+                    Ok(DuplicateFile {
+                        drive_id: row.get(0)?,
+                        drive_name: row.get(1)?,
+                        relative_path: row.get(2)?,
+                        name: row.get(3)?,
+                        size_bytes: row.get(4)?,
+                        modified_at: row.get(5)?,
+                    })
+                })
+                .map_err(|error| format!("Unable to read probable duplicate files: {error}"))?;
+
+            let files = file_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read probable duplicate file rows: {error}"))?;
+
+            results.push(DuplicateGroup {
+                name,
+                size_bytes,
+                copies,
+                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+                files,
+            });
+        }
+
+        Ok(results)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+
+        let mut statement = connection
+            .prepare(
+                "SELECT f.drive_id,
+                        d.name,
+                        f.relative_path,
+                        f.name,
+                        f.size_bytes,
+                        f.modified_at
+                 FROM files f
+                 JOIN drives d ON d.persistent_identifier = f.drive_id
+                 WHERE f.is_directory = 0
+                   AND f.size_bytes IS NOT NULL
+                 ORDER BY f.size_bytes DESC, lower(f.name), lower(d.name)
+                 LIMIT 100",
+            )
+            .map_err(|error| format!("Unable to query largest files: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(LargestFile {
                     drive_id: row.get(0)?,
                     drive_name: row.get(1)?,
                     relative_path: row.get(2)?,
@@ -1310,60 +1392,12 @@ fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, Str
                     modified_at: row.get(5)?,
                 })
             })
-            .map_err(|error| format!("Unable to read probable duplicate files: {error}"))?;
+            .map_err(|error| format!("Unable to read largest files: {error}"))?;
 
-        let files = file_rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read probable duplicate file rows: {error}"))?;
-
-        results.push(DuplicateGroup {
-            name,
-            size_bytes,
-            copies,
-            potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
-            files,
-        });
-    }
-
-    Ok(results)
-}
-
-#[tauri::command]
-fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String> {
-    let connection = open_database(&database_path(&app)?)?;
-
-    let mut statement = connection
-        .prepare(
-            "SELECT f.drive_id,
-                    d.name,
-                    f.relative_path,
-                    f.name,
-                    f.size_bytes,
-                    f.modified_at
-             FROM files f
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE f.is_directory = 0
-               AND f.size_bytes IS NOT NULL
-             ORDER BY f.size_bytes DESC, lower(f.name), lower(d.name)
-             LIMIT 100",
-        )
-        .map_err(|error| format!("Unable to query largest files: {error}"))?;
-
-    let rows = statement
-        .query_map([], |row| {
-            Ok(LargestFile {
-                drive_id: row.get(0)?,
-                drive_name: row.get(1)?,
-                relative_path: row.get(2)?,
-                name: row.get(3)?,
-                size_bytes: row.get(4)?,
-                modified_at: row.get(5)?,
-            })
-        })
-        .map_err(|error| format!("Unable to read largest files: {error}"))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read largest file rows: {error}"))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read largest file rows: {error}"))
+    })
+    .await
 }
 
 fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
@@ -1387,111 +1421,20 @@ fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
-    let connection = open_database(&database_path(&app)?)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT id, kind, display_name, user_label, drive_id, local_path
-             FROM locations
-             ORDER BY CASE kind WHEN 'external_drive' THEN 0 ELSE 1 END,
-                      lower(COALESCE(NULLIF(user_label, ''), display_name))",
-        )
-        .map_err(|error| format!("Unable to query locations: {error}"))?;
+async fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, display_name, user_label, drive_id, local_path
+                 FROM locations
+                 ORDER BY CASE kind WHEN 'external_drive' THEN 0 ELSE 1 END,
+                          lower(COALESCE(NULLIF(user_label, ''), display_name))",
+            )
+            .map_err(|error| format!("Unable to query locations: {error}"))?;
 
-    let rows = statement
-        .query_map([], |row| {
-            Ok(Location {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                display_name: row.get(2)?,
-                user_label: row.get(3)?,
-                drive_id: row.get(4)?,
-                local_path: row.get(5)?,
-            })
-        })
-        .map_err(|error| format!("Unable to read locations: {error}"))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read location rows: {error}"))
-}
-
-#[tauri::command]
-fn set_drive_label(
-    app: tauri::AppHandle,
-    persistent_identifier: String,
-    label: String,
-) -> Result<(), String> {
-    let trimmed = label.trim();
-
-    if trimmed.chars().count() > 40 {
-        return Err("Drive labels can be up to 40 characters.".to_string());
-    }
-
-    let connection = open_database(&database_path(&app)?)?;
-    let changed = connection
-        .execute(
-            "UPDATE locations
-             SET user_label = CASE WHEN ?1 = '' THEN NULL ELSE ?1 END
-             WHERE kind = 'external_drive'
-               AND drive_id = ?2",
-            params![trimmed, persistent_identifier],
-        )
-        .map_err(|error| format!("Unable to save drive label: {error}"))?;
-
-    if changed == 0 {
-        return Err("That drive is not in the Media Mapper catalogue.".to_string());
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn add_local_folder_location(app: tauri::AppHandle, path: String) -> Result<Location, String> {
-    let candidate = PathBuf::from(path.trim());
-
-    if !candidate.is_absolute() {
-        return Err("The selected folder must have an absolute path.".to_string());
-    }
-
-    let metadata = fs::metadata(&candidate)
-        .map_err(|error| format!("Unable to inspect selected folder: {error}"))?;
-
-    if !metadata.is_dir() {
-        return Err("The selected location is not a folder.".to_string());
-    }
-
-    let canonical = fs::canonicalize(&candidate)
-        .map_err(|error| format!("Unable to resolve selected folder: {error}"))?;
-    let local_path = canonical.to_string_lossy().into_owned();
-
-    let display_name = canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("This Mac")
-        .to_owned();
-
-    // The path itself is the stable identity material. It is stored separately
-    // from the display name so renaming UI labels later will not affect plans.
-    let id = format!("local:{local_path}");
-
-    let connection = open_database(&database_path(&app)?)?;
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO locations
-                (id, kind, display_name, drive_id, local_path, created_at)
-             VALUES (?1, 'local_folder', ?2, NULL, ?3, ?4)",
-            params![id, display_name, local_path, now_unix()],
-        )
-        .map_err(|error| format!("Unable to save local folder location: {error}"))?;
-
-    connection
-        .query_row(
-            "SELECT id, kind, display_name, user_label, drive_id, local_path
-             FROM locations
-             WHERE local_path = ?1",
-            params![local_path],
-            |row| {
+        let rows = statement
+            .query_map([], |row| {
                 Ok(Location {
                     id: row.get(0)?,
                     kind: row.get(1)?,
@@ -1500,366 +1443,485 @@ fn add_local_folder_location(app: tauri::AppHandle, path: String) -> Result<Loca
                     drive_id: row.get(4)?,
                     local_path: row.get(5)?,
                 })
-            },
-        )
-        .map_err(|error| format!("Unable to read local folder location: {error}"))
+            })
+            .map_err(|error| format!("Unable to read locations: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to read location rows: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn create_planned_move(
+async fn set_drive_label(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+    label: String,
+) -> Result<(), String> {
+    run_blocking(move || {
+        let trimmed = label.trim();
+
+        if trimmed.chars().count() > 40 {
+            return Err("Drive labels can be up to 40 characters.".to_string());
+        }
+
+        let connection = open_database(&database_path(&app)?)?;
+        let changed = connection
+            .execute(
+                "UPDATE locations
+                 SET user_label = CASE WHEN ?1 = '' THEN NULL ELSE ?1 END
+                 WHERE kind = 'external_drive'
+                   AND drive_id = ?2",
+                params![trimmed, persistent_identifier],
+            )
+            .map_err(|error| format!("Unable to save drive label: {error}"))?;
+
+        if changed == 0 {
+            return Err("That drive is not in the Media Mapper catalogue.".to_string());
+        }
+
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn add_local_folder_location(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<Location, String> {
+    run_blocking(move || {
+        let candidate = PathBuf::from(path.trim());
+
+        if !candidate.is_absolute() {
+            return Err("The selected folder must have an absolute path.".to_string());
+        }
+
+        let metadata = fs::metadata(&candidate)
+            .map_err(|error| format!("Unable to inspect selected folder: {error}"))?;
+
+        if !metadata.is_dir() {
+            return Err("The selected location is not a folder.".to_string());
+        }
+
+        let canonical = fs::canonicalize(&candidate)
+            .map_err(|error| format!("Unable to resolve selected folder: {error}"))?;
+        let local_path = canonical.to_string_lossy().into_owned();
+
+        let display_name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("This Mac")
+            .to_owned();
+
+        // The path itself is the stable identity material. It is stored separately
+        // from the display name so renaming UI labels later will not affect plans.
+        let id = format!("local:{local_path}");
+
+        let connection = open_database(&database_path(&app)?)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO locations
+                    (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES (?1, 'local_folder', ?2, NULL, ?3, ?4)",
+                params![id, display_name, local_path, now_unix()],
+            )
+            .map_err(|error| format!("Unable to save local folder location: {error}"))?;
+
+        connection
+            .query_row(
+                "SELECT id, kind, display_name, user_label, drive_id, local_path
+                 FROM locations
+                 WHERE local_path = ?1",
+                params![local_path],
+                |row| {
+                    Ok(Location {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        display_name: row.get(2)?,
+                        user_label: row.get(3)?,
+                        drive_id: row.get(4)?,
+                        local_path: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Unable to read local folder location: {error}"))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn create_planned_move(
     app: tauri::AppHandle,
     source_drive_id: String,
     source_relative_path: String,
     destination_location_id: String,
     destination_relative_path: String,
 ) -> Result<i64, String> {
-    validate_catalogue_relative_path(&source_relative_path)?;
-    validate_catalogue_relative_path(&destination_relative_path)?;
+    run_blocking(move || {
+        validate_catalogue_relative_path(&source_relative_path)?;
+        validate_catalogue_relative_path(&destination_relative_path)?;
 
-    let connection = open_database(&database_path(&app)?)?;
+        let connection = open_database(&database_path(&app)?)?;
 
-    let (destination_kind, destination_drive_id): (String, Option<String>) = connection
-        .query_row(
-            "SELECT kind, drive_id FROM locations WHERE id = ?1",
-            params![destination_location_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
-
-    if destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-        && source_relative_path == destination_relative_path
-    {
-        return Err(
-            "The planned destination is the same as the current catalogue location.".to_string(),
-        );
-    }
-    let source_is_directory = match connection.query_row(
-        "SELECT is_directory
-         FROM files
-         WHERE drive_id = ?1 AND relative_path = ?2",
-        params![source_drive_id, source_relative_path],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(value) => value != 0,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err("The source item is not present in the catalogue.".to_string());
-        }
-        Err(error) => {
-            return Err(format!("Unable to validate planned move source: {error}"));
-        }
-    };
-
-    if source_is_directory
-        && destination_drive_id.as_deref() == Some(source_drive_id.as_str())
-        && destination_relative_path.starts_with(&(source_relative_path.clone() + "/"))
-    {
-        return Err("A folder cannot be planned inside itself.".to_string());
-    }
-
-    // Planning must not silently target a catalogue location that is already
-    // occupied. The catalogue is a snapshot, so this is an early safety check;
-    // execution will re-check the live destination before any future copy.
-    if destination_kind == "external_drive" {
-        let destination_drive_id = destination_drive_id
-            .as_deref()
-            .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
-
-        let destination_occupied: bool = connection
+        let (destination_kind, destination_drive_id): (String, Option<String>) = connection
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM files
-                    WHERE drive_id = ?1 AND relative_path = ?2
-                )",
-                params![destination_drive_id, destination_relative_path],
-                |row| row.get(0),
+                "SELECT kind, drive_id FROM locations WHERE id = ?1",
+                params![destination_location_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|error| format!("Unable to check planned destination: {error}"))?;
+            .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
 
-        if destination_occupied {
+        if destination_drive_id.as_deref() == Some(source_drive_id.as_str())
+            && source_relative_path == destination_relative_path
+        {
             return Err(
-                "That destination already exists in the destination drive catalogue.".to_string(),
+                "The planned destination is the same as the current catalogue location.".to_string(),
             );
         }
-    }
-
-    // Two source files must never silently claim the same planned destination.
-    // Exclude this source so an existing plan can still be edited/replaced.
-    let destination_already_planned: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-            SELECT 1
-            FROM planned_moves
-            WHERE destination_location_id = ?1
-              AND destination_relative_path = ?2
-              AND NOT (
-                  source_drive_id = ?3
-                  AND source_relative_path = ?4
-              )
-        )",
-            params![
-                destination_location_id,
-                destination_relative_path,
-                source_drive_id,
-                source_relative_path
-            ],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
-
-    if destination_already_planned {
-        return Err("Another planned move already uses that destination.".to_string());
-    }
-
-    connection
-        .execute(
-            "INSERT INTO planned_moves (
-                source_drive_id,
-                source_relative_path,
-                destination_location_id,
-                destination_relative_path,
-                created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
-                destination_location_id = excluded.destination_location_id,
-                destination_relative_path = excluded.destination_relative_path,
-                created_at = excluded.created_at",
-            params![
-                source_drive_id,
-                source_relative_path,
-                destination_location_id,
-                destination_relative_path,
-                now_unix()
-            ],
-        )
-        .map_err(|error| format!("Unable to save planned move: {error}"))?;
-
-    connection
-        .query_row(
-            "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
+        let source_is_directory = match connection.query_row(
+            "SELECT is_directory
+             FROM files
+             WHERE drive_id = ?1 AND relative_path = ?2",
             params![source_drive_id, source_relative_path],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("Unable to read planned move id: {error}"))
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(value) => value != 0,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err("The source item is not present in the catalogue.".to_string());
+            }
+            Err(error) => {
+                return Err(format!("Unable to validate planned move source: {error}"));
+            }
+        };
+
+        if source_is_directory
+            && destination_drive_id.as_deref() == Some(source_drive_id.as_str())
+            && destination_relative_path.starts_with(&(source_relative_path.clone() + "/"))
+        {
+            return Err("A folder cannot be planned inside itself.".to_string());
+        }
+
+        // Planning must not silently target a catalogue location that is already
+        // occupied. The catalogue is a snapshot, so this is an early safety check;
+        // execution will re-check the live destination before any future copy.
+        if destination_kind == "external_drive" {
+            let destination_drive_id = destination_drive_id
+                .as_deref()
+                .ok_or_else(|| "External drive location has no drive identity.".to_string())?;
+
+            let destination_occupied: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM files
+                        WHERE drive_id = ?1 AND relative_path = ?2
+                    )",
+                    params![destination_drive_id, destination_relative_path],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("Unable to check planned destination: {error}"))?;
+
+            if destination_occupied {
+                return Err(
+                    "That destination already exists in the destination drive catalogue.".to_string(),
+                );
+            }
+        }
+
+        // Two source files must never silently claim the same planned destination.
+        // Exclude this source so an existing plan can still be edited/replaced.
+        let destination_already_planned: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1
+                FROM planned_moves
+                WHERE destination_location_id = ?1
+                  AND destination_relative_path = ?2
+                  AND NOT (
+                      source_drive_id = ?3
+                      AND source_relative_path = ?4
+                  )
+            )",
+                params![
+                    destination_location_id,
+                    destination_relative_path,
+                    source_drive_id,
+                    source_relative_path
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
+
+        if destination_already_planned {
+            return Err("Another planned move already uses that destination.".to_string());
+        }
+
+        connection
+            .execute(
+                "INSERT INTO planned_moves (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_drive_id, source_relative_path) DO UPDATE SET
+                    destination_location_id = excluded.destination_location_id,
+                    destination_relative_path = excluded.destination_relative_path,
+                    created_at = excluded.created_at",
+                params![
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    now_unix()
+                ],
+            )
+            .map_err(|error| format!("Unable to save planned move: {error}"))?;
+
+        connection
+            .query_row(
+                "SELECT id FROM planned_moves WHERE source_drive_id = ?1 AND source_relative_path = ?2",
+                params![source_drive_id, source_relative_path],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to read planned move id: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String> {
-    let connection = open_database(&database_path(&app)?)?;
-    let mut statement = connection
-        .prepare(
-            "SELECT p.id,
-                p.source_drive_id,
-                sd.name,
-                p.source_relative_path,
-                sf.name,
-                sf.size_bytes,
-                COALESCE(sf.is_directory, 0),
-                dl.id,
-                COALESCE(NULLIF(dl.user_label, ''), dl.display_name),
-                p.destination_relative_path,
-                p.created_at
-         FROM planned_moves p
-         JOIN drives sd ON sd.persistent_identifier = p.source_drive_id
-         JOIN locations dl ON dl.id = p.destination_location_id
-         LEFT JOIN files sf
-           ON sf.drive_id = p.source_drive_id
-          AND sf.relative_path = p.source_relative_path
-         ORDER BY p.created_at DESC",
-        )
-        .map_err(|error| format!("Unable to query planned moves: {error}"))?;
-
-    let rows = statement
-        .query_map([], |row| {
-            let source_relative_path: String = row.get(3)?;
-            let fallback_name = Path::new(&source_relative_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&source_relative_path)
-                .to_owned();
-            Ok(PlannedMove {
-                id: row.get(0)?,
-                source_drive_id: row.get(1)?,
-                source_drive_name: row.get(2)?,
-                source_relative_path,
-                source_name: row.get::<_, Option<String>>(4)?.unwrap_or(fallback_name),
-                source_size_bytes: row.get(5)?,
-                source_is_directory: row.get::<_, i64>(6)? != 0,
-                destination_location_id: row.get(7)?,
-                destination_location_name: row.get(8)?,
-                destination_relative_path: row.get(9)?,
-                created_at: row.get(10)?,
-            })
-        })
-        .map_err(|error| format!("Unable to read planned moves: {error}"))?;
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to read planned move rows: {error}"))
-}
-
-#[tauri::command]
-fn list_planned_folder_entries(
-    app: tauri::AppHandle,
-    destination_location_id: String,
-    parent_path: String,
-) -> Result<Vec<PlannedFolderEntry>, String> {
-    if !parent_path.is_empty() {
-        validate_catalogue_relative_path(&parent_path)?;
-    }
-
-    let connection = open_database(&database_path(&app)?)?;
-
-    let roots = {
+async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
         let mut statement = connection
             .prepare(
-                "SELECT
-                    p.id,
+                "SELECT p.id,
                     p.source_drive_id,
                     sd.name,
                     p.source_relative_path,
                     sf.name,
-                    COALESCE(sf.is_directory, 0),
                     sf.size_bytes,
-                    p.destination_relative_path
-                 FROM planned_moves p
-                 JOIN drives sd
-                   ON sd.persistent_identifier = p.source_drive_id
-                 LEFT JOIN files sf
-                   ON sf.drive_id = p.source_drive_id
-                  AND sf.relative_path = p.source_relative_path
-                 WHERE p.destination_location_id = ?1
-                 ORDER BY lower(p.destination_relative_path)",
+                    COALESCE(sf.is_directory, 0),
+                    dl.id,
+                    COALESCE(NULLIF(dl.user_label, ''), dl.display_name),
+                    p.destination_relative_path,
+                    p.created_at
+             FROM planned_moves p
+             JOIN drives sd ON sd.persistent_identifier = p.source_drive_id
+             JOIN locations dl ON dl.id = p.destination_location_id
+             LEFT JOIN files sf
+               ON sf.drive_id = p.source_drive_id
+              AND sf.relative_path = p.source_relative_path
+             ORDER BY p.created_at DESC",
             )
-            .map_err(|error| format!("Unable to query planned folder: {error}"))?;
+            .map_err(|error| format!("Unable to query planned moves: {error}"))?;
 
         let rows = statement
-            .query_map(params![destination_location_id], |row| {
+            .query_map([], |row| {
                 let source_relative_path: String = row.get(3)?;
-                let stored_name: Option<String> = row.get(4)?;
-
-                let name = stored_name.unwrap_or_else(|| {
-                    Path::new(&source_relative_path)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or(&source_relative_path)
-                        .to_owned()
-                });
-
-                Ok(PlannedFolderEntry {
-                    move_id: row.get(0)?,
+                let fallback_name = Path::new(&source_relative_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&source_relative_path)
+                    .to_owned();
+                Ok(PlannedMove {
+                    id: row.get(0)?,
                     source_drive_id: row.get(1)?,
                     source_drive_name: row.get(2)?,
                     source_relative_path,
-                    name,
-                    is_directory: row.get::<_, i64>(5)? != 0,
-                    size_bytes: row.get(6)?,
-                    destination_relative_path: row.get(7)?,
+                    source_name: row.get::<_, Option<String>>(4)?.unwrap_or(fallback_name),
+                    source_size_bytes: row.get(5)?,
+                    source_is_directory: row.get::<_, i64>(6)? != 0,
+                    destination_location_id: row.get(7)?,
+                    destination_location_name: row.get(8)?,
+                    destination_relative_path: row.get(9)?,
+                    created_at: row.get(10)?,
                 })
             })
-            .map_err(|error| format!("Unable to read planned folder: {error}"))?;
+            .map_err(|error| format!("Unable to read planned moves: {error}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read planned folder rows: {error}"))?
-    };
-
-    let mut entries = Vec::new();
-
-    for root in roots {
-        let destination_parent = Path::new(&root.destination_relative_path)
-            .parent()
-            .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .replace('\\', "/");
-
-        // Show the planned item itself in its future parent folder.
-        if destination_parent == parent_path {
-            entries.push(root.clone());
-        }
-
-        if !root.is_directory {
-            continue;
-        }
-
-        // If the user is browsing inside a planned directory at its future
-        // location, map that virtual path back to the source catalogue.
-        let source_parent = if parent_path == root.destination_relative_path {
-            Some(root.source_relative_path.clone())
-        } else {
-            let prefix = format!("{}/", root.destination_relative_path);
-
-            parent_path.strip_prefix(&prefix).map(|suffix| {
-                if suffix.is_empty() {
-                    root.source_relative_path.clone()
-                } else {
-                    format!("{}/{}", root.source_relative_path, suffix)
-                }
-            })
-        };
-
-        let Some(source_parent) = source_parent else {
-            continue;
-        };
-
-        let children = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT relative_path, name, is_directory, size_bytes
-                     FROM files
-                     WHERE drive_id = ?1 AND parent_path = ?2
-                     ORDER BY lower(name)",
-                )
-                .map_err(|error| format!("Unable to query planned directory contents: {error}"))?;
-
-            let rows = statement
-                .query_map(params![root.source_drive_id, source_parent], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                })
-                .map_err(|error| format!("Unable to read planned directory contents: {error}"))?;
-
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("Unable to read planned directory rows: {error}"))?
-        };
-
-        for (source_relative_path, name, is_directory, size_bytes) in children {
-            let destination_relative_path = if parent_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", parent_path, name)
-            };
-
-            entries.push(PlannedFolderEntry {
-                move_id: root.move_id,
-                source_drive_id: root.source_drive_id.clone(),
-                source_drive_name: root.source_drive_name.clone(),
-                source_relative_path,
-                name,
-                is_directory,
-                size_bytes,
-                destination_relative_path,
-            });
-        }
-    }
-
-    entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
-
-    Ok(entries)
+            .map_err(|error| format!("Unable to read planned move rows: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    let connection = open_database(&database_path(&app)?)?;
-    let changed = connection
-        .execute("DELETE FROM planned_moves WHERE id = ?1", params![id])
-        .map_err(|error| format!("Unable to remove planned move: {error}"))?;
-    if changed == 0 {
-        return Err("That planned move no longer exists.".to_string());
-    }
-    Ok(())
+async fn list_planned_folder_entries(
+    app: tauri::AppHandle,
+    destination_location_id: String,
+    parent_path: String,
+) -> Result<Vec<PlannedFolderEntry>, String> {
+    run_blocking(move || {
+        if !parent_path.is_empty() {
+            validate_catalogue_relative_path(&parent_path)?;
+        }
+
+        let connection = open_database(&database_path(&app)?)?;
+
+        let roots = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT
+                        p.id,
+                        p.source_drive_id,
+                        sd.name,
+                        p.source_relative_path,
+                        sf.name,
+                        COALESCE(sf.is_directory, 0),
+                        sf.size_bytes,
+                        p.destination_relative_path
+                     FROM planned_moves p
+                     JOIN drives sd
+                       ON sd.persistent_identifier = p.source_drive_id
+                     LEFT JOIN files sf
+                       ON sf.drive_id = p.source_drive_id
+                      AND sf.relative_path = p.source_relative_path
+                     WHERE p.destination_location_id = ?1
+                     ORDER BY lower(p.destination_relative_path)",
+                )
+                .map_err(|error| format!("Unable to query planned folder: {error}"))?;
+
+            let rows = statement
+                .query_map(params![destination_location_id], |row| {
+                    let source_relative_path: String = row.get(3)?;
+                    let stored_name: Option<String> = row.get(4)?;
+
+                    let name = stored_name.unwrap_or_else(|| {
+                        Path::new(&source_relative_path)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or(&source_relative_path)
+                            .to_owned()
+                    });
+
+                    Ok(PlannedFolderEntry {
+                        move_id: row.get(0)?,
+                        source_drive_id: row.get(1)?,
+                        source_drive_name: row.get(2)?,
+                        source_relative_path,
+                        name,
+                        is_directory: row.get::<_, i64>(5)? != 0,
+                        size_bytes: row.get(6)?,
+                        destination_relative_path: row.get(7)?,
+                    })
+                })
+                .map_err(|error| format!("Unable to read planned folder: {error}"))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to read planned folder rows: {error}"))?
+        };
+
+        let mut entries = Vec::new();
+
+        for root in roots {
+            let destination_parent = Path::new(&root.destination_relative_path)
+                .parent()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .replace('\\', "/");
+
+            // Show the planned item itself in its future parent folder.
+            if destination_parent == parent_path {
+                entries.push(root.clone());
+            }
+
+            if !root.is_directory {
+                continue;
+            }
+
+            // If the user is browsing inside a planned directory at its future
+            // location, map that virtual path back to the source catalogue.
+            let source_parent = if parent_path == root.destination_relative_path {
+                Some(root.source_relative_path.clone())
+            } else {
+                let prefix = format!("{}/", root.destination_relative_path);
+
+                parent_path.strip_prefix(&prefix).map(|suffix| {
+                    if suffix.is_empty() {
+                        root.source_relative_path.clone()
+                    } else {
+                        format!("{}/{}", root.source_relative_path, suffix)
+                    }
+                })
+            };
+
+            let Some(source_parent) = source_parent else {
+                continue;
+            };
+
+            let children = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT relative_path, name, is_directory, size_bytes
+                         FROM files
+                         WHERE drive_id = ?1 AND parent_path = ?2
+                         ORDER BY lower(name)",
+                    )
+                    .map_err(|error| {
+                        format!("Unable to query planned directory contents: {error}")
+                    })?;
+
+                let rows = statement
+                    .query_map(params![root.source_drive_id, source_parent], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        format!("Unable to read planned directory contents: {error}")
+                    })?;
+
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Unable to read planned directory rows: {error}"))?
+            };
+
+            for (source_relative_path, name, is_directory, size_bytes) in children {
+                let destination_relative_path = if parent_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", parent_path, name)
+                };
+
+                entries.push(PlannedFolderEntry {
+                    move_id: root.move_id,
+                    source_drive_id: root.source_drive_id.clone(),
+                    source_drive_name: root.source_drive_name.clone(),
+                    source_relative_path,
+                    name,
+                    is_directory,
+                    size_bytes,
+                    destination_relative_path,
+                });
+            }
+        }
+
+        entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+
+        Ok(entries)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    run_blocking(move || {
+        let connection = open_database(&database_path(&app)?)?;
+        let changed = connection
+            .execute("DELETE FROM planned_moves WHERE id = ?1", params![id])
+            .map_err(|error| format!("Unable to remove planned move: {error}"))?;
+        if changed == 0 {
+            return Err("That planned move no longer exists.".to_string());
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
