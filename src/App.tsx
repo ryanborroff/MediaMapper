@@ -124,6 +124,14 @@ function formatDate(timestamp: number | null) {
     .format(new Date(timestamp * 1000));
 }
 
+// Searches wait for a pause in typing before querying, so each keystroke does
+// not start its own full catalogue search. Short enough to feel immediate.
+const SEARCH_DEBOUNCE_MS = 200;
+
+function waitForTypingPause() {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, SEARCH_DEBOUNCE_MS));
+}
+
 function parentFolder(relativePath: string) {
   const separator = relativePath.lastIndexOf("/");
   return separator === -1 ? "" : relativePath.slice(0, separator);
@@ -351,6 +359,9 @@ function App() {
     const trimmed = query.trim();
     if (!trimmed) { setSearchResults([]); setSearching(false); return; }
     setSearching(true); setError(null);
+    await waitForTypingPause();
+    // A newer keystroke has taken over; it will run the search instead.
+    if (request !== catalogueSearchRequest.current) return;
     try {
       const results = await invoke<CatalogueEntry[]>("search_catalogue", {
         persistentIdentifier: drive.persistentIdentifier, query: trimmed,
@@ -374,6 +385,9 @@ function App() {
 
     setLibrarySearching(true);
     setError(null);
+    await waitForTypingPause();
+    // A newer keystroke has taken over; it will run the search instead.
+    if (request !== librarySearchRequest.current) return;
     try {
       const results = await invoke<LibrarySearchResult[]>("search_all_catalogues", { query: trimmed });
       if (request === librarySearchRequest.current) setLibraryResults(results);
