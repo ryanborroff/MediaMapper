@@ -1787,3 +1787,77 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     flex-direction: column;
   }
 }
+
+
+/* Whole-app polish */
+.app-sidebar {
+  background: color-mix(in srgb, var(--surface) 94%, var(--bg));
+}
+
+.sidebar-brand {
+  font-size: 16px;
+  letter-spacing: -.025em;
+}
+
+.sidebar-item {
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.sidebar-item.active {
+  background: var(--text);
+  color: var(--surface);
+}
+
+.app-content {
+  max-width: 1040px;
+  width: 100%;
+}
+
+.app-content .app-header h1 {
+  font-size: 30px;
+}
+
+.app-content .app-header .intro {
+  max-width: 560px;
+}
+
+.app-content .section-heading h2 {
+  letter-spacing: -.01em;
+}
+
+.browse-button,
+.scan-button,
+.section-action,
+.secondary-button {
+  min-height: 34px;
+}
+
+.browse-drive-card,
+.drive-card,
+.plan-file-list,
+.transfer-history-new,
+.connect-instruction,
+.plan-overview {
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.transfer-path {
+  color: var(--text-muted);
+}
+
+.transfer-path > span {
+  color: var(--text-disabled);
+}
+
+.plan-remove-button,
+.drive-label-button,
+.transfer-more-button {
+  text-underline-offset: 3px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar-item.active {
+    background: #ededed;
+    color: #1c1c1c;
+  }
+}
