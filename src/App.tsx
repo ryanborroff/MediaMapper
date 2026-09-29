@@ -1803,15 +1803,12 @@ function App() {
             return (
               <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
                 <div className="folder-picker-header">
-                  <div>
-                    <strong>Choose folder</strong>
-                    <span>{destinationName}</span>
-                  </div>
+                  <strong>Choose folder</strong>
                   <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
                 </div>
                 <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
                   <button type="button" onClick={() => void openDestinationFolderPicker("")}>
-                    {destinationName}
+                    Top level
                   </button>
                   {parts.map((part, index) => {
                     const path = parts.slice(0, index + 1).join("/");
@@ -1841,7 +1838,6 @@ function App() {
                   ))}
                 </div>
                 <div className="folder-picker-footer">
-                  <span>{formatLocationPath(destinationName, folderPickerPath)}</span>
                   <button
                     type="button"
                     className="browse-button"
