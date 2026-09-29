@@ -416,6 +416,33 @@ fn resolve_transfer_paths(
     Ok((source, destination))
 }
 
+fn execute_planned_transfer(
+    connection: &Connection,
+    planned_move_id: i64,
+    connected_drives: &[DriveInfo],
+) -> Result<TransferRecord, String> {
+    let validation = validate_plan_live(connection, connected_drives)?;
+
+    if !validation.ready {
+        let relevant_issue = validation
+            .issues
+            .iter()
+            .find(|issue| issue.move_id == Some(planned_move_id))
+            .or_else(|| validation.issues.first());
+
+        let message = relevant_issue
+            .map(|issue| issue.message.clone())
+            .unwrap_or_else(|| "The plan did not pass final validation.".to_string());
+
+        return Err(format!("Transfer blocked by final validation: {message}"));
+    }
+
+    let (source, destination) =
+        resolve_transfer_paths(connection, planned_move_id, connected_drives)?;
+
+    execute_transfer_paths(connection, planned_move_id, &source, &destination)
+}
+
 fn execute_transfer_paths(
     connection: &Connection,
     planned_move_id: i64,
@@ -4771,6 +4798,210 @@ mod tests {
         assert!(error.contains("Destination already exists"), "{error}");
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn planned_transfer_executes_only_after_final_live_validation() {
+        let database = TestDatabase::new("planned-transfer-valid");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        let _ = fs::remove_dir_all(&destination_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+        fs::create_dir_all(&destination_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        let contents = b"verified transfer contents";
+        fs::write(&source_path, contents).unwrap();
+
+        let metadata = fs::metadata(&source_path).unwrap();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64);
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, ?1, ?2)",
+                params![contents.len() as i64, modified_at],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "Archive/film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source_volume.0, 10_000),
+            test_drive("UUID-B", "Backup", &destination_volume.0, 10_000),
+        ];
+
+        let transfer = execute_planned_transfer(&connection, move_id, &drives).unwrap();
+
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(
+            fs::read(destination_volume.0.join("Archive/film.mov")).unwrap(),
+            contents
+        );
+        assert_eq!(fs::read(&source_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn planned_transfer_refuses_offline_destination_before_creating_record() {
+        let database = TestDatabase::new("planned-transfer-offline");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-offline-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        fs::write(&source_path, b"source").unwrap();
+
+        let metadata = fs::metadata(&source_path).unwrap();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64);
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 6, ?1)",
+                params![modified_at],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![test_drive("UUID-A", "Source", &source_volume.0, 10_000)];
+
+        let error = execute_planned_transfer(&connection, move_id, &drives).unwrap_err();
+
+        assert!(error.contains("final validation"), "{error}");
+
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+        assert_eq!(fs::read(&source_path).unwrap(), b"source");
+    }
+
+    #[test]
+    fn planned_transfer_refuses_changed_source_before_creating_record() {
+        let database = TestDatabase::new("planned-transfer-changed");
+        let source_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-changed-source-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let destination_volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-gated-changed-destination-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+
+        let _ = fs::remove_dir_all(&source_volume.0);
+        let _ = fs::remove_dir_all(&destination_volume.0);
+        fs::create_dir_all(&source_volume.0).unwrap();
+        fs::create_dir_all(&destination_volume.0).unwrap();
+
+        let source_path = source_volume.0.join("film.mov");
+        fs::write(&source_path, b"changed contents").unwrap();
+
+        let mut connection = open_database(&database.0).unwrap();
+
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+
+        // Deliberately stale catalogue size. The live file is larger.
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id,
+                    relative_path,
+                    name,
+                    parent_path,
+                    is_directory,
+                    size_bytes,
+                    modified_at
+                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 3, NULL)",
+                [],
+            )
+            .unwrap();
+
+        let move_id = plan_move(
+            &mut connection,
+            "UUID-A",
+            "film.mov",
+            "drive:UUID-B",
+            "film.mov",
+        )
+        .unwrap();
+
+        let drives = vec![
+            test_drive("UUID-A", "Source", &source_volume.0, 10_000),
+            test_drive("UUID-B", "Backup", &destination_volume.0, 10_000),
+        ];
+
+        let error = execute_planned_transfer(&connection, move_id, &drives).unwrap_err();
+
+        assert!(error.contains("final validation"), "{error}");
+
+        assert!(list_transfer_records(&connection).unwrap().is_empty());
+        assert!(!destination_volume.0.join("film.mov").exists());
+        assert_eq!(fs::read(&source_path).unwrap(), b"changed contents");
     }
 
     #[test]
