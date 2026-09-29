@@ -1374,7 +1374,7 @@ function App() {
                   onClick={() => void openSearchResult(liveDrive, entry)}
                 >
                   <span className="file-name">
-                    <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+                    
                     <span className="file-name-text">
                       <span className="file-name-primary">{entry.name}</span>
                       <span className="file-location">{formatLocationPath(liveDriveName, parentFolder(entry.relativePath))}</span>
@@ -1411,11 +1411,22 @@ function App() {
               {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
 
-                const openOrPlan = () => {
+                const openRow = () => {
                   if (entry.isDirectory) {
                     void openFolder(liveDrive, entry.relativePath);
-                  } else {
-                    beginPlanMove(entry);
+                  }
+                };
+
+                const openFile = () => {
+                  if (!entry.isDirectory) {
+                    if (!online) {
+                      setError(`Connect ${liveDriveName} to open this file.`);
+                      return;
+                    }
+                    void invoke("open_catalogued_file", {
+                      driveId: liveDrive.persistentIdentifier,
+                      relativePath: entry.relativePath,
+                    }).catch((reason) => setError(String(reason)));
                   }
                 };
 
@@ -1478,16 +1489,17 @@ function App() {
 
                       void planEntryToFolder(source, entry.relativePath);
                     }}
-                    onClick={openOrPlan}
+                    onClick={openRow}
+                    onDoubleClick={openFile}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
+                      if (event.key === "Enter" && entry.isDirectory) {
                         event.preventDefault();
-                        openOrPlan();
+                        openRow();
                       }
                     }}
                   >
                     <span className="file-name">
-                      <span className="file-kind" aria-hidden="true">{entry.isDirectory ? "▸" : ""}</span>
+                      
                       <span className="file-name-text">
                         <span className="file-name-primary">{entry.name}</span>
                         {entry.unreadable && (
@@ -1541,9 +1553,7 @@ function App() {
                     }}
                   >
                     <span className="file-name">
-                      <span className="file-kind" aria-hidden="true">
-                        {planned.isDirectory ? "▸" : ""}
-                      </span>
+                      
                       <span className="file-name-text">
                         <span className="file-name-primary">
                           <span className="planned-tag">Planned</span>{planned.name}
