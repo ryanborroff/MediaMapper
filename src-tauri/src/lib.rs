@@ -365,9 +365,78 @@ fn open_database(path: &Path) -> Result<Connection, String> {
             "
             CREATE INDEX IF NOT EXISTS idx_files_drive_parent
                 ON files(drive_id, parent_path);
+
+            -- A location is somewhere Media Mapper can plan files to live.
+            --
+            -- external_drive locations point back to the existing catalogue
+            -- drive identity. local_folder locations will later represent
+            -- folders explicitly chosen by the user on this computer.
+            CREATE TABLE IF NOT EXISTS locations (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('external_drive', 'local_folder')),
+                display_name TEXT NOT NULL,
+                drive_id TEXT,
+                local_path TEXT,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+                CHECK(
+                    (kind = 'external_drive' AND drive_id IS NOT NULL AND local_path IS NULL)
+                    OR
+                    (kind = 'local_folder' AND drive_id IS NULL AND local_path IS NOT NULL)
+                )
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_drive
+                ON locations(drive_id)
+                WHERE drive_id IS NOT NULL;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_local_path
+                ON locations(local_path)
+                WHERE local_path IS NOT NULL;
             ",
         )
-        .map_err(|error| format!("Unable to initialise parent path index: {error}"))?;
+        .map_err(|error| format!("Unable to initialise location schema: {error}"))?;
+
+    // Every catalogued external drive is also a Media Mapper location.
+    //
+    // The `drive:` prefix keeps the location namespace separate from future
+    // local-folder identifiers while preserving the drive UUID as its stable
+    // underlying identity.
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO locations (
+                id,
+                kind,
+                display_name,
+                drive_id,
+                local_path,
+                created_at
+            )
+            SELECT
+                'drive:' || persistent_identifier,
+                'external_drive',
+                name,
+                persistent_identifier,
+                NULL,
+                ?1
+            FROM drives",
+            params![now_unix()],
+        )
+        .map_err(|error| format!("Unable to create drive locations: {error}"))?;
+
+    connection
+        .execute(
+            "UPDATE locations
+             SET display_name = (
+                 SELECT drives.name
+                 FROM drives
+                 WHERE drives.persistent_identifier = locations.drive_id
+             )
+             WHERE kind = 'external_drive'
+               AND drive_id IS NOT NULL",
+            [],
+        )
+        .map_err(|error| format!("Unable to update drive locations: {error}"))?;
 
     Ok(connection)
 }
