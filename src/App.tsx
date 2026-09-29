@@ -1344,9 +1344,12 @@ function App() {
         <div className="sidebar-brand">MediaMapper</div>
         <nav className="sidebar-navigation" aria-label="Main navigation">
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
-          <button className="sidebar-item" type="button" disabled>Browse</button>
-          <button className="sidebar-item" type="button" disabled>Plan</button>
-          <button className="sidebar-item" type="button" disabled>Transfers</button>
+          <button className="sidebar-item" type="button" onClick={() => {
+            const first = catalogued[0];
+            if (first) void openFolder(first, "");
+          }}>Browse</button>
+          <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Plan</button>
+          <button className="sidebar-item" type="button" disabled title="Coming in the next UI migration">Transfers</button>
         </nav>
       </aside>
       <div className="app-content">
@@ -1363,7 +1366,7 @@ function App() {
 
       {error && <div className="notice error">{error}</div>}
 
-      {catalogued.length > 0 && <section className="section-block">
+      {false && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Search all drives</h2></div>
         <div className="catalogue-search">
           <input
@@ -1450,9 +1453,9 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse catalogue</button>}
+                      {catalogue && <button className="browse-button" onClick={() => void openFolder(catalogue, "")}>Browse</button>}
                       <button className="scan-button" disabled={scanningId !== null || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
-                        {scanning ? "Scanning…" : catalogue ? "Rescan drive" : "Scan drive"}
+                        {scanning ? "Scanning…" : "Scan"}
                       </button>
                     </div>
                   </div>
@@ -1498,9 +1501,9 @@ function App() {
       </section>
 
       <section className="section-block">
-        <div className="section-heading"><h2>Offline catalogue</h2><span>{offline.length}</span></div>
+        <div className="section-heading"><h2>Offline</h2><span>{offline.length}</span></div>
         {offline.length === 0 ? (
-          <p className="section-empty">Scanned drives appear here when disconnected, and stay browsable.</p>
+          <p className="section-empty">Catalogued drives stay available to browse when they are disconnected.</p>
         ) : (
           <div className="drive-list">
             {offline.map((drive) => (
@@ -1542,7 +1545,7 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse catalogue</button>
+                      <button className="browse-button" onClick={() => void openFolder(drive, "")}>Browse</button>
                     </div>
                   </div>
                 </div>
@@ -1560,7 +1563,7 @@ function App() {
         )}
       </section>
 
-      {executionProgress && (() => {
+      {false && executionProgress && (() => {
         const { moves, completed } = executionProgress;
         const current = moves[Math.min(completed, moves.length - 1)];
         const paths = plannedMovePaths(current);
@@ -1583,7 +1586,7 @@ function App() {
         );
       })()}
 
-      {!executionProgress && executionResult && <section className="section-block">
+      {false && !executionProgress && executionResult && <section className="section-block">
         <div className="section-heading">
           <h2>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</h2>
           <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
@@ -1593,7 +1596,7 @@ function App() {
         </p>
       </section>}
 
-      {showTransfers && <section className="section-block">
+      {false && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Waiting to transfer</h2>
           <span>{plannedMoves.length}</span>
@@ -1769,7 +1772,7 @@ function App() {
         </>}
       </section>}
 
-      {showTransfers && <section className="section-block">
+      {false && showTransfers && <section className="section-block">
         <div className="section-heading">
           <h2>Transfer history</h2>
           {transfers.length > 0 && <span>{transfers.length}</span>}
@@ -1815,7 +1818,7 @@ function App() {
         </>}
       </section>}
 
-      {catalogued.length > 0 && <section className="section-block">
+      {false && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
         <div className="tool-row">
           <div>
@@ -1910,7 +1913,6 @@ function App() {
         </div>}
       </section>}
 
-      <footer className="safety-note">Scanning reads names, paths, sizes and timestamps only and does not open, rename, move, copy or delete files.</footer>
       </div>
     </main>
   );
