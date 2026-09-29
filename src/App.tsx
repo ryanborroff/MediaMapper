@@ -266,6 +266,31 @@ function PlannedPath({ direction, locationName, folder }: {
   );
 }
 
+// Where a transfer copies from and to, as full "Location / Folder / File"
+// paths. Shared by waiting, in-progress and history rows so they read alike.
+function TransferPaths({ from, to }: { from: string; to: string }) {
+  return (
+    <>
+      <span className="transfer-path" title={from}><span>From</span>{from}</span>
+      <span className="transfer-path" title={to}><span>To</span>{to}</span>
+    </>
+  );
+}
+
+const RECENT_TRANSFER_COUNT = 10;
+
+function fileName(relativePath: string) {
+  return relativePath.split("/").pop() ?? relativePath;
+}
+
+// Pending, copying and verifying are only seen in history when a run ended
+// without recording an outcome, such as the app quitting mid-copy.
+function transferOutcome(status: string) {
+  if (status === "completed") return { label: "Copied and verified", tone: "completed" };
+  if (status === "failed") return { label: "Failed", tone: "failed" };
+  return { label: "Did not finish", tone: "incomplete" };
+}
+
 function App() {
   const [connected, setConnected] = useState<DriveInfo[]>([]);
   const [catalogued, setCatalogued] = useState<CataloguedDrive[]>([]);
@@ -302,9 +327,15 @@ function App() {
   const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
   const [showCopyConfirmation, setShowCopyConfirmation] = useState(false);
   const [executingPlan, setExecutingPlan] = useState(false);
-  const [executionProgress, setExecutionProgress] = useState<{ completed: number; total: number } | null>(null);
-  const [executionMessage, setExecutionMessage] = useState<string | null>(null);
+  // The files being copied in the current run, in order, and how many have
+  // been copied and verified so far.
+  const [executionProgress, setExecutionProgress] = useState<{ moves: PlannedMove[]; completed: number } | null>(null);
+  const [executionResult, setExecutionResult] = useState<{ stopped: boolean; message: string } | null>(null);
+  // Set synchronously so a second click cannot start another run before
+  // React re-renders with the button disabled.
+  const executionRunning = useRef(false);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
+  const [showAllTransfers, setShowAllTransfers] = useState(false);
   const [plannedFolderEntries, setPlannedFolderEntries] = useState<PlannedFolderEntry[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
   const [editingDriveLabelId, setEditingDriveLabelId] = useState<string | null>(null);
@@ -353,16 +384,18 @@ function App() {
 
     if (
       fileMoves.length === 0 ||
-      executingPlan ||
+      executionRunning.current ||
       !planValidation?.ready ||
       (planPreflight?.issues.length ?? 0) > 0
     ) {
       return;
     }
 
+    executionRunning.current = true;
     setExecutingPlan(true);
-    setExecutionMessage(null);
-    setExecutionProgress({ completed: 0, total: fileMoves.length });
+    setExecutionResult(null);
+    setShowCopyConfirmation(false);
+    setExecutionProgress({ moves: fileMoves, completed: 0 });
 
     let completed = 0;
 
@@ -375,26 +408,28 @@ function App() {
         });
 
         completed += 1;
-        setExecutionProgress({ completed, total: fileMoves.length });
+        setExecutionProgress({ moves: fileMoves, completed });
       }
 
-      setExecutionMessage(
-        `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.`,
-      );
-      setShowCopyConfirmation(false);
+      setExecutionResult({
+        stopped: false,
+        message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.`,
+      });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
-      setExecutionMessage(
-        completed > 0
+      setExecutionResult({
+        stopped: true,
+        message: completed > 0
           ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}`
           : `Nothing was copied. ${String(cause)}`,
-      );
+      });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
+      executionRunning.current = false;
       setExecutingPlan(false);
+      setExecutionProgress(null);
     }
   }, [
-    executingPlan,
     loadPlannedMoves,
     loadTransfers,
     planPreflight,
@@ -506,6 +541,19 @@ function App() {
   // only a fallback when no label has been set.
   const driveDisplayName = (persistentIdentifier: string | null, volumeName: string) =>
     locationForDrive(persistentIdentifier)?.userLabel ?? volumeName;
+
+  const sourceDriveName = (driveId: string) =>
+    driveDisplayName(
+      driveId,
+      catalogued.find((drive) => drive.persistentIdentifier === driveId)?.name ??
+        locationForDrive(driveId)?.displayName ??
+        "Unknown drive",
+    );
+
+  const plannedMovePaths = (move: PlannedMove) => ({
+    from: formatLocationPath(driveDisplayName(move.sourceDriveId, move.sourceDriveName), move.sourceRelativePath),
+    to: formatLocationPath(move.destinationLocationName, move.destinationRelativePath),
+  });
 
   const beginDriveLabelEdit = (persistentIdentifier: string, currentLabel: string | null) => {
     setEditingDriveLabelId(persistentIdentifier);
@@ -877,6 +925,8 @@ function App() {
 
   const pathParts = browserPath ? browserPath.split("/") : [];
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
+  const showTransfers =
+    plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
 
   if (browserDrive) {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
@@ -1503,226 +1553,260 @@ function App() {
         )}
       </section>
 
-      {plannedMoves.length > 0 && <section className="section-block">
+      {executionProgress && (() => {
+        const { moves, completed } = executionProgress;
+        const current = moves[Math.min(completed, moves.length - 1)];
+        const paths = plannedMovePaths(current);
+
+        return (
+          <section className="section-block" aria-live="polite">
+            <div className="section-heading"><h2>In progress</h2></div>
+            <div className="transfer-progress">
+              <strong>
+                Copying {Math.min(completed + 1, moves.length).toLocaleString()} of{" "}
+                {moves.length.toLocaleString()} {moves.length === 1 ? "file" : "files"}
+              </strong>
+              <div className="transfer-item">
+                <strong>{current.sourceName}</strong>
+                <TransferPaths from={paths.from} to={paths.to} />
+              </div>
+              <p>Each file is copied and verified before the next one starts. Originals stay in place.</p>
+            </div>
+          </section>
+        );
+      })()}
+
+      {!executionProgress && executionResult && <section className="section-block">
         <div className="section-heading">
-          <h2>Planned moves</h2>
+          <h2>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</h2>
+          <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+        </div>
+        <p className={`transfer-result${executionResult.stopped ? " failed" : ""}`} role="status">
+          {executionResult.message}
+        </p>
+      </section>}
+
+      {showTransfers && <section className="section-block">
+        <div className="section-heading">
+          <h2>Waiting to transfer</h2>
           <span>{plannedMoves.length}</span>
         </div>
-        <p className="section-description">Virtual locations only. No files have been moved.</p>
+        {plannedMoves.length === 0 ? (
+          <p className="section-empty">Nothing is waiting. Plan a move from a drive's catalogue to add it here.</p>
+        ) : <>
+          <p className="section-description">Planned only. Nothing is copied until you choose Copy and verify.</p>
 
-        {planPreflight && <div className="plan-summary" aria-live="polite">
-          {planValidation && (
-            <div className={`plan-validation ${planValidation.ready ? "ready" : "blocked"}`}>
-              <strong>{planValidation.ready ? "Current checks passed" : "Plan needs attention"}</strong>
-              <span>
-                {planValidation.ready
-                  ? "Connected sources and destinations have passed the current checks."
-                  : `${planValidation.issues.length.toLocaleString()} ${planValidation.issues.length === 1 ? "live issue needs" : "live issues need"} attention.`}
-              </span>
-              {!planValidation.ready && (
-                <ul>
-                  {planValidation.issues.map((issue, index) => (
-                    <li key={`live:${issue.code}:${issue.moveId ?? "plan"}:${index}`}>
-                      {issue.message}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
-
-          <div className="plan-summary-total">
-            <strong>
-              {planPreflight.moveCount.toLocaleString()} {planPreflight.moveCount === 1 ? "move" : "moves"}
-              {" · "}
-              {planPreflight.unknownSizeCount > 0 ? "at least " : ""}
-              {formatBytes(planPreflight.knownBytes)}
-            </strong>
-            {planPreflight.unknownSizeCount > 0 && (
-              <span>
-                {planPreflight.unknownSizeCount.toLocaleString()} {planPreflight.unknownSizeCount === 1 ? "file has" : "files have"} unknown size
-              </span>
-            )}
-          </div>
-
-          <div className="plan-destinations">
-            {planPreflight.destinations.map((destination) => (
-              <div className="plan-destination" key={destination.locationId}>
-                <strong>{destination.displayName}</strong>
+          {planPreflight && <div className="plan-summary" aria-live="polite">
+            {planValidation && (
+              <div className={`plan-validation ${planValidation.ready ? "ready" : "blocked"}`}>
+                <strong>{planValidation.ready ? "Current checks passed" : "Plan needs attention"}</strong>
                 <span>
-                  {destination.unknownSizeCount > 0 ? "At least " : ""}
-                  {formatBytes(destination.knownBytes)} planned
-                  {destination.projectedAvailableBytes !== null
-                    ? ` · ${formatBytes(destination.projectedAvailableBytes)} free after`
-                    : " · capacity unknown"}
+                  {planValidation.ready
+                    ? "Connected sources and destinations have passed the current checks."
+                    : `${planValidation.issues.length.toLocaleString()} ${planValidation.issues.length === 1 ? "live issue needs" : "live issues need"} attention.`}
                 </span>
-                {destination.capacitySufficient === false && (
-                  <span className="plan-summary-warning">Not enough catalogued free space</span>
-                )}
-                {destination.capacitySufficient === null && destination.availableBytes !== null && (
-                  <span className="plan-summary-note">Final capacity cannot be confirmed while some file sizes are unknown.</span>
+                {!planValidation.ready && (
+                  <ul>
+                    {planValidation.issues.map((issue, index) => (
+                      <li key={`live:${issue.code}:${issue.moveId ?? "plan"}:${index}`}>
+                        {issue.message}
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </div>
-            ))}
-          </div>
+            )}
 
-          {planPreflight.issues.length > 0 && (
-            <div className="plan-issues">
+            <div className="plan-summary-total">
               <strong>
-                {planPreflight.issues.length.toLocaleString()} {planPreflight.issues.length === 1 ? "issue needs" : "issues need"} attention
+                {planPreflight.moveCount.toLocaleString()} {planPreflight.moveCount === 1 ? "move" : "moves"}
+                {" · "}
+                {planPreflight.unknownSizeCount > 0 ? "at least " : ""}
+                {formatBytes(planPreflight.knownBytes)}
               </strong>
-              <ul>
-                {planPreflight.issues.map((issue, index) => (
-                  <li key={`${issue.code}:${issue.moveId ?? "plan"}:${index}`}>{issue.message}</li>
-                ))}
-              </ul>
+              {planPreflight.unknownSizeCount > 0 && (
+                <span>
+                  {planPreflight.unknownSizeCount.toLocaleString()} {planPreflight.unknownSizeCount === 1 ? "file has" : "files have"} unknown size
+                </span>
+              )}
             </div>
-          )}
-        </div>}
 
-        {(() => {
-          const fileMoveCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
-          const folderMoveCount = plannedMoves.length - fileMoveCount;
-          const planReady =
-            planValidation?.ready === true &&
-            (planPreflight?.issues.length ?? 0) === 0;
-          const canCopy = planReady && fileMoveCount > 0 && !executingPlan;
-
-          return (
-            <div className="plan-copy">
-              {!showCopyConfirmation ? (
-                <div className="plan-copy-row">
-                  <div>
-                    <strong>Copy planned files</strong>
-                    <span>
-                      Copies are verified before completion. Originals stay in place.
-                    </span>
-                    {folderMoveCount > 0 && (
-                      <span>
-                        {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    className="section-action"
-                    disabled={!canCopy}
-                    onClick={() => {
-                      setExecutionMessage(null);
-                      setShowCopyConfirmation(true);
-                    }}
-                  >
-                    Review copy
-                  </button>
+            <div className="plan-destinations">
+              {planPreflight.destinations.map((destination) => (
+                <div className="plan-destination" key={destination.locationId}>
+                  <strong>{destination.displayName}</strong>
+                  <span>
+                    {destination.unknownSizeCount > 0 ? "At least " : ""}
+                    {formatBytes(destination.knownBytes)} planned
+                    {destination.projectedAvailableBytes !== null
+                      ? ` · ${formatBytes(destination.projectedAvailableBytes)} free after`
+                      : " · capacity unknown"}
+                  </span>
+                  {destination.capacitySufficient === false && (
+                    <span className="plan-summary-warning">Not enough catalogued free space</span>
+                  )}
+                  {destination.capacitySufficient === null && destination.availableBytes !== null && (
+                    <span className="plan-summary-note">Final capacity cannot be confirmed while some file sizes are unknown.</span>
+                  )}
                 </div>
-              ) : (
-                <div className="plan-copy-confirmation">
-                  <div>
-                    <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
-                    <span>
-                      Media Mapper will run final checks again, copy each file, verify it byte for byte, and leave every original untouched.
-                    </span>
-                  </div>
-                  <div className="plan-copy-actions">
-                    <button
-                      className="secondary-button"
-                      disabled={executingPlan}
-                      onClick={() => setShowCopyConfirmation(false)}
-                    >
-                      Cancel
-                    </button>
+              ))}
+            </div>
+
+            {planPreflight.issues.length > 0 && (
+              <div className="plan-issues">
+                <strong>
+                  {planPreflight.issues.length.toLocaleString()} {planPreflight.issues.length === 1 ? "issue needs" : "issues need"} attention
+                </strong>
+                <ul>
+                  {planPreflight.issues.map((issue, index) => (
+                    <li key={`${issue.code}:${issue.moveId ?? "plan"}:${index}`}>{issue.message}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>}
+
+          {(() => {
+            const fileMoveCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
+            const folderMoveCount = plannedMoves.length - fileMoveCount;
+            const planReady =
+              planValidation?.ready === true &&
+              (planPreflight?.issues.length ?? 0) === 0;
+            const canCopy = planReady && fileMoveCount > 0 && !executingPlan;
+
+            return (
+              <div className="plan-copy">
+                {!showCopyConfirmation ? (
+                  <div className="plan-copy-row">
+                    <div>
+                      <strong>Copy planned files</strong>
+                      <span>
+                        Copies are verified before completion. Originals stay in place.
+                      </span>
+                      {folderMoveCount > 0 && (
+                        <span>
+                          {folderMoveCount.toLocaleString()} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.
+                        </span>
+                      )}
+                    </div>
                     <button
                       className="section-action"
                       disabled={!canCopy}
-                      onClick={() => void copyPlannedFiles()}
+                      onClick={() => {
+                        setExecutionResult(null);
+                        setShowCopyConfirmation(true);
+                      }}
                     >
-                      {executingPlan ? "Copying…" : "Copy and verify"}
+                      Review copy
                     </button>
                   </div>
-                </div>
-              )}
+                ) : (
+                  <div className="plan-copy-confirmation">
+                    <div>
+                      <strong>Copy {fileMoveCount.toLocaleString()} {fileMoveCount === 1 ? "file" : "files"}?</strong>
+                      <span>
+                        Media Mapper will run final checks again, copy each file, verify it byte for byte, and leave every original untouched.
+                      </span>
+                    </div>
+                    <div className="plan-copy-actions">
+                      <button
+                        className="secondary-button"
+                        disabled={executingPlan}
+                        onClick={() => setShowCopyConfirmation(false)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="section-action"
+                        disabled={!canCopy}
+                        onClick={() => void copyPlannedFiles()}
+                      >
+                        {executingPlan ? "Copying…" : "Copy and verify"}
+                      </button>
+                    </div>
+                  </div>
+                )}
 
-              {executionProgress && executingPlan && (
-                <p className="plan-copy-status" aria-live="polite">
-                  Copied and verified {executionProgress.completed.toLocaleString()} of{" "}
-                  {executionProgress.total.toLocaleString()} files.
-                </p>
-              )}
-
-              {executionMessage && (
-                <p className="plan-copy-status" aria-live="polite">
-                  {executionMessage}
-                </p>
-              )}
-            </div>
-          );
-        })()}
-
-        <div className="planned-move-list">
-          {plannedMoves.map((move) => (
-            <div className="planned-move-row" key={move.id}>
-              <div className="planned-move-main">
-                <strong>{move.sourceName}</strong>
-                <span>
-                  {formatLocationPath(
-                    driveDisplayName(move.sourceDriveId, move.sourceDriveName),
-                    parentFolder(move.sourceRelativePath),
-                  )}
-                </span>
-                <PlannedPath
-                  direction="to"
-                  locationName={move.destinationLocationName}
-                  folder={parentFolder(move.destinationRelativePath)}
-                />
               </div>
-              <span>{formatBytes(move.sourceSizeBytes)}</span>
-              <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
-                Remove
-              </button>
-            </div>
-          ))}
-        </div>
+            );
+          })()}
+
+          <div className="planned-move-list">
+            {plannedMoves.map((move) => {
+              const paths = plannedMovePaths(move);
+              const runIndex = executionProgress?.moves.findIndex((item) => item.id === move.id) ?? -1;
+              const runState =
+                !executionProgress || runIndex === -1 ? ""
+                  : runIndex < executionProgress.completed ? "Copied"
+                    : runIndex === executionProgress.completed ? "Copying…"
+                      : "Waiting";
+
+              return (
+                <div className="planned-move-row" key={move.id}>
+                  <div className="transfer-item">
+                    <strong>{move.sourceName}</strong>
+                    <TransferPaths from={paths.from} to={paths.to} />
+                  </div>
+                  <span>{formatBytes(move.sourceSizeBytes)}</span>
+                  {executingPlan ? (
+                    <span className="transfer-run-state">{runState}</span>
+                  ) : (
+                    <button className="plan-remove-button" onClick={() => void removePlannedMove(move.id)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>}
       </section>}
 
-      {transfers.some((transfer) => transfer.status === "completed") && (
-        <section className="section-block">
-          <div className="section-heading">
-            <h2>Completed transfers</h2>
-            <span>{transfers.filter((transfer) => transfer.status === "completed").length}</span>
-          </div>
-          <p className="section-description">
-            Verified copies. Original files were left untouched.
-          </p>
+      {showTransfers && <section className="section-block">
+        <div className="section-heading">
+          <h2>Transfer history</h2>
+          {transfers.length > 0 && <span>{transfers.length}</span>}
+        </div>
+        {transfers.length === 0 ? (
+          <p className="section-empty">No transfers yet. Copied files will be listed here.</p>
+        ) : <>
+          <p className="section-description">Most recent first. Original files are left untouched.</p>
 
           <div className="transfer-history">
-            {transfers
-              .filter((transfer) => transfer.status === "completed")
-              .slice(0, 10)
-              .map((transfer) => (
-                <div className="transfer-history-row" key={transfer.id}>
-                  <div>
-                    <strong>
-                      {transfer.sourceRelativePath.split("/").pop()}
-                    </strong>
-                    <span>
-                      {(() => {
-                        const location = locations.find(
-                          (item) => item.id === transfer.destinationLocationId,
-                        );
-                        const locationName =
-                          location?.displayName ||
-                          transfer.destinationLocationId;
+            {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
+              const outcome = transferOutcome(transfer.status);
+              const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
+              const location = locations.find((item) => item.id === transfer.destinationLocationId);
 
-                        return `${locationName} / ${transfer.destinationRelativePath}`;
-                      })()}
-                    </span>
+              return (
+                <div className={`transfer-history-row ${outcome.tone}`} key={transfer.id}>
+                  <div className="transfer-item">
+                    <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                    <TransferPaths
+                      from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
+                      to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
+                    />
+                    {transfer.status === "failed" && transfer.errorMessage && (
+                      <p className="transfer-error">{transfer.errorMessage}</p>
+                    )}
                   </div>
-                  <span>{formatBytes(transfer.copiedBytes)}</span>
-                  <span>{formatDate(transfer.completedAt)}</span>
+                  <span>{size === null ? "" : formatBytes(size)}</span>
+                  <div className="transfer-outcome">
+                    <span className="transfer-status">{outcome.label}</span>
+                    <span>{formatDate(transfer.completedAt ?? transfer.startedAt ?? transfer.createdAt)}</span>
+                  </div>
                 </div>
-              ))}
+              );
+            })}
           </div>
-        </section>
-      )}
+
+          {transfers.length > RECENT_TRANSFER_COUNT && (
+            <button className="transfer-more-button" onClick={() => setShowAllTransfers((showAll) => !showAll)}>
+              {showAllTransfers ? "Show recent only" : `Show all ${transfers.length.toLocaleString()}`}
+            </button>
+          )}
+        </>}
+      </section>}
 
       {catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>

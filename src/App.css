@@ -453,7 +453,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .planned-move-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto 58px;
+  grid-template-columns: minmax(0, 1fr) auto 64px;
   align-items: center;
   gap: 18px;
   padding: 12px 14px;
@@ -465,13 +465,14 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   border-bottom: 0;
 }
 
-.planned-move-main {
+/* One file in a transfer list: name, then where it is copied from and to. */
+.transfer-item {
   display: grid;
   min-width: 0;
   gap: 2px;
 }
 
-.planned-move-main strong {
+.transfer-item strong {
   overflow: hidden;
   font-size: 13px;
   font-weight: 600;
@@ -479,11 +480,23 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   white-space: nowrap;
 }
 
-.planned-move-main > span:not(.planned-path) {
+.transfer-path {
   overflow: hidden;
-  color: var(--text-muted);
+  color: var(--text-body);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.transfer-path > span {
+  display: inline-block;
+  width: 36px;
+  color: var(--text-muted);
+}
+
+.transfer-run-state {
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 /* Shared planned-move line: neutral, never amber (amber means a warning). */
@@ -947,7 +960,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 
 .plan-copy-actions .secondary-button:hover:not(:disabled) {
-  background: var(--surface-hover);
+  background: var(--hover);
 }
 
 .plan-copy-actions .secondary-button:disabled {
@@ -964,7 +977,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 .transfer-history-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto 150px;
-  align-items: center;
+  align-items: start;
   gap: 18px;
   padding: 11px 14px;
   font-size: 12px;
@@ -989,8 +1002,69 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   white-space: nowrap;
 }
 
-.transfer-history-row span {
+.transfer-history-row > span,
+.transfer-outcome > span {
   color: var(--text-muted);
+}
+
+/* Outcome colour is limited to the status word (UI guidelines section 12). */
+.transfer-history-row.completed .transfer-status { color: var(--green); }
+.transfer-history-row.failed .transfer-status { color: var(--error-text); }
+.transfer-history-row.incomplete .transfer-status { color: var(--amber); }
+
+.transfer-error,
+.transfer-result {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.transfer-error,
+.transfer-result.failed {
+  color: var(--error-text);
+}
+
+.transfer-result {
+  margin: 0;
+  color: var(--text-body);
+  font-size: 13px;
+}
+
+.transfer-more-button {
+  margin-top: 8px;
+  border: 0;
+  padding: 4px 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.transfer-more-button:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+/* The running copy: a count, then the file being copied now. */
+.transfer-progress {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--divider);
+  border-bottom: 1px solid var(--divider);
+  font-size: 13px;
+}
+
+.transfer-progress > strong {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.transfer-progress > p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
 }
 
 @media (max-width: 760px) {
@@ -998,7 +1072,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
     grid-template-columns: 1fr auto;
   }
 
-  .transfer-history-row > span:last-child {
+  .transfer-history-row > .transfer-outcome {
     grid-column: 1 / -1;
   }
 }
