@@ -1678,7 +1678,6 @@ function App() {
         <div>
           <p className="eyebrow">DRIVES</p>
           <h1>Your storage</h1>
-          <p className="intro">See what's connected and keep catalogued drives available when they're offline.</p>
         </div>
         <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
           {loading ? "Checking…" : "Refresh"}
@@ -1725,7 +1724,7 @@ function App() {
       </section>}
 
       <section className="section-block">
-        <div className="section-heading"><h2>Connected</h2>{connected.length > 0 && <span className="count-badge">{connected.length}</span>}</div>
+        <div className="section-heading"><h2>Connected</h2></div>
         {!loading && connected.length === 0 && (
           <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive and it will appear here.</p></div>
         )}
@@ -1764,7 +1763,7 @@ function App() {
                               </div>
                             ) : (
                               <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}>
-                                {label ? "Rename" : "Add label"}
+                                {label ? "Edit name" : "Add label"}
                               </button>
                             )
                           )}
@@ -1857,7 +1856,7 @@ function App() {
                             </div>
                           ) : (
                             <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}>
-                              {label ? "Rename" : "Add label"}
+                              {label ? "Edit name" : "Add label"}
                             </button>
                           )}
                         </>
