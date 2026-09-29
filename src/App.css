@@ -37,11 +37,12 @@
   --focus: #2f6fd6;
 
   color-scheme: light dark;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
   color: var(--text);
   background: var(--bg);
   font-synthesis: none;
-  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: auto;
 }
 
 @media (prefers-color-scheme: dark) {
