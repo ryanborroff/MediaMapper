@@ -1427,13 +1427,19 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .browse-drive-card:hover {
   background: var(--hover);
+  border-color: var(--border-control);
 }
 
 .browse-drive-card-top {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
+
+.browse-drive-card-top .folder-chevron { flex: none; }
+.browse-drive-card:hover .folder-chevron,
+.browse-drive-card:focus-visible .folder-chevron { color: var(--text-body); }
 
 .browse-drive-card-top strong {
   color: var(--text);

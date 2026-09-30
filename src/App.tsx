@@ -1484,8 +1484,7 @@ function App() {
         <div className="app-content browse-home">
           <header className="app-header">
             <div>
-              <p className="eyebrow">BROWSE</p>
-              <h1>All files</h1>
+              <h1>Browse</h1>
             </div>
           </header>
 
@@ -1529,12 +1528,12 @@ function App() {
             </section>
           ) : (
             <section className="browse-drives">
-              <div className="section-heading"><h2>Browse by drive</h2></div>
               <div className="browse-drive-grid">
                 {catalogued.map((drive) => (
-                  <button className="browse-drive-card" key={drive.persistentIdentifier} onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>
+                  <button className="browse-drive-card" type="button" key={drive.persistentIdentifier} onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>
                     <span className="browse-drive-card-top">
                       <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
+                      <FolderChevron />
                     </span>
                     <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
                   </button>
