@@ -1051,6 +1051,25 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   text-decoration: underline;
 }
 
+/* Sits under the "To" path, aligned with the filename and path labels. */
+.transfer-reveal-button {
+  justify-self: start;
+  margin: 1px 0 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.transfer-reveal-button:hover,
+.transfer-reveal-button:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 /* The running copy: a count, then the file being copied now. */
 .transfer-progress {
   display: grid;

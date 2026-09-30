@@ -4721,6 +4721,89 @@ async fn open_catalogued_file(
     .await
 }
 
+// Where the file a completed transfer copied is now. Built from the stored
+// destination location and path, so it only succeeds while that location is
+// available and the file has not been moved or deleted since.
+fn completed_transfer_file(
+    connection: &Connection,
+    transfer_id: i64,
+    connected_drives: &[DriveInfo],
+) -> Result<PathBuf, String> {
+    let transfer = connection
+        .query_row(
+            "SELECT t.status, t.destination_relative_path, l.kind, l.drive_id, l.local_path
+             FROM transfers t
+             LEFT JOIN locations l ON l.id = t.destination_location_id
+             WHERE t.id = ?1",
+            params![transfer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read the transfer: {error}"))?;
+
+    let Some((status, relative_path, kind, drive_id, local_path)) = transfer else {
+        return Err("That transfer is no longer in the history.".to_string());
+    };
+    if status != "completed" {
+        return Err("Only completed transfers can be shown in Finder.".to_string());
+    }
+
+    let not_found =
+        || "The copied file is no longer at its destination. It may have been moved or deleted.";
+    validate_catalogue_relative_path(&relative_path).map_err(|_| not_found().to_string())?;
+
+    let Some(root) = connected_location_root(
+        kind.as_deref(),
+        drive_id.as_deref(),
+        local_path.as_deref(),
+        connected_drives,
+    ) else {
+        return Err(if kind.as_deref() == Some("external_drive") {
+            "Connect the destination drive to show this file in Finder.".to_string()
+        } else {
+            not_found().to_string()
+        });
+    };
+
+    let path = root.join(&relative_path);
+    // `open -R` is given this path as an argument, so it must never read as
+    // an option.
+    if !path.is_absolute() {
+        return Err(not_found().to_string());
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => Ok(path),
+        _ => Err(not_found().to_string()),
+    }
+}
+
+#[tauri::command]
+async fn reveal_transferred_file(app: tauri::AppHandle, transfer_id: i64) -> Result<(), String> {
+    run_blocking(move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        let path = completed_transfer_file(&connection, transfer_id, &drives)?;
+
+        // Selects the file in a Finder window rather than opening it.
+        std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|_| "Unable to show the file in Finder.".to_string())?;
+
+        Ok(())
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4764,7 +4847,8 @@ pub fn run() {
             list_transfers,
             list_planned_folder_entries,
             remove_planned_move,
-            open_catalogued_file
+            open_catalogued_file,
+            reveal_transferred_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -6328,6 +6412,155 @@ mod tests {
             contents
         );
         assert_eq!(fs::read(&source_path).unwrap(), contents);
+    }
+
+    fn insert_transfer_record(
+        connection: &Connection,
+        location_id: &str,
+        relative_path: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO transfers (
+                    source_drive_id,
+                    source_relative_path,
+                    destination_location_id,
+                    destination_relative_path,
+                    status,
+                    error_message,
+                    created_at
+                 ) VALUES ('UUID-A', 'film.mov', ?1, ?2, ?3, ?4, 0)",
+                params![location_id, relative_path, status, error_message],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
+    }
+
+    #[test]
+    fn completed_transfer_file_is_the_exact_destination_file() {
+        let database = TestDatabase::new("reveal-drive");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-reveal-drive-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(volume.0.join("Archive")).unwrap();
+        fs::write(volume.0.join("Archive/film.mov"), b"film").unwrap();
+
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        let drives = vec![test_drive("UUID-B", "Backup", &volume.0, 10_000)];
+
+        let completed = insert_transfer_record(
+            &connection,
+            "drive:UUID-B",
+            "Archive/film.mov",
+            "completed",
+            None,
+        );
+        assert_eq!(
+            completed_transfer_file(&connection, completed, &drives).unwrap(),
+            volume.0.join("Archive/film.mov")
+        );
+
+        // The drive is not connected.
+        let error = completed_transfer_file(&connection, completed, &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "Connect the destination drive to show this file in Finder."
+        );
+
+        // The file was moved or deleted after the transfer.
+        fs::rename(volume.0.join("Archive/film.mov"), volume.0.join("film.mov")).unwrap();
+        let error = completed_transfer_file(&connection, completed, &drives).unwrap_err();
+        assert!(error.contains("moved or deleted"), "{error}");
+
+        // A folder now at that path is not the copied file.
+        fs::create_dir(volume.0.join("Archive/film.mov")).unwrap();
+        let error = completed_transfer_file(&connection, completed, &drives).unwrap_err();
+        assert!(error.contains("moved or deleted"), "{error}");
+    }
+
+    #[test]
+    fn only_completed_transfers_have_a_file_to_show() {
+        let database = TestDatabase::new("reveal-status");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-reveal-status-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&volume.0).unwrap();
+        // Even with a file at the destination path, only a completed
+        // transfer put it there.
+        fs::write(volume.0.join("film.mov"), b"film").unwrap();
+
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        let drives = vec![test_drive("UUID-B", "Backup", &volume.0, 10_000)];
+
+        let failed = insert_transfer_record(
+            &connection,
+            "drive:UUID-B",
+            "film.mov",
+            "failed",
+            Some("Verification failed."),
+        );
+        let cancelled = insert_transfer_record(
+            &connection,
+            "drive:UUID-B",
+            "film.mov",
+            "failed",
+            Some(TRANSFER_CANCELLED),
+        );
+        let copying =
+            insert_transfer_record(&connection, "drive:UUID-B", "film.mov", "copying", None);
+
+        for transfer in [failed, cancelled, copying] {
+            assert_eq!(
+                completed_transfer_file(&connection, transfer, &drives).unwrap_err(),
+                "Only completed transfers can be shown in Finder."
+            );
+        }
+        assert_eq!(
+            completed_transfer_file(&connection, 9_999, &drives).unwrap_err(),
+            "That transfer is no longer in the history."
+        );
+    }
+
+    #[test]
+    fn completed_transfer_file_resolves_local_folder_destinations() {
+        let database = TestDatabase::new("reveal-folder");
+        let folder = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-reveal-folder-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        fs::create_dir_all(&folder.0).unwrap();
+        fs::write(folder.0.join("film.mov"), b"film").unwrap();
+
+        let connection = open_database(&database.0).unwrap();
+        connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, drive_id, local_path, created_at)
+                 VALUES ('folder:test', 'local_folder', 'Films', NULL, ?1, 0)",
+                params![folder.0.to_string_lossy()],
+            )
+            .unwrap();
+
+        let completed =
+            insert_transfer_record(&connection, "folder:test", "film.mov", "completed", None);
+        assert_eq!(
+            completed_transfer_file(&connection, completed, &[]).unwrap(),
+            folder.0.join("film.mov")
+        );
+
+        fs::remove_file(folder.0.join("film.mov")).unwrap();
+        let error = completed_transfer_file(&connection, completed, &[]).unwrap_err();
+        assert!(error.contains("moved or deleted"), "{error}");
     }
 
     #[test]

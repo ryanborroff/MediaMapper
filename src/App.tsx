@@ -1212,6 +1212,19 @@ function App() {
                             from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                             to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
                           />
+                          {transfer.status === "completed" && (
+                            <button
+                              className="transfer-reveal-button"
+                              type="button"
+                              onClick={() => {
+                                setError(null);
+                                void invoke("reveal_transferred_file", { transferId: transfer.id })
+                                  .catch((reason) => setError(String(reason)));
+                              }}
+                            >
+                              Show in Finder
+                            </button>
+                          )}
                           {outcome.tone === "failed" && transfer.errorMessage && <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>}
                         </div>
                         <span className="transfer-history-size">{size === null ? "" : formatBytes(size)}</span>
