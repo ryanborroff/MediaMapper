@@ -1263,14 +1263,6 @@ function App() {
                 </section>
               )}
 
-              {planReady && (
-                <section className="connect-instruction ready">
-                  <span className="connect-instruction-label">READY</span>
-                  <h2>Required locations are connected</h2>
-                  <p>MediaMapper will copy directly from source to destination and verify each file.</p>
-                </section>
-              )}
-
               {(planPreflight?.issues.length ?? 0) > 0 && missingNames.length === 0 && (
                 <section className="plan-attention">
                   <strong>Plan needs attention</strong>
@@ -1285,10 +1277,13 @@ function App() {
                     <div className="plan-file-row" key={move.id}>
                       <div className="transfer-item">
                         <strong>{move.sourceName}</strong>
-                        <TransferPaths from={paths.from} to={paths.to} />
+                        <span className="transfer-path" title={paths.from}>{paths.from}</span>
+                        <span className="transfer-path" title={paths.to}><span className="plan-destination-arrow">→</span>{paths.to}</span>
                       </div>
-                      <span>{formatBytes(move.sourceSizeBytes)}</span>
-                      <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                      <div className="plan-file-side">
+                        <span>{formatBytes(move.sourceSizeBytes)}</span>
+                        <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                      </div>
                     </div>
                   );
                 })}
@@ -1296,12 +1291,12 @@ function App() {
 
               <section className="plan-review">
                 <div>
-                  <strong>{fileMoves.length.toLocaleString()} {fileMoves.length === 1 ? "file" : "files"} · {formatBytes(knownBytes)}</strong>
+                  <strong>{fileMoves.length.toLocaleString()} {fileMoves.length === 1 ? "file" : "files"} · {formatBytes(knownBytes)} will be copied</strong>
                   <span>Originals remain untouched.</span>
                   {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
                 </div>
                 {!showCopyConfirmation ? (
-                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Review copy</button>
+                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Continue</button>
                 ) : (
                   <div className="plan-copy-actions">
                     <button className="secondary-button" disabled={executingPlan} onClick={() => setShowCopyConfirmation(false)}>Cancel</button>

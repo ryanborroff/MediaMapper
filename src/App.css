@@ -1540,10 +1540,6 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   background: var(--surface-subtle);
 }
 
-.connect-instruction.ready {
-  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
-}
-
 .connect-instruction-label {
   color: var(--text-muted);
   font-size: 10px;
@@ -1586,11 +1582,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   border-radius: 12px;
 }
 
+/* Name, source and → destination on the left; size above Remove on the
+   right, lined up with the name and the destination. */
 .plan-file-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 100px 70px;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 18px;
-  align-items: center;
   padding: 13px 16px;
   border-bottom: 1px solid var(--divider);
 }
@@ -1599,10 +1596,33 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   border-bottom: 0;
 }
 
-.plan-file-row > span {
+.plan-file-row .transfer-item {
+  gap: 4px;
+}
+
+.plan-file-row .transfer-item strong {
+  margin-bottom: 1px;
+}
+
+/* Overrides the From/To label styling of `.transfer-path > span`. */
+.plan-file-row .transfer-path > .plan-destination-arrow {
+  width: auto;
+  margin-right: 6px;
+  color: inherit;
+}
+
+.plan-file-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.plan-file-side > span {
   color: var(--text-muted);
   font-size: 12px;
-  text-align: right;
+  white-space: nowrap;
 }
 
 .plan-review {
@@ -1637,15 +1657,6 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 @media (max-width: 760px) {
   .plan-overview {
     grid-template-columns: 1fr;
-  }
-
-  .plan-file-row {
-    grid-template-columns: minmax(0, 1fr) 70px;
-  }
-
-  .plan-file-row .plan-remove-button {
-    grid-column: 1 / -1;
-    justify-self: start;
   }
 
   .plan-review {
