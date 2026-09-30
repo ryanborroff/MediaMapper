@@ -1629,7 +1629,7 @@ function App() {
                 <section className="connect-instruction">
                   <span className="connect-instruction-label">NEXT STEP</span>
                   <h2>Connect {missingNames.join(" and ")}</h2>
-                  <p>{missingNames.length === 1 ? "This location is" : "These locations are"} required before the planned transfer can run. No files will be staged on this Mac.</p>
+                  <p>Connect {missingNames.join(" and ")} before starting the transfer. Files will be copied directly between the connected drives.</p>
                 </section>
               )}
 
