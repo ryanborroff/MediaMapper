@@ -435,6 +435,9 @@ function App() {
   const [driveLabelDraft, setDriveLabelDraft] = useState("");
   const [savingDriveLabel, setSavingDriveLabel] = useState(false);
   const [selectedPlanEntry, setSelectedPlanEntry] = useState<CatalogueEntry | null>(null);
+  // The drive the item being planned is on. Global search plans items from
+  // any drive without opening it, so this is not always the browsed drive.
+  const [planSourceDrive, setPlanSourceDrive] = useState<CataloguedDrive | null>(null);
   // Why the plan panel's last action was refused. Shown inside the panel: the
   // page's error banner is at the top, out of sight below a long folder.
   const [planError, setPlanError] = useState<string | null>(null);
@@ -925,8 +928,20 @@ function App() {
     });
   };
 
-  const beginPlanMove = (entry: CatalogueEntry) => {
+  // Opens a catalogued file in its default app. Browse rows and search
+  // results share this, so every format and every failure reads the same.
+  const openCataloguedFile = (driveId: string, driveName: string, relativePath: string) => {
+    if (!connectedIds.has(driveId)) {
+      setError(`Connect ${driveName} to open this file.`);
+      return;
+    }
+    void invoke("open_catalogued_file", { driveId, relativePath })
+      .catch((reason) => setError(String(reason)));
+  };
+
+  const beginPlanMove = (drive: CataloguedDrive, entry: CatalogueEntry) => {
     setSelectedPlanEntry(entry);
+    setPlanSourceDrive(drive);
     // Do not preselect the source drive. Planning should begin with an
     // intentional destination choice rather than an immediate invalid state.
     setPlanDestinationLocationId("");
@@ -966,7 +981,7 @@ function App() {
   };
 
   const savePlannedMove = async () => {
-    if (!browserDrive || !selectedPlanEntry || !planDestinationLocationId) return;
+    if (!planSourceDrive || !selectedPlanEntry || !planDestinationLocationId) return;
 
     const folder = normaliseFolderInput(planDestinationFolder);
     const destinationRelativePath = folder
@@ -978,13 +993,13 @@ function App() {
 
     try {
       await invoke<number>("create_planned_move", {
-        sourceDriveId: browserDrive.persistentIdentifier,
+        sourceDriveId: planSourceDrive.persistentIdentifier,
         sourceRelativePath: selectedPlanEntry.relativePath,
         destinationLocationId: planDestinationLocationId,
         destinationRelativePath,
       });
       await loadPlannedMoves();
-      await openFolder(browserDrive, browserPath);
+      if (browserDrive) await openFolder(browserDrive, browserPath);
 
       setSelectedPlanEntry(null);
       setPlanDestinationFolder("");
@@ -1053,6 +1068,214 @@ function App() {
     } catch (cause) {
       setError(String(cause));
     }
+  };
+
+  // The destination panel Add to plan opens, shared by a browsed folder and
+  // global search. It plans the item from the drive it was picked on.
+  const renderPlanPanel = () => {
+    if (!selectedPlanEntry || !planSourceDrive) return null;
+
+    const normalisedPlanFolder = normaliseFolderInput(planDestinationFolder);
+    const proposedDestinationPath = normalisedPlanFolder
+      ? `${normalisedPlanFolder}/${selectedPlanEntry.name}`
+      : selectedPlanEntry.name;
+
+    const planIsCurrentLocation =
+      planDestinationLocationId === `drive:${planSourceDrive.persistentIdentifier}` &&
+      proposedDestinationPath === selectedPlanEntry.relativePath;
+
+    return (
+  <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
+            <div className="plan-move-heading">
+              <div>
+                <h2>Add to plan</h2>
+                <p className="plan-file-summary" title={selectedPlanEntry.name}>
+                  {selectedPlanEntry.name}
+                </p>
+              </div>
+              <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
+            </div>
+
+            <div className="plan-fields compact-plan-fields">
+              <label>
+                <span>Location</span>
+                <select
+                  ref={planLocationSelect}
+                  value={planDestinationLocationId}
+                  onChange={(event) => {
+                    if (event.target.value === "__choose_mac__") {
+                      void addFolderOnThisMac();
+                      return;
+                    }
+                    setPlanDestinationLocationId(event.target.value);
+                    setPlanDestinationFolder("");
+                    setFolderPickerOpen(false);
+                    setPlanError(null);
+                  }}
+                >
+                  <option value="">Choose a location</option>
+                  <option value="__choose_mac__">Choose a folder on this Mac…</option>
+
+                  <optgroup label="External drives">
+                    {locations
+                      .filter((location) => location.kind === "external_drive")
+                      .map((location) => (
+                        <option key={location.id} value={location.id}>
+                          {location.userLabel ?? location.displayName}
+                          {location.driveId && connectedIds.has(location.driveId)
+                            ? " · Connected"
+                            : " · Offline"}
+                        </option>
+                      ))}
+                  </optgroup>
+
+                  {locations.some((location) => location.kind === "local_folder") && (
+                    <optgroup label="This Mac">
+                      {locations
+                        .filter((location) => location.kind === "local_folder")
+                        .map((location) => (
+                          <option key={location.id} value={location.id}>
+                            {location.displayName}
+                          </option>
+                        ))}
+                    </optgroup>
+                  )}
+                </select>
+              </label>
+
+              <label>
+                <span>Folder</span>
+                {(() => {
+                  const destination = locations.find(
+                    (location) => location.id === planDestinationLocationId,
+                  );
+                  const canBrowseCatalogue =
+                    destination?.kind === "external_drive" && Boolean(destination.driveId);
+
+                  return canBrowseCatalogue ? (
+                    <button
+                      type="button"
+                      className="folder-picker-button"
+                      aria-expanded={folderPickerOpen}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void openDestinationFolderPicker(planDestinationFolder);
+                      }}
+                    >
+                      <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
+                        {planDestinationFolder || "Top level"}
+                      </span>
+                      <span className="folder-picker-choose">Choose…</span>
+                    </button>
+                  ) : (
+                    <div className="folder-picker-readonly">
+                      {destination?.kind === "local_folder"
+                        ? "Selected folder"
+                        : "Choose a location first"}
+                    </div>
+                  );
+                })()}
+              </label>
+            </div>
+
+            {folderPickerOpen && (() => {
+              const parts = folderPickerPath ? folderPickerPath.split("/") : [];
+
+              return (
+                <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
+                  <div className="folder-picker-header">
+                    <strong>Choose folder</strong>
+                    <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
+                  </div>
+                  <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
+                    <button type="button" onClick={() => void openDestinationFolderPicker("")}>
+                      Top level
+                    </button>
+                    {parts.map((part, index) => {
+                      const path = parts.slice(0, index + 1).join("/");
+                      return (
+                        <span key={path}>
+                          <span>/</span>
+                          <button type="button" onClick={() => void openDestinationFolderPicker(path)}>
+                            {part}
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </nav>
+                  <div className="folder-picker-list">
+                    {folderPickerLoading ? (
+                      <div className="folder-picker-empty">Loading folders…</div>
+                    ) : folderPickerEntries.length === 0 ? (
+                      <div className="folder-picker-empty">No folders inside this folder.</div>
+                    ) : folderPickerEntries.map((entry) => (
+                      <button
+                        type="button"
+                        key={entry.relativePath}
+                        onClick={() => void openDestinationFolderPicker(entry.relativePath)}
+                      >
+                        <span>{entry.name}</span><span>›</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="folder-picker-footer">
+                    <button
+                      type="button"
+                      className="browse-button"
+                      onClick={() => {
+                        setPlanDestinationFolder(folderPickerPath);
+                        setFolderPickerOpen(false);
+                      }}
+                    >
+                      Choose this folder
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {planDestinationLocationId && (
+              <div className="plan-destination-preview">
+                <span>Will be copied to</span>
+                <strong title={(() => {
+                  const destination = locations.find(
+                    (location) => location.id === planDestinationLocationId,
+                  );
+                  const destinationName =
+                    destination?.userLabel ?? destination?.displayName ?? "Destination";
+                  return formatLocationPath(destinationName, normalisedPlanFolder);
+                })()}>
+                  {(() => {
+                    const destination = locations.find(
+                      (location) => location.id === planDestinationLocationId,
+                    );
+                    const destinationName =
+                      destination?.userLabel ?? destination?.displayName ?? "Destination";
+                    return formatLocationPath(destinationName, normalisedPlanFolder);
+                  })()}
+                </strong>
+              </div>
+            )}
+
+            <div className="plan-actions compact-plan-actions">
+              {planError ? (
+                <span className="plan-location-warning" role="alert">{planError}</span>
+              ) : planIsCurrentLocation ? (
+                <span className="plan-location-warning">Choose a different destination.</span>
+              ) : (
+                <span>Nothing is copied until you run the plan.</span>
+              )}
+              <button
+                className="browse-button"
+                disabled={!planDestinationLocationId || savingPlan || planIsCurrentLocation}
+                onClick={() => void savePlannedMove()}
+              >
+                {savingPlan ? "Saving…" : "Add to plan"}
+              </button>
+            </div>
+          </section>
+    );
   };
 
   const cancelScan = async (persistentIdentifier: string) => {
@@ -1470,6 +1693,10 @@ function App() {
   }
 
     if (activeView === "browse" && !browserDrive) {
+    const plannedMoveBySource = new Map(
+      plannedMoves.map((move) => [`${move.sourceDriveId}\u0000${move.sourceRelativePath}`, move]),
+    );
+
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
@@ -1513,18 +1740,85 @@ function App() {
               </div>
               {librarySearching ? <div className="browser-message">Searching catalogues…</div>
               : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-              : visibleLibraryResults.map((result) => (
-                <button className="browse-result-row" key={`${result.driveId}:${result.relativePath}`} onClick={() => void openLibraryResult(result)}>
-                  <span className="browse-result-name">
-                    <strong>{result.name}</strong>
-                    <span>{formatLocationPath(driveDisplayName(result.driveId, result.driveName), parentFolder(result.relativePath))}</span>
-                  </span>
-                  <span className={connectedIds.has(result.driveId) ? "browse-drive-state connected" : "browse-drive-state"}>
-                    {connectedIds.has(result.driveId) ? "Connected" : "Offline"}
-                  </span>
-                  <span>{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
-                </button>
-              ))}
+              : visibleLibraryResults.map((result) => {
+                const driveName = driveDisplayName(result.driveId, result.driveName);
+                const location = formatLocationPath(driveName, parentFolder(result.relativePath));
+                const plannedMove = plannedMoveBySource.get(`${result.driveId}\u0000${result.relativePath}`);
+                return (
+                  <div
+                    className="browse-result-row"
+                    key={`${result.driveId}:${result.relativePath}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => void openLibraryResult(result)}
+                    onKeyDown={(event) => {
+                      // Enter on the name or action buttons belongs to them.
+                      if (event.key === "Enter" && event.target === event.currentTarget) {
+                        event.preventDefault();
+                        void openLibraryResult(result);
+                      }
+                    }}
+                  >
+                    <span className="browse-result-name">
+                      {result.isDirectory ? (
+                        <strong>{result.name}</strong>
+                      ) : (
+                        <button
+                          className="file-open-button browse-result-open"
+                          type="button"
+                          title={`Open ${result.name}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            // The second click of a double-click would open it again.
+                            if (event.detail <= 1) {
+                              openCataloguedFile(result.driveId, driveName, result.relativePath);
+                            }
+                          }}
+                        >
+                          {result.name}
+                        </button>
+                      )}
+                      <span className="browse-result-meta">
+                        <span title={location}>{location}</span>
+                        {!connectedIds.has(result.driveId) && <span className="browse-drive-state">Drive offline</span>}
+                      </span>
+                    </span>
+                    <span className="browse-result-size">{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
+                    <span className="row-action">
+                      {result.isDirectory ? (
+                        <FolderChevron />
+                      ) : plannedMove ? (
+                        <button
+                          className="plan-remove-button"
+                          type="button"
+                          disabled={executingPlan}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void removePlannedMove(plannedMove.id);
+                          }}
+                        >
+                          Remove
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
+                            if (!drive) {
+                              setError("That drive catalogue is no longer available.");
+                              return;
+                            }
+                            beginPlanMove(drive, result);
+                          }}
+                        >
+                          Add to plan
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                );
+              })}
             </section>
           ) : (
             <section className="browse-drives">
@@ -1542,6 +1836,8 @@ function App() {
               {catalogued.length === 0 && <div className="empty-state compact"><h3>No catalogued drives</h3><p>Scan a drive first, then its files will appear here.</p></div>}
             </section>
           )}
+
+          {renderPlanPanel()}
         </div>
       </main>
     );
@@ -1549,21 +1845,8 @@ function App() {
 
     if (browserDrive) {
     const liveDrive = catalogued.find((drive) => drive.persistentIdentifier === browserDrive.persistentIdentifier) ?? browserDrive;
-    const online = connectedIds.has(liveDrive.persistentIdentifier);
     const liveDriveName = driveDisplayName(liveDrive.persistentIdentifier, liveDrive.name);
     const liveDriveHasLabel = liveDriveName !== liveDrive.name;
-
-    const normalisedPlanFolder = normaliseFolderInput(planDestinationFolder);
-    const proposedDestinationPath = selectedPlanEntry
-      ? (normalisedPlanFolder
-          ? `${normalisedPlanFolder}/${selectedPlanEntry.name}`
-          : selectedPlanEntry.name)
-      : "";
-
-    const planIsCurrentLocation =
-      selectedPlanEntry !== null &&
-      planDestinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
-      proposedDestinationPath === selectedPlanEntry.relativePath;
 
     const plannedMoveBySourcePath = new Map(
       plannedMoves
@@ -1717,14 +2000,7 @@ function App() {
 
                 const openFile = () => {
                   if (!entry.isDirectory) {
-                    if (!online) {
-                      setError(`Connect ${liveDriveName} to open this file.`);
-                      return;
-                    }
-                    void invoke("open_catalogued_file", {
-                      driveId: liveDrive.persistentIdentifier,
-                      relativePath: entry.relativePath,
-                    }).catch((reason) => setError(String(reason)));
+                    openCataloguedFile(liveDrive.persistentIdentifier, liveDriveName, entry.relativePath);
                   }
                 };
 
@@ -1849,7 +2125,7 @@ function App() {
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            beginPlanMove(entry);
+                            beginPlanMove(liveDrive, entry);
                           }}
                         >
                           Add to plan
@@ -1909,196 +2185,7 @@ function App() {
           )}
         </section>}
 
-        {selectedPlanEntry && <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
-          <div className="plan-move-heading">
-            <div>
-              <h2>Add to plan</h2>
-              <p className="plan-file-summary" title={selectedPlanEntry.name}>
-                {selectedPlanEntry.name}
-              </p>
-            </div>
-            <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
-          </div>
-
-          <div className="plan-fields compact-plan-fields">
-            <label>
-              <span>Location</span>
-              <select
-                ref={planLocationSelect}
-                value={planDestinationLocationId}
-                onChange={(event) => {
-                  if (event.target.value === "__choose_mac__") {
-                    void addFolderOnThisMac();
-                    return;
-                  }
-                  setPlanDestinationLocationId(event.target.value);
-                  setPlanDestinationFolder("");
-                  setFolderPickerOpen(false);
-                  setPlanError(null);
-                }}
-              >
-                <option value="">Choose a location</option>
-                <option value="__choose_mac__">Choose a folder on this Mac…</option>
-
-                <optgroup label="External drives">
-                  {locations
-                    .filter((location) => location.kind === "external_drive")
-                    .map((location) => (
-                      <option key={location.id} value={location.id}>
-                        {location.userLabel ?? location.displayName}
-                        {location.driveId && connectedIds.has(location.driveId)
-                          ? " · Connected"
-                          : " · Offline"}
-                      </option>
-                    ))}
-                </optgroup>
-
-                {locations.some((location) => location.kind === "local_folder") && (
-                  <optgroup label="This Mac">
-                    {locations
-                      .filter((location) => location.kind === "local_folder")
-                      .map((location) => (
-                        <option key={location.id} value={location.id}>
-                          {location.displayName}
-                        </option>
-                      ))}
-                  </optgroup>
-                )}
-              </select>
-            </label>
-
-            <label>
-              <span>Folder</span>
-              {(() => {
-                const destination = locations.find(
-                  (location) => location.id === planDestinationLocationId,
-                );
-                const canBrowseCatalogue =
-                  destination?.kind === "external_drive" && Boolean(destination.driveId);
-
-                return canBrowseCatalogue ? (
-                  <button
-                    type="button"
-                    className="folder-picker-button"
-                    aria-expanded={folderPickerOpen}
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void openDestinationFolderPicker(planDestinationFolder);
-                    }}
-                  >
-                    <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
-                      {planDestinationFolder || "Top level"}
-                    </span>
-                    <span className="folder-picker-choose">Choose…</span>
-                  </button>
-                ) : (
-                  <div className="folder-picker-readonly">
-                    {destination?.kind === "local_folder"
-                      ? "Selected folder"
-                      : "Choose a location first"}
-                  </div>
-                );
-              })()}
-            </label>
-          </div>
-
-          {folderPickerOpen && (() => {
-            const parts = folderPickerPath ? folderPickerPath.split("/") : [];
-
-            return (
-              <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
-                <div className="folder-picker-header">
-                  <strong>Choose folder</strong>
-                  <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
-                </div>
-                <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
-                  <button type="button" onClick={() => void openDestinationFolderPicker("")}>
-                    Top level
-                  </button>
-                  {parts.map((part, index) => {
-                    const path = parts.slice(0, index + 1).join("/");
-                    return (
-                      <span key={path}>
-                        <span>/</span>
-                        <button type="button" onClick={() => void openDestinationFolderPicker(path)}>
-                          {part}
-                        </button>
-                      </span>
-                    );
-                  })}
-                </nav>
-                <div className="folder-picker-list">
-                  {folderPickerLoading ? (
-                    <div className="folder-picker-empty">Loading folders…</div>
-                  ) : folderPickerEntries.length === 0 ? (
-                    <div className="folder-picker-empty">No folders inside this folder.</div>
-                  ) : folderPickerEntries.map((entry) => (
-                    <button
-                      type="button"
-                      key={entry.relativePath}
-                      onClick={() => void openDestinationFolderPicker(entry.relativePath)}
-                    >
-                      <span>{entry.name}</span><span>›</span>
-                    </button>
-                  ))}
-                </div>
-                <div className="folder-picker-footer">
-                  <button
-                    type="button"
-                    className="browse-button"
-                    onClick={() => {
-                      setPlanDestinationFolder(folderPickerPath);
-                      setFolderPickerOpen(false);
-                    }}
-                  >
-                    Choose this folder
-                  </button>
-                </div>
-              </div>
-            );
-          })()}
-
-          {planDestinationLocationId && (
-            <div className="plan-destination-preview">
-              <span>Will be copied to</span>
-              <strong title={(() => {
-                const destination = locations.find(
-                  (location) => location.id === planDestinationLocationId,
-                );
-                const destinationName =
-                  destination?.userLabel ?? destination?.displayName ?? "Destination";
-                return formatLocationPath(destinationName, normalisedPlanFolder);
-              })()}>
-                {(() => {
-                  const destination = locations.find(
-                    (location) => location.id === planDestinationLocationId,
-                  );
-                  const destinationName =
-                    destination?.userLabel ?? destination?.displayName ?? "Destination";
-                  return formatLocationPath(destinationName, normalisedPlanFolder);
-                })()}
-              </strong>
-            </div>
-          )}
-
-          <div className="plan-actions compact-plan-actions">
-            {planError ? (
-              <span className="plan-location-warning" role="alert">{planError}</span>
-            ) : planIsCurrentLocation ? (
-              <span className="plan-location-warning">Choose a different destination.</span>
-            ) : (
-              <span>Nothing is copied until you run the plan.</span>
-            )}
-            <button
-              className="browse-button"
-              disabled={!planDestinationLocationId || savingPlan || planIsCurrentLocation}
-              onClick={() => void savePlannedMove()}
-            >
-              {savingPlan ? "Saving…" : "Add to plan"}
-            </button>
-          </div>
-        </section>}
+        {renderPlanPanel()}
 
         </div>
       </main>

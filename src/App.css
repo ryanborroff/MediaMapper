@@ -1360,7 +1360,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 .browse-result-row {
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 100px 100px;
+  grid-template-columns: minmax(0, 1fr) 80px 84px;
   gap: 20px;
   align-items: center;
   padding: 12px 10px;
@@ -1398,13 +1398,33 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   white-space: nowrap;
 }
 
-.browse-drive-state {
-  color: var(--text-muted);
-  font-size: 12px;
+.browse-result-name .browse-result-open {
+  justify-self: start;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.browse-drive-state.connected {
-  color: var(--green);
+/* The path truncates; its title holds the full path. A drive status sits
+   beside it and never truncates. */
+.browse-result-name .browse-result-meta {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.browse-result-meta > span:first-child {
+  min-width: 0;
+}
+
+.browse-result-name .browse-drive-state {
+  flex: none;
+  overflow: visible;
+}
+
+.browse-result-size {
+  text-align: right;
 }
 
 .browse-drive-grid {
@@ -1458,10 +1478,10 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   }
 
   .browse-result-row {
-    grid-template-columns: minmax(0, 1fr) 80px;
+    grid-template-columns: minmax(0, 1fr) 84px;
   }
 
-  .browse-result-row > :last-child {
+  .browse-result-row > .browse-result-size {
     display: none;
   }
 }
