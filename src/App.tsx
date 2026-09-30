@@ -1629,7 +1629,7 @@ function App() {
                 <section className="connect-instruction">
                   <span className="connect-instruction-label">NEXT STEP</span>
                   <h2>Connect {missingNames.join(" and ")}</h2>
-                  <p>Connect {missingNames.join(" and ")} before starting the transfer. Files will be copied directly between the connected drives.</p>
+                  <p>Files will be copied directly between the connected drives.</p>
                 </section>
               )}
 
