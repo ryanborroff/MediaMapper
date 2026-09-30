@@ -1895,7 +1895,6 @@ function App() {
         <div className="app-content browse-detail">
           <header className="app-header browse-detail-header">
             <div>
-              <p className="eyebrow">BROWSE</p>
               <nav className="browse-detail-breadcrumb" aria-label="Browse path">
                 <button type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>All files</button>
                 <span>/</span>
