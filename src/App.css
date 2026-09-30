@@ -1625,6 +1625,74 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   white-space: nowrap;
 }
 
+.plan-transfer-progress {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+}
+
+.plan-transfer-progress-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+
+.plan-transfer-progress > strong {
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.plan-transfer-progress .transfer-path {
+  margin-top: 1px;
+}
+
+.plan-transfer-progress-bar {
+  height: 5px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--track);
+}
+
+.plan-transfer-progress-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--bar);
+}
+
+.plan-transfer-progress p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-transfer-progress .secondary-button {
+  justify-self: start;
+  margin-top: 6px;
+}
+
+.plan-transfer-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.plan-transfer-result-actions .section-action,
+.plan-transfer-result-actions .browse-button {
+  margin: 0;
+}
+
 .plan-review {
   display: flex;
   align-items: center;
