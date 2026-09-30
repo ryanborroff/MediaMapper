@@ -470,9 +470,9 @@ function App() {
     setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
-    const copiedSoFar = () => completed === 0
-      ? "Nothing was copied."
-      : `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified.`;
+    const cancelledMessage = () => completed === 0
+      ? "Copy cancelled. No files were copied. Planned transfers are unchanged."
+      : `Copy cancelled. ${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified. The remaining files stay planned.`;
 
     try {
       // The backend reruns final live validation immediately before every
@@ -491,11 +491,11 @@ function App() {
       setExecutionResult(cancelRequested.current && completed < readyMoves.length
         ? {
           stopped: true,
-          message: `Copy cancelled. ${copiedSoFar()} The rest stay planned.${skippedNote}`,
+          message: `${cancelledMessage()}${skippedNote}`,
         }
         : {
           stopped: false,
-          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals were left untouched.${skippedNote}`,
+          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals stay in place.${skippedNote}`,
         });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
@@ -503,7 +503,7 @@ function App() {
       setExecutionResult({
         stopped: true,
         message: cancelled
-          ? `Copy cancelled. ${copiedSoFar()} The file being copied was not finished; it and the rest stay planned.${skippedNote}`
+          ? `${cancelledMessage()}${skippedNote}`
           : completed > 0
             ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
             : `Nothing was copied. ${String(cause)}${skippedNote}`,
@@ -1209,7 +1209,14 @@ function App() {
           : [];
       }),
     ]));
-    const planReady = plannedMoves.length > 0 && planValidation?.ready === true && (planPreflight?.issues.length ?? 0) === 0;
+    const planIssues = [
+      ...(planValidation?.issues ?? []),
+      ...(planPreflight?.issues ?? []),
+    ];
+    const planReady =
+      plannedMoves.length > 0 &&
+      planValidation?.ready === true &&
+      (planPreflight?.issues.length ?? 0) === 0;
     const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
 
     return (
@@ -1234,12 +1241,82 @@ function App() {
 
           {error && <div className="notice error">{error}</div>}
 
+          {executionProgress && (() => {
+            const { moves, completed } = executionProgress;
+            const current = moves[Math.min(completed, moves.length - 1)];
+            const paths = plannedMovePaths(current);
+            const currentFileProgress =
+              fileProgress?.plannedMoveId === current.id ? fileProgress : null;
+            const percent = currentFileProgress
+              ? (currentFileProgress.totalBytes > 0
+                ? Math.min(100, Math.floor((currentFileProgress.bytes / currentFileProgress.totalBytes) * 100))
+                : 100)
+              : null;
+            const fileIndex = Math.min(completed + 1, moves.length);
+
+            return (
+              <section className="plan-transfer-progress" aria-live="polite">
+                <span className="plan-transfer-progress-label">
+                  {currentFileProgress
+                    ? (currentFileProgress.stage === "copying" ? "COPYING" : "VERIFYING")
+                    : "PREPARING"}
+                </span>
+                <strong>{current.sourceName}</strong>
+                <TransferPaths from={paths.from} to={paths.to} />
+                {currentFileProgress && percent !== null ? (
+                  <>
+                    <div
+                      className="plan-transfer-progress-bar"
+                      role="progressbar"
+                      aria-label={currentFileProgress.stage === "copying" ? "Copying" : "Verifying"}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={percent}
+                    >
+                      <span style={{ width: `${percent}%` }} />
+                    </div>
+                    <p>
+                      {currentFileProgress.stage === "copying" ? "Copying" : "Verifying"}{" "}
+                      {formatBytes(currentFileProgress.bytes)} of {formatBytes(currentFileProgress.totalBytes)} · {percent}%
+                    </p>
+                  </>
+                ) : (
+                  <p>Preparing transfer…</p>
+                )}
+                <p>File {fileIndex.toLocaleString()} of {moves.length.toLocaleString()}</p>
+                <p>Originals stay in place.</p>
+                <button className="secondary-button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
+                  {cancellingCopy ? "Cancelling…" : "Cancel copy"}
+                </button>
+              </section>
+            );
+          })()}
+
+          {!executionProgress && executionResult && (
+            <section className="plan-transfer-progress" aria-live="polite">
+              <span className="plan-transfer-progress-label">
+                {executionResult.stopped ? "TRANSFER STOPPED" : "TRANSFER COMPLETE"}
+              </span>
+              <p>{executionResult.message}</p>
+              <div className="plan-transfer-result-actions">
+                <button className="section-action" type="button" onClick={() => setActiveView("transfers")}>
+                  View transfers
+                </button>
+                <button className="browse-button" type="button" onClick={() => setExecutionResult(null)}>
+                  {executionResult.stopped ? "Dismiss" : "Done"}
+                </button>
+              </div>
+            </section>
+          )}
+
           {plannedMoves.length === 0 ? (
+            executionResult && !executionProgress && !executionResult.stopped ? null : (
             <section className="plan-empty">
               <h2>Nothing planned yet</h2>
               <p>Browse your catalogued files and choose Plan move to add files here.</p>
               <button className="browse-button" type="button" onClick={() => setActiveView("browse")}>Browse files</button>
             </section>
+            )
           ) : (
             <>
               <section className="plan-overview">
@@ -1249,8 +1326,14 @@ function App() {
                 </div>
                 <div>
                   <span>Status</span>
-                  <strong className={planReady ? "plan-ready-text" : "plan-waiting-text"}>
-                    {planReady ? "Ready to transfer" : missingNames.length > 0 ? `Waiting for ${missingNames.join(" and ")}` : "Needs attention"}
+                  <strong className={executingPlan || !planReady ? "plan-waiting-text" : "plan-ready-text"}>
+                    {executingPlan
+                      ? "Transferring"
+                      : planReady
+                        ? "Ready to transfer"
+                        : missingNames.length > 0
+                          ? `Waiting for ${missingNames.join(" and ")}`
+                          : "Needs attention"}
                   </strong>
                 </div>
               </section>
@@ -1263,10 +1346,14 @@ function App() {
                 </section>
               )}
 
-              {(planPreflight?.issues.length ?? 0) > 0 && missingNames.length === 0 && (
+              {planIssues.length > 0 && missingNames.length === 0 && (
                 <section className="plan-attention">
                   <strong>Plan needs attention</strong>
-                  <ul>{planPreflight!.issues.map((issue, index) => <li key={`${issue.code}:${index}`}>{issue.message}</li>)}</ul>
+                  <ul>
+                    {planIssues.map((issue, index) => (
+                      <li key={`${issue.code}:${index}`}>{issue.message}</li>
+                    ))}
+                  </ul>
                 </section>
               )}
 
