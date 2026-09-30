@@ -1772,6 +1772,19 @@ function App() {
                           Add to plan
                         </button>
                       )}
+                      {plannedMove && (
+                        <button
+                          className="plan-remove-button"
+                          type="button"
+                          disabled={executingPlan}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void removePlannedMove(plannedMove.id);
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
                     </span>
                   </div>
                 );

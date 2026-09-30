@@ -2115,6 +2115,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 .row-action button:hover,
 .row-action button:focus-visible { text-decoration: underline; }
+/* Remove on a planned Browse row matches Remove on the Plan screen. */
+.row-action .plan-remove-button {
+  color: var(--text-muted);
+  font-weight: inherit;
+}
+.row-action .plan-remove-button:hover { color: var(--text); }
 
 .folder-picker-button,
 .folder-picker-readonly {
