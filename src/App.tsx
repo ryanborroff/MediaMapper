@@ -1521,7 +1521,6 @@ function App() {
         <div className="app-content plan-home">
           <header className="app-header">
             <div>
-              <p className="eyebrow">PLAN</p>
               <h1>Planned transfers</h1>
               <p className="intro">Organise your files. Decide what goes where. Copy only when you’re ready.</p>
             </div>
@@ -1666,7 +1665,6 @@ function App() {
 
               <section className="plan-review">
                 <div>
-                  <strong>{fileMoves.length.toLocaleString()} {fileMoves.length === 1 ? "file" : "files"} · {formatBytes(knownBytes)} will be copied</strong>
                   <span>Originals remain untouched.</span>
                   {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
                 </div>
