@@ -333,6 +333,10 @@ function fileName(relativePath: string) {
 // window names the destination instead, without showing its path.
 const DESTINATION_UNAVAILABLE = "The destination became unavailable during the copy.";
 
+// The backend records a copy the user stopped as failed with exactly this
+// message. The window shows it as cancelled rather than as a failure.
+const TRANSFER_CANCELLED = "Copy cancelled.";
+
 function transferErrorMessage(message: string, destinationName: string | undefined) {
   if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
   return destinationName
@@ -340,12 +344,29 @@ function transferErrorMessage(message: string, destinationName: string | undefin
     : "The destination folder is no longer available.";
 }
 
+function isCancelledTransfer(transfer: TransferRecord) {
+  return transfer.status === "failed" && transfer.errorMessage === TRANSFER_CANCELLED;
+}
+
 // Pending, copying and verifying are only seen in history when a run ended
 // without recording an outcome, such as the app quitting mid-copy.
-function transferOutcome(status: string) {
-  if (status === "completed") return { label: "Copied and verified", tone: "completed" };
-  if (status === "failed") return { label: "Failed", tone: "failed" };
+function transferOutcome(transfer: TransferRecord) {
+  if (transfer.status === "completed") return { label: "Copied and verified", tone: "completed" };
+  if (isCancelledTransfer(transfer)) return { label: "Cancelled", tone: "cancelled" };
+  if (transfer.status === "failed") return { label: "Failed", tone: "failed" };
   return { label: "Did not finish", tone: "incomplete" };
+}
+
+// The plan is ready when the live checks and the preflight both pass. Plan
+// shows this as "Ready to transfer"; Transfers summarises the same state.
+function isPlanReady(
+  plannedMoves: PlannedMove[],
+  validation: PlanLiveValidation | null,
+  preflight: PlanPreflight | null,
+) {
+  return plannedMoves.length > 0 &&
+    validation?.ready === true &&
+    (preflight?.issues.length ?? 0) === 0;
 }
 
 function App() {
@@ -512,7 +533,7 @@ function App() {
         });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
-      const cancelled = String(cause).includes("Copy cancelled.");
+      const cancelled = String(cause).includes(TRANSFER_CANCELLED);
       const reason = transferErrorMessage(String(cause), currentMove?.destinationLocationName);
       setExecutionResult({
         stopped: true,
@@ -1145,16 +1166,23 @@ function App() {
             </section>
           )}
 
-          {!executionProgress && !executionResult && plannedMoves.length > 0 && (
-            <section className="transfer-waiting-card">
-              <div>
-                <span className="transfer-active-label">PLANNED</span>
-                <h2>{plannedMoves.length} {plannedMoves.length === 1 ? "transfer" : "transfers"} waiting</h2>
-                <p>Open Plan to see what is required before copying can begin.</p>
-              </div>
-              <button className="browse-button" onClick={() => setActiveView("plan")}>View plan</button>
-            </section>
-          )}
+          {!executionProgress && !executionResult && (() => {
+            // Copying only runs on planned files, so planned folders are not
+            // counted as transfers.
+            const fileCount = plannedMoves.filter((move) => !move.sourceIsDirectory).length;
+            if (fileCount === 0) return null;
+            const ready = isPlanReady(plannedMoves, planValidation, planPreflight);
+            return (
+              <section className="transfer-waiting-card">
+                <div>
+                  <span className="transfer-active-label">PLANNED</span>
+                  <h2>{fileCount.toLocaleString()} {fileCount === 1 ? "transfer" : "transfers"} {ready ? "ready" : "waiting"}</h2>
+                  <p>{ready ? "Ready to copy when you are." : "Open Plan to see what needs attention."}</p>
+                </div>
+                <button className="browse-button" onClick={() => setActiveView("plan")}>View plan</button>
+              </section>
+            );
+          })()}
 
           <section className="transfer-history-section">
             <div className="section-heading">
@@ -1169,7 +1197,7 @@ function App() {
               <>
                 <div className="transfer-history-new">
                   {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
-                    const outcome = transferOutcome(transfer.status);
+                    const outcome = transferOutcome(transfer);
                     const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
                     const location = locations.find((item) => item.id === transfer.destinationLocationId);
                     return (
@@ -1181,7 +1209,7 @@ function App() {
                             from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                             to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
                           />
-                          {transfer.status === "failed" && transfer.errorMessage && <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>}
+                          {outcome.tone === "failed" && transfer.errorMessage && <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>}
                         </div>
                         <span className="transfer-history-size">{size === null ? "" : formatBytes(size)}</span>
                         <div className="transfer-outcome">
@@ -1227,10 +1255,7 @@ function App() {
       ...(planValidation?.issues ?? []),
       ...(planPreflight?.issues ?? []),
     ];
-    const planReady =
-      plannedMoves.length > 0 &&
-      planValidation?.ready === true &&
-      (planPreflight?.issues.length ?? 0) === 0;
+    const planReady = isPlanReady(plannedMoves, planValidation, planPreflight);
     const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
 
     return (
@@ -2535,7 +2560,7 @@ function App() {
 
           <div className="transfer-history">
             {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
-              const outcome = transferOutcome(transfer.status);
+              const outcome = transferOutcome(transfer);
               const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
               const location = locations.find((item) => item.id === transfer.destinationLocationId);
 
@@ -2547,7 +2572,7 @@ function App() {
                       from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                       to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
                     />
-                    {transfer.status === "failed" && transfer.errorMessage && (
+                    {outcome.tone === "failed" && transfer.errorMessage && (
                       <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>
                     )}
                   </div>

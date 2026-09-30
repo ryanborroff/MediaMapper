@@ -1928,6 +1928,10 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--amber);
 }
 
+.transfer-history-new-row.cancelled .transfer-status {
+  color: var(--text-body);
+}
+
 .transfer-history-new-row .transfer-outcome > span:last-child {
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
