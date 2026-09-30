@@ -4704,21 +4704,49 @@ async fn open_catalogued_file(
             .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
             .ok_or_else(|| "Connect this drive to open the file.".to_string())?;
 
-        let path = PathBuf::from(&drive.mount_point).join(&relative_path);
-        if !path.is_file() {
-            return Err(
-                "The file is not currently available at its catalogued location.".to_string(),
-            );
-        }
+        let path = resolve_catalogued_file(Path::new(&drive.mount_point), &relative_path)?;
 
-        std::process::Command::new("/usr/bin/open")
+        // Any format goes to the same opener; which app handles it, and whether
+        // one can, is macOS's file association. `open` returns once Launch
+        // Services has accepted or refused the file, so waiting is brief.
+        let output = std::process::Command::new("/usr/bin/open")
             .arg(&path)
-            .spawn()
-            .map_err(|error| format!("Unable to open the file: {error}"))?;
+            .output()
+            .map_err(|_| "Unable to ask macOS to open the file.".to_string())?;
+        if !output.status.success() {
+            return Err(open_failure_message(&String::from_utf8_lossy(&output.stderr)));
+        }
 
         Ok(())
     })
     .await
+}
+
+// The physical file a catalogue entry names on a mounted drive. Resolving
+// symlinks and requiring the result to stay on the drive means a link inside
+// the catalogue cannot hand the opener a file somewhere else.
+fn resolve_catalogued_file(mount_point: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let unavailable =
+        || "The file is not currently available at its catalogued location.".to_string();
+    let mount = fs::canonicalize(mount_point).map_err(|_| unavailable())?;
+    let path = fs::canonicalize(mount.join(relative_path)).map_err(|_| unavailable())?;
+    if !path.starts_with(&mount) {
+        return Err("That file points outside its drive, so it was not opened.".to_string());
+    }
+    if !path.is_file() {
+        return Err(unavailable());
+    }
+    Ok(path)
+}
+
+// Turns `open`'s stderr into something to show the user. Launch Services
+// reports a missing app as "No application knows how to open ..." (-10814).
+fn open_failure_message(stderr: &str) -> String {
+    if stderr.contains("No application knows how to open") || stderr.contains("-10814") {
+        "No app on this Mac can open this type of file.".to_string()
+    } else {
+        "macOS couldn't open this file.".to_string()
+    }
 }
 
 // Where the file a completed transfer copied is now. Built from the stored
@@ -5188,6 +5216,50 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalogued_files_resolve_only_to_files_on_their_drive() {
+        let root = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-open-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&root.0);
+        let volume = root.0.join("Drive");
+        fs::create_dir_all(volume.join("Films")).unwrap();
+        fs::write(volume.join("Films/Down.by.Law.1986.mkv"), b"film").unwrap();
+        fs::write(root.0.join("outside.txt"), b"elsewhere").unwrap();
+        std::os::unix::fs::symlink(root.0.join("outside.txt"), volume.join("escape.txt")).unwrap();
+        std::os::unix::fs::symlink(volume.join("Films/Down.by.Law.1986.mkv"), volume.join("alias.mkv"))
+            .unwrap();
+
+        let resolved = resolve_catalogued_file(&volume, "Films/Down.by.Law.1986.mkv").unwrap();
+        assert!(resolved.ends_with("Drive/Films/Down.by.Law.1986.mkv"));
+        assert!(resolve_catalogued_file(&volume, "alias.mkv").is_ok());
+
+        assert_eq!(
+            resolve_catalogued_file(&volume, "escape.txt").unwrap_err(),
+            "That file points outside its drive, so it was not opened."
+        );
+        for unavailable in ["Films", "Films/missing.mov"] {
+            assert_eq!(
+                resolve_catalogued_file(&volume, unavailable).unwrap_err(),
+                "The file is not currently available at its catalogued location."
+            );
+        }
+    }
+
+    #[test]
+    fn open_failures_become_friendly_messages() {
+        assert_eq!(
+            open_failure_message(
+                "No application knows how to open URL file:///Volumes/Drive/a.xyz (Error Domain=NSOSStatusErrorDomain Code=-10814)"
+            ),
+            "No app on this Mac can open this type of file."
+        );
+        assert_eq!(open_failure_message("something else"), "macOS couldn't open this file.");
     }
 
     #[cfg(unix)]

@@ -312,6 +312,16 @@ function PlannedPath({ direction, locationName, folder }: {
   );
 }
 
+// Marks a Browse row that opens a folder. Decorative: the row itself is the
+// control and already says "Folder".
+function FolderChevron() {
+  return (
+    <svg className="folder-chevron" viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
+      <path d="M4.5 2.5 8 6l-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 // Where a transfer copies from and to, as full "Location / Folder / File"
 // paths. Shared by waiting, in-progress and history rows so they read alike.
 function TransferPaths({ from, to }: { from: string; to: string }) {
@@ -1788,10 +1798,28 @@ function App() {
                       }
                     }}
                   >
-                    <span className="file-name">
+                    <span className={entry.isDirectory ? "file-name" : "file-name file-name-openable"}>
 
                       <span className="file-name-text">
-                        <span className="file-name-primary">{entry.name}</span>
+                        {entry.isDirectory ? (
+                          <span className="file-name-primary">{entry.name}</span>
+                        ) : (
+                          <button
+                            className="file-name-primary file-open-button"
+                            type="button"
+                            title={`Open ${entry.name}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              // The second click of a double-click would open it again.
+                              if (event.detail <= 1) {
+                                openFile();
+                              }
+                            }}
+                            onDoubleClick={(event) => event.stopPropagation()}
+                          >
+                            {entry.name}
+                          </button>
+                        )}
                         {entry.unreadable && (
                           <span className="unreadable-note">Couldn't be read during the last scan</span>
                         )}
@@ -1816,6 +1844,7 @@ function App() {
                         : formatBytes(entry.sizeBytes)}
                     </span>
                     <span className="row-action">
+                      {entry.isDirectory && <FolderChevron />}
                       {!entry.isDirectory && !plannedMove && (
                         <button
                           type="button"
@@ -1874,7 +1903,7 @@ function App() {
                     </span>
                     <span aria-label="Not on the drive yet">—</span>
                     <span>{planned.isDirectory ? "Folder" : formatBytes(planned.sizeBytes)}</span>
-                    <span />
+                    <span className="row-action">{planned.isDirectory && <FolderChevron />}</span>
                   </button>
                 ))}
             </>

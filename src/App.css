@@ -2162,6 +2162,36 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 .row-action .plan-remove-button:hover { color: var(--text); }
 
+/* A file name opens the file in its default app. It reads as table text at
+   rest; the extra padding widens the target and the negative margin keeps it
+   aligned with the column. The wrapper stops clipping so the focus ring and
+   padding show; the button still truncates the name itself. */
+.file-name-openable { overflow: visible; }
+.file-open-button {
+  max-width: calc(100% + 8px);
+  margin: -2px -4px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.file-open-button:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.file-open-button:focus-visible { outline-offset: 0; }
+
+/* Folder rows: a quiet chevron in the action column says the row opens. */
+.folder-chevron {
+  display: block;
+  color: var(--text-muted);
+}
+.folder-row:hover .folder-chevron { color: var(--text-body); }
+
 .folder-picker-button,
 .folder-picker-readonly {
   width: 100%;
