@@ -470,9 +470,9 @@ function App() {
     setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
-    const copiedSoFar = () => completed === 0
-      ? "Nothing was copied."
-      : `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified.`;
+    const cancelledMessage = () => completed === 0
+      ? "Copy cancelled. No files were copied. Planned transfers are unchanged."
+      : `Copy cancelled. ${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified. The remaining files stay planned.`;
 
     try {
       // The backend reruns final live validation immediately before every
@@ -491,7 +491,7 @@ function App() {
       setExecutionResult(cancelRequested.current && completed < readyMoves.length
         ? {
           stopped: true,
-          message: `Copy cancelled. ${copiedSoFar()} The rest stay planned.${skippedNote}`,
+          message: `${cancelledMessage()}${skippedNote}`,
         }
         : {
           stopped: false,
@@ -503,7 +503,7 @@ function App() {
       setExecutionResult({
         stopped: true,
         message: cancelled
-          ? `Copy cancelled. ${copiedSoFar()} The file being copied was not finished; it and the rest stay planned.${skippedNote}`
+          ? `${cancelledMessage()}${skippedNote}`
           : completed > 0
             ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
             : `Nothing was copied. ${String(cause)}${skippedNote}`,
