@@ -36,7 +36,14 @@ struct CataloguedDrive {
     total_bytes: Option<u64>,
     available_bytes: Option<u64>,
     last_mount_point: Option<String>,
+    // When a scan of this drive last completed. It is written only in the
+    // scan's own transaction, so a failed or cancelled scan leaves it as it
+    // was. The catalogue is a snapshot from this moment; the drive itself may
+    // have changed since.
     last_scanned_at: Option<i64>,
+    // When Media Mapper last saw this drive connected, stored in the drive's
+    // `last_seen_at` column. Connecting a drive is not a scan.
+    last_connected_at: Option<i64>,
     file_count: i64,
     directory_count: i64,
     catalogued_bytes: i64,
@@ -2296,56 +2303,144 @@ where
         .map_err(|error| format!("Background task failed: {error}"))?
 }
 
+// The window checks for drives every two seconds. Recording each sighting
+// would write that often, so a drive's connection is recorded when it is
+// first seen in this run of the app and then at most this often while it
+// stays connected.
+const CONNECTION_RECORD_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+// When each drive's connection was last recorded in this run of the app.
+static RECORDED_CONNECTIONS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+// Records that known drives are connected now. Drives that were never
+// scanned have no catalogue record and are left alone. Only the connection
+// time changes, never the scan time.
+fn record_drive_connections(
+    connection: &Connection,
+    drive_ids: &[String],
+    connected_at: i64,
+) -> Result<(), String> {
+    for drive_id in drive_ids {
+        connection
+            .execute(
+                "UPDATE drives
+                 SET last_seen_at = MAX(last_seen_at, ?1)
+                 WHERE persistent_identifier = ?2",
+                params![connected_at, drive_id],
+            )
+            .map_err(|error| format!("Unable to record connected drive: {error}"))?;
+    }
+    Ok(())
+}
+
+// Best effort: a failure only means the connection is recorded on a later
+// check. A scan holds the database's write lock for its whole run, so this
+// gives up at once rather than waiting and delaying the drive list.
+fn note_connected_drives(database: &Path, drives: &[DriveInfo]) {
+    let Ok(mut recorded) = RECORDED_CONNECTIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        return;
+    };
+    let due: Vec<String> = drives
+        .iter()
+        .filter_map(|drive| drive.persistent_identifier.clone())
+        .filter(|drive_id| {
+            recorded
+                .get(drive_id)
+                .is_none_or(|at| at.elapsed() >= CONNECTION_RECORD_INTERVAL)
+        })
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+
+    let result = open_database(database).and_then(|connection| {
+        connection
+            .busy_timeout(Duration::ZERO)
+            .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
+        record_drive_connections(&connection, &due, now_unix())
+    });
+    if result.is_ok() {
+        let now = Instant::now();
+        for drive_id in due {
+            recorded.insert(drive_id, now);
+        }
+    }
+}
+
 #[tauri::command]
-async fn list_external_drives() -> Result<Vec<DriveInfo>, String> {
-    run_blocking(external_drives).await
+async fn list_external_drives(app: tauri::AppHandle) -> Result<Vec<DriveInfo>, String> {
+    run_blocking(move || {
+        let drives = external_drives()?;
+        if let Ok(database) = database_path(&app) {
+            note_connected_drives(&database, &drives);
+        }
+        Ok(drives)
+    })
+    .await
+}
+
+// Drives are listed most recently scanned first, so the catalogues most likely
+// to still match their drives come first. Drives never scanned come last, and
+// the name, then the identifier, keep the order stable. The window lists
+// connected drives before offline ones, each group in this order.
+fn catalogued_drives(connection: &Connection) -> Result<Vec<CataloguedDrive>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT
+                d.persistent_identifier,
+                d.name,
+                d.filesystem,
+                d.total_bytes,
+                d.available_bytes,
+                d.last_mount_point,
+                d.last_scanned_at,
+                d.last_seen_at,
+                d.file_count,
+                d.directory_count,
+                d.catalogued_bytes,
+                d.unreadable_folder_count
+            FROM drives d
+            ORDER BY
+                d.last_scanned_at IS NULL,
+                d.last_scanned_at DESC,
+                lower(d.name),
+                d.persistent_identifier
+            ",
+        )
+        .map_err(|error| format!("Unable to query catalogue: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CataloguedDrive {
+                persistent_identifier: row.get(0)?,
+                name: row.get(1)?,
+                filesystem: row.get(2)?,
+                total_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                available_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                last_mount_point: row.get(5)?,
+                last_scanned_at: row.get(6)?,
+                last_connected_at: row.get(7)?,
+                file_count: row.get(8)?,
+                directory_count: row.get(9)?,
+                catalogued_bytes: row.get(10)?,
+                unreadable_folder_count: row.get(11)?,
+            })
+        })
+        .map_err(|error| format!("Unable to read catalogue: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read catalogue rows: {error}"))
 }
 
 #[tauri::command]
 async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>, String> {
     run_blocking(move || {
         let connection = open_database(&database_path(&app)?)?;
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT
-                    d.persistent_identifier,
-                    d.name,
-                    d.filesystem,
-                    d.total_bytes,
-                    d.available_bytes,
-                    d.last_mount_point,
-                    d.last_scanned_at,
-                    d.file_count,
-                    d.directory_count,
-                    d.catalogued_bytes,
-                    d.unreadable_folder_count
-                FROM drives d
-                ORDER BY lower(d.name)
-                ",
-            )
-            .map_err(|error| format!("Unable to query catalogue: {error}"))?;
-
-        let rows = statement
-            .query_map([], |row| {
-                Ok(CataloguedDrive {
-                    persistent_identifier: row.get(0)?,
-                    name: row.get(1)?,
-                    filesystem: row.get(2)?,
-                    total_bytes: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                    available_bytes: row.get::<_, Option<i64>>(4)?.map(|value| value as u64),
-                    last_mount_point: row.get(5)?,
-                    last_scanned_at: row.get(6)?,
-                    file_count: row.get(7)?,
-                    directory_count: row.get(8)?,
-                    catalogued_bytes: row.get(9)?,
-                    unreadable_folder_count: row.get(10)?,
-                })
-            })
-            .map_err(|error| format!("Unable to read catalogue: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read catalogue rows: {error}"))
+        catalogued_drives(&connection)
     })
     .await
 }
@@ -2514,23 +2609,16 @@ fn scan_directory(
     Ok(())
 }
 
-#[tauri::command]
-async fn scan_drive(
-    app: tauri::AppHandle,
-    persistent_identifier: String,
-) -> Result<ScanResult, String> {
-    let drive = external_drives()?
-        .into_iter()
-        .find(|drive| drive.persistent_identifier.as_deref() == Some(&persistent_identifier))
-        .ok_or_else(|| "That drive is no longer connected.".to_string())?;
-
-    let database = database_path(&app)?;
-    let progress_app = app.clone();
-
-    // Clear stale cancellation before the worker starts.
-    clear_scan_cancel(&persistent_identifier);
-
-    tauri::async_runtime::spawn_blocking(move || {
+// The scan itself, run on the blocking thread pool. Everything happens in one
+// transaction: only a scan that reaches the end commits, and with it the new
+// `last_scanned_at`. A failed or cancelled scan rolls back, keeping the
+// previous catalogue and its scan time.
+fn scan_drive_job(
+    database: PathBuf,
+    drive: DriveInfo,
+    report_progress: impl Fn(&str, &(i64, i64, i64, i64), &str) + Send + 'static,
+) -> impl FnOnce() -> Result<ScanResult, String> + Send + 'static {
+    move || {
         let drive_id = drive
             .persistent_identifier
             .clone()
@@ -2573,8 +2661,12 @@ async fn scan_drive(
                     drive_id,
                     drive.name,
                     drive.filesystem,
-                    drive.total_bytes.map(|value| value.min(i64::MAX as u64) as i64),
-                    drive.available_bytes.map(|value| value.min(i64::MAX as u64) as i64),
+                    drive
+                        .total_bytes
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    drive
+                        .available_bytes
+                        .map(|value| value.min(i64::MAX as u64) as i64),
                     drive.mount_point,
                     scanned_at
                 ],
@@ -2607,16 +2699,14 @@ async fn scan_drive(
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
         let mut unreadable_folders = Vec::new();
         let mut last_emit_at = Instant::now();
-        emit_scan_progress(&progress_app, &drive_id, &counters, "");
+        report_progress(&drive_id, &counters, "");
         if let Err(error) = scan_directory(
             &root,
             &mut insert_statement,
             &drive_id,
             &mut counters,
             &mut unreadable_folders,
-            &|counters, current_path| {
-                emit_scan_progress(&progress_app, &drive_id, counters, current_path)
-            },
+            &|counters, current_path| report_progress(&drive_id, counters, current_path),
             &mut last_emit_at,
         ) {
             clear_scan_cancel(&drive_id);
@@ -2625,7 +2715,7 @@ async fn scan_drive(
             }
             return Err(error);
         }
-        emit_scan_progress(&progress_app, &drive_id, &counters, "");
+        report_progress(&drive_id, &counters, "");
         clear_scan_cancel(&drive_id);
 
         drop(insert_statement);
@@ -2636,7 +2726,10 @@ async fn scan_drive(
                     "UPDATE files SET unreadable = 1 WHERE drive_id = ?1 AND relative_path = ?2",
                 )
                 .map_err(|error| format!("Unable to mark unreadable folders: {error}"))?;
-            for folder in unreadable_folders.iter().filter(|folder| !folder.is_empty()) {
+            for folder in unreadable_folders
+                .iter()
+                .filter(|folder| !folder.is_empty())
+            {
                 mark_unreadable
                     .execute(params![drive_id, folder])
                     .map_err(|error| format!("Unable to mark unreadable folders: {error}"))?;
@@ -2680,7 +2773,32 @@ async fn scan_drive(
             unreadable_folder_count,
             unreadable_examples: unreadable_folders.into_iter().take(3).collect(),
         })
-    })
+    }
+}
+
+#[tauri::command]
+async fn scan_drive(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+) -> Result<ScanResult, String> {
+    let drive = external_drives()?
+        .into_iter()
+        .find(|drive| drive.persistent_identifier.as_deref() == Some(&persistent_identifier))
+        .ok_or_else(|| "That drive is no longer connected.".to_string())?;
+
+    let database = database_path(&app)?;
+    let progress_app = app.clone();
+
+    // Clear stale cancellation before the worker starts.
+    clear_scan_cancel(&persistent_identifier);
+
+    tauri::async_runtime::spawn_blocking(scan_drive_job(
+        database,
+        drive,
+        move |drive_id, counters, current_path| {
+            emit_scan_progress(&progress_app, drive_id, counters, current_path)
+        },
+    ))
     .await
     .map_err(|error| format!("Drive scan task failed: {error}"))?
 }
@@ -3917,8 +4035,14 @@ fn validate_plan_live(
                         )) = catalogued
                         {
                             let live_is_directory = metadata.is_dir();
+                            // Scans never catalogue symbolic links, so a
+                            // catalogued file that is now a link (or anything
+                            // else but a file) has changed type too. Copying
+                            // it would copy whatever the link points to.
+                            let file_no_longer_file =
+                                !catalogued_is_directory && !metadata.file_type().is_file();
 
-                            if live_is_directory != catalogued_is_directory {
+                            if live_is_directory != catalogued_is_directory || file_no_longer_file {
                                 issues.push(PlanPreflightIssue {
                                     code: "source_type_changed".to_string(),
                                     message: format!(
@@ -4465,7 +4589,9 @@ async fn open_catalogued_file(
 
         let path = PathBuf::from(&drive.mount_point).join(&relative_path);
         if !path.is_file() {
-            return Err("The file is not currently available at its catalogued location.".to_string());
+            return Err(
+                "The file is not currently available at its catalogued location.".to_string(),
+            );
         }
 
         std::process::Command::new("/usr/bin/open")
@@ -7890,5 +8016,291 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             vec!["film.mov"]
         );
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    fn scan_times(connection: &Connection, drive_id: &str) -> Option<(Option<i64>, Option<i64>)> {
+        catalogued_drives(connection)
+            .unwrap()
+            .into_iter()
+            .find(|drive| drive.persistent_identifier == drive_id)
+            .map(|drive| (drive.last_scanned_at, drive.last_connected_at))
+    }
+
+    #[test]
+    fn existing_database_migrates_keeping_catalogue_and_scan_times() {
+        let database = TestDatabase::new("freshness-migration");
+        Connection::open(&database.0)
+            .unwrap()
+            .execute_batch(&format!(
+                "{LEGACY_SCHEMA}{LEGACY_LOCATIONS_SCHEMA}
+                 UPDATE drives SET last_scanned_at = 1000, last_seen_at = 900
+                 WHERE persistent_identifier = 'UUID-A';"
+            ))
+            .unwrap();
+
+        let connection = open_database(&database.0).expect("old database must migrate");
+
+        let files: Vec<String> = connection
+            .prepare("SELECT relative_path FROM files WHERE drive_id = 'UUID-A'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(files, ["film.mp4"]);
+        assert_eq!(location_count(&connection), 2);
+
+        let drives = catalogued_drives(&connection).unwrap();
+        let source = drives
+            .iter()
+            .find(|drive| drive.persistent_identifier == "UUID-A")
+            .unwrap();
+        assert_eq!(source.last_scanned_at, Some(1000));
+        assert_eq!(source.last_connected_at, Some(900));
+        assert_eq!(scan_times(&connection, "UUID-B"), Some((None, Some(0))));
+    }
+
+    #[test]
+    fn connection_is_recorded_for_known_drives_without_counting_as_a_scan() {
+        let database = TestDatabase::new("record-connection");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-SCANNED", "Films");
+        insert_drive(&connection, "UUID-NEVER", "Old Backup");
+        connection
+            .execute(
+                "UPDATE drives SET last_scanned_at = 500
+                 WHERE persistent_identifier = 'UUID-SCANNED'",
+                [],
+            )
+            .unwrap();
+
+        let drive_ids = ["UUID-SCANNED", "UUID-NEVER", "UUID-UNKNOWN"].map(String::from);
+        record_drive_connections(&connection, &drive_ids, 2000).unwrap();
+
+        assert_eq!(
+            scan_times(&connection, "UUID-SCANNED"),
+            Some((Some(500), Some(2000)))
+        );
+        // Never scanned stays never scanned, however often it connects.
+        assert_eq!(
+            scan_times(&connection, "UUID-NEVER"),
+            Some((None, Some(2000)))
+        );
+        // A drive with no catalogue is not added by connecting it.
+        assert_eq!(scan_times(&connection, "UUID-UNKNOWN"), None);
+
+        // An older sighting never moves the time backwards.
+        record_drive_connections(&connection, &drive_ids[..1], 1500).unwrap();
+        assert_eq!(
+            scan_times(&connection, "UUID-SCANNED"),
+            Some((Some(500), Some(2000)))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_completed_scan_changes_the_scan_time() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database = TestDatabase::new("scan-time");
+        let volume = TestVolume(std::env::temp_dir().join(format!(
+            "media-mapper-scan-time-{}-{}",
+            std::process::id(),
+            now_unix()
+        )));
+        let _ = fs::remove_dir_all(&volume.0);
+        fs::create_dir_all(volume.0.join("Video")).unwrap();
+        fs::write(volume.0.join("Video/film.mp4"), b"film").unwrap();
+        let drive = test_drive("UUID-SCAN-TIME", "Films", &volume.0, 1_000);
+        let scan =
+            |drive: &DriveInfo| scan_drive_job(database.0.clone(), drive.clone(), |_, _, _| {})();
+        let cancel = || {
+            cancelled_scans()
+                .lock()
+                .unwrap()
+                .insert("UUID-SCAN-TIME".to_string());
+        };
+
+        // A first scan that is cancelled leaves the drive never scanned.
+        cancel();
+        let error = scan(&drive).unwrap_err();
+        assert_eq!(error, "Scan cancelled.");
+        let connection = open_database(&database.0).unwrap();
+        assert_eq!(scan_times(&connection, "UUID-SCAN-TIME"), None);
+
+        let result = scan(&drive).unwrap();
+        let (scanned_at, _) = scan_times(&connection, "UUID-SCAN-TIME").unwrap();
+        assert_eq!(scanned_at, Some(result.scanned_at));
+
+        // Mark the successful scan as older, so a later write would show.
+        connection
+            .execute(
+                "UPDATE drives SET last_scanned_at = 100
+                 WHERE persistent_identifier = 'UUID-SCAN-TIME'",
+                [],
+            )
+            .unwrap();
+        fs::write(volume.0.join("Video/new.mp4"), b"new").unwrap();
+
+        // A cancelled rescan keeps the previous scan time and catalogue.
+        cancel();
+        scan(&drive).unwrap_err();
+        let (scanned_at, _) = scan_times(&connection, "UUID-SCAN-TIME").unwrap();
+        assert_eq!(scanned_at, Some(100));
+
+        // So does a rescan that fails part way, here on an unreadable drive.
+        fs::set_permissions(&volume.0, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = scan(&drive);
+        fs::set_permissions(&volume.0, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap_err().contains("top folder"));
+        let (scanned_at, _) = scan_times(&connection, "UUID-SCAN-TIME").unwrap();
+        assert_eq!(scanned_at, Some(100));
+        let file_count: i64 = connection
+            .query_row(
+                "SELECT file_count FROM drives WHERE persistent_identifier = 'UUID-SCAN-TIME'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_count, 1, "the previous catalogue must be kept");
+
+        // A drive that is no longer mounted cannot be scanned at all.
+        let missing = test_drive(
+            "UUID-SCAN-TIME",
+            "Films",
+            &volume.0.join("not-mounted"),
+            1_000,
+        );
+        scan(&missing).unwrap_err();
+        let (scanned_at, _) = scan_times(&connection, "UUID-SCAN-TIME").unwrap();
+        assert_eq!(scanned_at, Some(100));
+    }
+
+    #[test]
+    fn drives_are_listed_most_recently_scanned_first_then_by_name() {
+        let database = TestDatabase::new("drive-order");
+        let connection = open_database(&database.0).unwrap();
+        for (id, name, scanned_at) in [
+            ("UUID-1", "beta", Some(100)),
+            ("UUID-2", "Echo", None),
+            ("UUID-3", "gamma", Some(300)),
+            ("UUID-4", "Alpha", Some(100)),
+            ("UUID-5", "delta", None),
+        ] {
+            insert_drive(&connection, id, name);
+            connection
+                .execute(
+                    "UPDATE drives SET last_scanned_at = ?1 WHERE persistent_identifier = ?2",
+                    params![scanned_at, id],
+                )
+                .unwrap();
+        }
+
+        let names: Vec<String> = catalogued_drives(&connection)
+            .unwrap()
+            .into_iter()
+            .map(|drive| drive.name)
+            .collect();
+        assert_eq!(names, ["gamma", "Alpha", "beta", "delta", "Echo"]);
+    }
+
+    #[test]
+    fn transfer_refuses_a_catalogued_source_that_is_gone() {
+        let fixture = transfer_fixture("transfer-source-gone");
+        fs::remove_file(&fixture.source).unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+
+        assert!(error.contains("not currently present"), "{error}");
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.destination.exists());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_refuses_a_catalogued_file_replaced_by_a_link() {
+        let fixture = transfer_fixture("transfer-source-link");
+        let elsewhere = fixture.destination_volume.0.join("elsewhere.mov");
+        fs::write(&elsewhere, b"not the catalogued file").unwrap();
+        fs::remove_file(&fixture.source).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fixture.source).unwrap();
+        // Give the catalogue the link's own size and no date, so only its
+        // type tells it apart.
+        let link_size = fs::symlink_metadata(&fixture.source).unwrap().len() as i64;
+        fixture
+            .connection
+            .execute(
+                "UPDATE files SET size_bytes = ?1, modified_at = NULL
+                 WHERE drive_id = 'UUID-A' AND relative_path = 'film.mov'",
+                params![link_size],
+            )
+            .unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+
+        assert!(error.contains("changed type"), "{error}");
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.destination.exists());
+    }
+
+    #[test]
+    fn transfer_refuses_a_destination_that_appeared_after_planning() {
+        let fixture = transfer_fixture("transfer-destination-appeared");
+        fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+        fs::write(&fixture.destination, b"someone else's file").unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(
+            fs::read(&fixture.destination).unwrap(),
+            b"someone else's file"
+        );
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[test]
+    fn transfer_never_replaces_a_destination_that_appears_during_the_copy() {
+        let fixture = transfer_fixture("transfer-destination-races");
+        let destination = fixture.destination.clone();
+
+        // Validation has passed by the time the copy reports progress.
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.drives,
+            &|_| {
+                if !destination.exists() {
+                    fs::write(&destination, b"arrived mid-copy").unwrap();
+                }
+            },
+            &|| false,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read(&fixture.destination).unwrap(), b"arrived mid-copy");
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert_eq!(
+            folder_names(fixture.destination.parent().unwrap()),
+            vec!["film.mov"],
+            "no temporary file may be left behind"
+        );
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
     }
 }

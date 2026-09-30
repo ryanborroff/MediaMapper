@@ -21,7 +21,11 @@ type CataloguedDrive = {
   totalBytes: number | null;
   availableBytes: number | null;
   lastMountPoint: string | null;
+  // When a scan of this drive last completed. The catalogue is a snapshot
+  // from then; the drive may have changed since.
   lastScannedAt: number | null;
+  // When Media Mapper last saw this drive connected. Kept for later use.
+  lastConnectedAt: number | null;
   fileCount: number;
   directoryCount: number;
   cataloguedBytes: number;
@@ -212,6 +216,28 @@ function formatDate(timestamp: number | null) {
   if (!timestamp) return "Never";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
     .format(new Date(timestamp * 1000));
+}
+
+const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+
+// How long ago a drive was last scanned, such as "Scanned 12 minutes ago".
+// It only says when; whether the drive has changed since is unknown.
+function formatScanAge(timestamp: number | null, now = Date.now()) {
+  if (!timestamp) return "Never scanned";
+  const seconds = Math.max(0, Math.floor(now / 1000 - timestamp));
+  if (seconds < 60) return "Scanned just now";
+  const units: [Intl.RelativeTimeFormatUnit, number][] = [
+    ["minute", 60],
+    ["hour", 60 * 60],
+    ["day", 24 * 60 * 60],
+    ["month", 30 * 24 * 60 * 60],
+    ["year", 365 * 24 * 60 * 60],
+  ];
+  let [unit, size] = units[0];
+  for (const [candidate, candidateSize] of units) {
+    if (seconds >= candidateSize) [unit, size] = [candidate, candidateSize];
+  }
+  return `Scanned ${relativeTime.format(-Math.floor(seconds / size), unit)}`;
 }
 
 // Searches wait for a pause in typing before querying, so each keystroke does
@@ -1045,6 +1071,13 @@ function App() {
 
   const pathParts = browserPath ? browserPath.split("/") : [];
   let showLegacyDashboard: boolean = false;
+  // Connected drives are listed first, then offline ones. Both follow the
+  // catalogue's order: most recently scanned first, then by name. Connected
+  // drives never scanned come last, still in name order.
+  const catalogueOrder = new Map(catalogued.map((drive, index) => [drive.persistentIdentifier, index]));
+  const connectedInOrder = [...connected].sort((first, second) =>
+    (catalogueOrder.get(first.persistentIdentifier ?? "") ?? catalogued.length) -
+    (catalogueOrder.get(second.persistentIdentifier ?? "") ?? catalogued.length));
   const offline = catalogued.filter((drive) => !connectedIds.has(drive.persistentIdentifier));
   const showTransfers =
     plannedMoves.length > 0 || transfers.length > 0 || executionProgress !== null || executionResult !== null;
@@ -1961,7 +1994,7 @@ function App() {
           <div className="empty-state compact"><h3>No external drives detected</h3><p>Connect a drive and it will appear here.</p></div>
         )}
         <div className="drive-list">
-          {connected.map((drive) => {
+          {connectedInOrder.map((drive) => {
             const catalogue = catalogueFor(drive.persistentIdentifier);
             const scanning = scanningId === drive.persistentIdentifier;
             return (
@@ -2019,7 +2052,7 @@ function App() {
                       ? `${catalogue.fileCount.toLocaleString()} files · ${catalogue.directoryCount.toLocaleString()} folders · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
                       : "Not catalogued yet"}
                   </span>
-                  <span>{catalogue?.lastScannedAt ? `Scanned ${formatDate(catalogue.lastScannedAt)}` : "Not scanned yet"}</span>
+                  <span title={catalogue?.lastScannedAt ? formatDate(catalogue.lastScannedAt) : undefined}>{formatScanAge(catalogue?.lastScannedAt ?? null)}</span>
                   {catalogue && catalogue.unreadableFolderCount > 0 && (
                     <span className="unreadable-note">Couldn't read {catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
                   )}
@@ -2108,7 +2141,7 @@ function App() {
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
                 <div className="drive-meta">
                   <span>{drive.fileCount.toLocaleString()} files · {drive.directoryCount.toLocaleString()} folders · {formatBytes(drive.cataloguedBytes)} catalogued</span>
-                  <span>{drive.lastScannedAt ? `Scanned ${formatDate(drive.lastScannedAt)}` : "Not scanned yet"}</span>
+                  <span title={drive.lastScannedAt ? formatDate(drive.lastScannedAt) : undefined}>{formatScanAge(drive.lastScannedAt)}</span>
                   {drive.unreadableFolderCount > 0 && (
                     <span className="unreadable-note">Couldn't read {drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
                   )}
