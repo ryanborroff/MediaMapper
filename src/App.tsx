@@ -409,7 +409,7 @@ function App() {
   // The files being copied in the current run, in order, and how many have
   // been copied and verified so far.
   const [executionProgress, setExecutionProgress] = useState<{ moves: PlannedMove[]; completed: number } | null>(null);
-  const [executionResult, setExecutionResult] = useState<{ stopped: boolean; message: string } | null>(null);
+  const [executionResult, setExecutionResult] = useState<{ stopped: boolean; cancelled: boolean; message: string } | null>(null);
   // Set synchronously so a second click cannot start another run before
   // React re-renders with the button disabled.
   const executionRunning = useRef(false);
@@ -504,8 +504,8 @@ function App() {
     let completed = 0;
     let currentMove: PlannedMove | undefined;
     const cancelledMessage = () => completed === 0
-      ? "Copy cancelled. No files were copied. Planned transfers are unchanged."
-      : `Copy cancelled. ${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified. The remaining files stay planned.`;
+      ? "No files were copied. Planned transfers are unchanged."
+      : `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified. The remaining files stay planned.`;
 
     try {
       // The backend reruns final live validation immediately before every
@@ -525,10 +525,12 @@ function App() {
       setExecutionResult(cancelRequested.current && completed < readyMoves.length
         ? {
           stopped: true,
+          cancelled: true,
           message: `${cancelledMessage()}${skippedNote}`,
         }
         : {
           stopped: false,
+          cancelled: false,
           message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals stay in place.${skippedNote}`,
         });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
@@ -537,6 +539,7 @@ function App() {
       const reason = transferErrorMessage(String(cause), currentMove?.destinationLocationName);
       setExecutionResult({
         stopped: true,
+        cancelled,
         message: cancelled
           ? `${cancelledMessage()}${skippedNote}`
           : completed > 0
@@ -1157,9 +1160,9 @@ function App() {
           })()}
 
           {!executionProgress && executionResult && (
-            <section className={`transfer-result-card ${executionResult.stopped ? "failed" : "completed"}`}>
+            <section className={`transfer-result-card ${executionResult.cancelled ? "cancelled" : executionResult.stopped ? "failed" : "completed"}`}>
               <div>
-                <strong>{executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
+                <strong>{executionResult.cancelled ? "Copy cancelled" : executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
                 <p>{executionResult.message}</p>
               </div>
               <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
@@ -1334,7 +1337,7 @@ function App() {
           {!executionProgress && executionResult && (
             <section className="plan-transfer-progress" aria-live="polite">
               <span className="plan-transfer-progress-label">
-                {executionResult.stopped ? "TRANSFER STOPPED" : "TRANSFER COMPLETE"}
+                {executionResult.cancelled ? "TRANSFER CANCELLED" : executionResult.stopped ? "TRANSFER STOPPED" : "TRANSFER COMPLETE"}
               </span>
               <p>{executionResult.message}</p>
               <div className="plan-transfer-result-actions">
