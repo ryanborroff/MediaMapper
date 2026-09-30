@@ -1299,8 +1299,8 @@ function App() {
                 )}
                 <p>File {fileIndex.toLocaleString()} of {moves.length.toLocaleString()}</p>
                 <p>Originals stay in place.</p>
-                <button className="secondary-button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
-                  {cancellingCopy ? "Cancelling…" : "Cancel copy"}
+                <button className="plan-transfer-cancel" type="button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
+                  {cancellingCopy ? "Cancelling…" : "Cancel"}
                 </button>
               </section>
             );

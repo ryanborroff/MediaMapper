@@ -1674,9 +1674,26 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   font-variant-numeric: tabular-nums;
 }
 
-.plan-transfer-progress .secondary-button {
+.plan-transfer-cancel {
   justify-self: start;
-  margin-top: 6px;
+  margin: 8px -8px -6px;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.plan-transfer-cancel:hover:not(:disabled) {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.plan-transfer-cancel:disabled {
+  cursor: default;
 }
 
 .plan-transfer-result-actions {
