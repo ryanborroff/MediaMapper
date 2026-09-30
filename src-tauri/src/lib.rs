@@ -1553,8 +1553,10 @@ where
 
     // Set once this call has created the temporary file, so a failure only
     // ever removes a file this call wrote. A file already at that path is
-    // never adopted or deleted; create_new refuses it instead.
+    // never adopted or deleted; create_new refuses it instead. The handle
+    // identifies that file for as long as the transfer runs.
     let mut created_temporary = false;
+    let mut temporary_handle: Option<fs::File> = None;
 
     let mut attempt = || -> Result<u64, String> {
         let source_file = fs::File::open(source)
@@ -1567,7 +1569,27 @@ where
             .open(temporary)
             .map_err(|error| format!("Unable to create temporary destination file: {error}"))?;
         created_temporary = true;
+        let handle: &fs::File = temporary_handle.insert(
+            temporary_file
+                .try_clone()
+                .map_err(|error| format!("Unable to track temporary destination file: {error}"))?,
+        );
         bypass_cache(&temporary_file)?;
+
+        // An open file keeps accepting writes after its folder is renamed,
+        // moved or deleted, so the copy would otherwise only notice a lost
+        // destination once it finished. Check at intervals that the
+        // temporary path still leads to this file.
+        let mut last_check = Instant::now();
+        let mut check_destination = |now: bool| -> Result<(), String> {
+            if now || last_check.elapsed() >= DESTINATION_CHECK_INTERVAL {
+                if !path_leads_to(temporary, handle) {
+                    return Err(DESTINATION_UNAVAILABLE.to_string());
+                }
+                last_check = Instant::now();
+            }
+            Ok(())
+        };
         // Uncached writes go straight to the drive, so write in large chunks.
         let mut writer = BufWriter::with_capacity(1024 * 1024, temporary_file);
 
@@ -1585,6 +1607,7 @@ where
                 .map_err(|error| format!("Unable to copy file: {error}"))?;
             copied += count as u64;
             on_progress(TransferStage::Copying, copied)?;
+            check_destination(false)?;
         }
 
         writer
@@ -1598,12 +1621,14 @@ where
 
         drop(writer);
 
+        check_destination(true)?;
         copy_file_details(source, temporary)?;
 
         on_verifying(copied)?;
 
         if !files_are_identical_with_progress(source, temporary, &mut |verified| {
-            on_progress(TransferStage::Verifying, verified)
+            on_progress(TransferStage::Verifying, verified)?;
+            check_destination(false)
         })? {
             return Err("Copied file failed byte-for-byte verification.".to_string());
         }
@@ -1614,13 +1639,86 @@ where
 
         Ok(copied)
     };
-    let result = attempt();
+    let mut result = attempt();
 
-    if result.is_err() && created_temporary {
-        let _ = fs::remove_file(temporary);
+    if let Err(error) = &mut result {
+        // A destination lost between checks surfaces as whatever step then
+        // failed, such as copying the file's details or the final rename.
+        if let Some(handle) = &temporary_handle {
+            if error != TRANSFER_CANCELLED && !path_leads_to(temporary, handle) {
+                *error = DESTINATION_UNAVAILABLE.to_string();
+            }
+        }
+        match &temporary_handle {
+            Some(handle) => remove_created_temporary(temporary, handle),
+            None if created_temporary => {
+                let _ = fs::remove_file(temporary);
+            }
+            None => {}
+        }
     }
 
     result
+}
+
+// How often a running copy or verification confirms that its destination
+// folder is still where it was. Each check is a single metadata lookup.
+const DESTINATION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const DESTINATION_UNAVAILABLE: &str = "The destination became unavailable during the copy.";
+
+// Whether a path still leads to exactly this open file.
+fn path_leads_to(path: &Path, file: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::symlink_metadata(path), file.metadata()) {
+        (Ok(at_path), Ok(open)) => {
+            at_path.file_type().is_file()
+                && at_path.dev() == open.dev()
+                && at_path.ino() == open.ino()
+        }
+        _ => false,
+    }
+}
+
+// Removes the temporary file a failed transfer created. If its folder was
+// renamed or moved during the copy, the file is found where it now is. Only
+// that same file, still under its temporary name, is ever removed.
+fn remove_created_temporary(temporary: &Path, file: &fs::File) {
+    if path_leads_to(temporary, file) {
+        let _ = fs::remove_file(temporary);
+        return;
+    }
+    if let Some(moved) = current_path_of(file) {
+        if moved.file_name() == temporary.file_name() && path_leads_to(&moved, file) {
+            let _ = fs::remove_file(moved);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_path_of(file: &fs::File) -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_char, c_int};
+
+    const F_GETPATH: c_int = 50;
+    const MAXPATHLEN: usize = 1024;
+
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+
+    let mut buffer = vec![0 as c_char; MAXPATHLEN];
+    if unsafe { fcntl(file.as_raw_fd(), F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+        return None;
+    }
+    let path = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+    Some(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_path_of(_file: &fs::File) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]
@@ -3926,6 +4024,16 @@ fn parse_df_available(text: &str) -> Option<u64> {
     kilobytes.checked_mul(1024)
 }
 
+// A validation message naming a destination as the user knows it, never by
+// its path or location id, such as "The destination “Backup” is not
+// currently connected." Without a usable name the destination goes unnamed.
+fn destination_message(subject: &str, name: Option<&str>, problem: &str) -> String {
+    match name {
+        Some(name) if !name.is_empty() => format!("{subject} “{name}” {problem}"),
+        _ => format!("{subject} {problem}"),
+    }
+}
+
 fn validate_plan_live(
     connection: &Connection,
     connected_drives: &[DriveInfo],
@@ -3945,7 +4053,8 @@ fn validate_plan_live(
                     p.destination_location_id,
                     l.kind,
                     l.drive_id,
-                    l.local_path
+                    l.local_path,
+                    COALESCE(NULLIF(l.user_label, ''), l.display_name)
              FROM planned_moves p
              LEFT JOIN locations l ON l.id = p.destination_location_id
              ORDER BY p.id",
@@ -3962,6 +4071,7 @@ fn validate_plan_live(
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| format!("Unable to validate live plan: {error}"))?
@@ -3976,6 +4086,7 @@ fn validate_plan_live(
         destination_kind,
         destination_drive_id,
         destination_local_path,
+        destination_name,
     ) in rows
     {
         match connected_by_id.get(source_drive_id.as_str()) {
@@ -4135,9 +4246,10 @@ fn validate_plan_live(
                 if connected.is_none() {
                     issues.push(PlanPreflightIssue {
                         code: "destination_drive_offline".to_string(),
-                        message: format!(
-                            "Destination {} is not currently connected.",
-                            destination_location_id
+                        message: destination_message(
+                            "The destination",
+                            destination_name.as_deref(),
+                            "is not currently connected.",
                         ),
                         move_id: Some(move_id),
                         location_id: None,
@@ -4150,9 +4262,10 @@ fn validate_plan_live(
                     if !destination.exists() {
                         issues.push(PlanPreflightIssue {
                             code: "destination_folder_missing".to_string(),
-                            message: format!(
-                                "The destination folder {} is no longer available.",
-                                path
+                            message: destination_message(
+                                "The destination folder",
+                                destination_name.as_deref(),
+                                "is no longer available.",
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4160,7 +4273,11 @@ fn validate_plan_live(
                     } else if !destination.is_dir() {
                         issues.push(PlanPreflightIssue {
                             code: "destination_not_folder".to_string(),
-                            message: format!("The destination {} is no longer a folder.", path),
+                            message: destination_message(
+                                "The destination",
+                                destination_name.as_deref(),
+                                "is no longer a folder.",
+                            ),
                             move_id: Some(move_id),
                             location_id: None,
                         });
@@ -5594,10 +5711,15 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "source_drive_offline"));
-        assert!(result
+        let offline = result
             .issues
             .iter()
-            .any(|issue| issue.code == "destination_drive_offline"));
+            .find(|issue| issue.code == "destination_drive_offline")
+            .unwrap();
+        assert_eq!(
+            offline.message,
+            "The destination “Backup” is not currently connected."
+        );
     }
 
     #[test]
@@ -5721,10 +5843,28 @@ mod tests {
 
         let missing = validate_plan_live(&connection, &drives).unwrap();
         assert!(!missing.ready);
-        assert!(missing
+        let issue = missing
             .issues
             .iter()
-            .any(|issue| issue.code == "destination_folder_missing"));
+            .find(|issue| issue.code == "destination_folder_missing")
+            .unwrap();
+        assert_eq!(
+            issue.message,
+            "The destination folder “Local” is no longer available."
+        );
+
+        fs::write(&local_path, b"not a folder").unwrap();
+        let not_folder = validate_plan_live(&connection, &drives).unwrap();
+        let issue = not_folder
+            .issues
+            .iter()
+            .find(|issue| issue.code == "destination_not_folder")
+            .unwrap();
+        assert_eq!(
+            issue.message,
+            "The destination “Local” is no longer a folder."
+        );
+        fs::remove_file(&local_path).unwrap();
 
         fs::create_dir_all(&local_path).unwrap();
 
@@ -5732,6 +5872,24 @@ mod tests {
         assert!(valid.ready, "{:?}", valid.issues);
 
         fs::remove_dir_all(&local_path).unwrap();
+    }
+
+    #[test]
+    fn destination_messages_never_fall_back_to_a_path_or_id() {
+        for name in [None, Some("")] {
+            assert_eq!(
+                destination_message("The destination", name, "is no longer a folder."),
+                "The destination is no longer a folder."
+            );
+            assert_eq!(
+                destination_message("The destination", name, "is not currently connected."),
+                "The destination is not currently connected."
+            );
+            assert_eq!(
+                destination_message("The destination folder", name, "is no longer available."),
+                "The destination folder is no longer available."
+            );
+        }
     }
 
     #[test]
@@ -6651,6 +6809,117 @@ mod tests {
             .unwrap();
         assert_eq!(planned, 1, "a cancelled copy stays planned");
         let _ = (&fixture.database, &fixture.volume);
+    }
+
+    // Runs the fixture's transfer, calling `lose` with the destination folder
+    // at the first progress report of `stage`, then waiting long enough for
+    // the next destination check to be due.
+    fn transfer_losing_destination(
+        fixture: &ProgressFixture,
+        stage: TransferStage,
+        lose: &dyn Fn(&Path),
+    ) -> (String, Vec<TransferProgress>) {
+        let reports = std::cell::RefCell::new(Vec::new());
+        let error = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| {
+                let first = !reports
+                    .borrow()
+                    .iter()
+                    .any(|report: &TransferProgress| report.stage == stage);
+                reports.borrow_mut().push(progress.clone());
+                if first && progress.stage == stage {
+                    lose(fixture.destination.parent().unwrap());
+                    std::thread::sleep(DESTINATION_CHECK_INTERVAL + Duration::from_millis(100));
+                }
+            },
+            &|| false,
+        )
+        .unwrap_err();
+        (error, reports.into_inner())
+    }
+
+    fn assert_stopped_for_lost_destination(fixture: &ProgressFixture, error: &str) {
+        assert_eq!(error, DESTINATION_UNAVAILABLE);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history[0].status, "failed");
+        assert_eq!(
+            history[0].error_message.as_deref(),
+            Some(DESTINATION_UNAVAILABLE)
+        );
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[test]
+    fn destination_renamed_during_copy_stops_the_copy_promptly() {
+        let fixture = progress_fixture("transfer-lost-copying");
+        let renamed = fixture.volume.0.join("Archive renamed");
+
+        let (error, reports) =
+            transfer_losing_destination(&fixture, TransferStage::Copying, &|folder| {
+                fs::rename(folder, &renamed).unwrap()
+            });
+
+        assert_stopped_for_lost_destination(&fixture, &error);
+        // Stopped mid-copy, never reaching verification.
+        let total = fixture.contents.len() as u64;
+        assert!(reports
+            .iter()
+            .all(|report| report.stage == TransferStage::Copying && report.bytes < total));
+        // No copy at the original path, and the partial copy that moved with
+        // the folder was removed from its new place.
+        assert!(!fixture.destination.exists());
+        assert!(folder_names(&renamed).is_empty());
+
+        // With the folder back, the plan can be retried.
+        fs::rename(&renamed, fixture.destination.parent().unwrap()).unwrap();
+        let transfer = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+        )
+        .unwrap();
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        let _ = &fixture.database;
+    }
+
+    #[test]
+    fn destination_renamed_during_verification_is_never_completed() {
+        let fixture = progress_fixture("transfer-lost-verifying");
+        let renamed = fixture.volume.0.join("Archive renamed");
+
+        let (error, reports) =
+            transfer_losing_destination(&fixture, TransferStage::Verifying, &|folder| {
+                fs::rename(folder, &renamed).unwrap()
+            });
+
+        assert_stopped_for_lost_destination(&fixture, &error);
+        let total = fixture.contents.len() as u64;
+        assert!(reports
+            .iter()
+            .all(|report| report.stage == TransferStage::Copying || report.bytes < total));
+        assert!(!fixture.destination.exists());
+        assert!(folder_names(&renamed).is_empty());
+        let _ = &fixture.database;
+    }
+
+    #[test]
+    fn destination_deleted_during_copy_stops_the_copy() {
+        let fixture = progress_fixture("transfer-lost-deleted");
+
+        let (error, _) = transfer_losing_destination(&fixture, TransferStage::Copying, &|folder| {
+            fs::remove_dir_all(folder).unwrap()
+        });
+
+        assert_stopped_for_lost_destination(&fixture, &error);
+        assert!(!fixture.destination.parent().unwrap().exists());
+        let _ = &fixture.database;
     }
 
     #[test]

@@ -329,6 +329,17 @@ function fileName(relativePath: string) {
   return relativePath.split("/").pop() ?? relativePath;
 }
 
+// The backend's own wording when a destination disappears mid-copy. The
+// window names the destination instead, without showing its path.
+const DESTINATION_UNAVAILABLE = "The destination became unavailable during the copy.";
+
+function transferErrorMessage(message: string, destinationName: string | undefined) {
+  if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
+  return destinationName
+    ? `The destination folder “${destinationName}” is no longer available.`
+    : "The destination folder is no longer available.";
+}
+
 // Pending, copying and verifying are only seen in history when a run ended
 // without recording an outcome, such as the app quitting mid-copy.
 function transferOutcome(status: string) {
@@ -470,6 +481,7 @@ function App() {
     setExecutionProgress({ moves: readyMoves, completed: 0 });
 
     let completed = 0;
+    let currentMove: PlannedMove | undefined;
     const cancelledMessage = () => completed === 0
       ? "Copy cancelled. No files were copied. Planned transfers are unchanged."
       : `Copy cancelled. ${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified. The remaining files stay planned.`;
@@ -479,6 +491,7 @@ function App() {
       // individual copy. UI validation is informative, not the safety gate.
       for (const move of readyMoves) {
         if (cancelRequested.current) break;
+        currentMove = move;
         setFileProgress(null);
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
@@ -500,13 +513,14 @@ function App() {
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
       const cancelled = String(cause).includes("Copy cancelled.");
+      const reason = transferErrorMessage(String(cause), currentMove?.destinationLocationName);
       setExecutionResult({
         stopped: true,
         message: cancelled
           ? `${cancelledMessage()}${skippedNote}`
           : completed > 0
-            ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${String(cause)}${skippedNote}`
-            : `Nothing was copied. ${String(cause)}${skippedNote}`,
+            ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${reason}${skippedNote}`
+            : `Nothing was copied. ${reason}${skippedNote}`,
       });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } finally {
@@ -1167,7 +1181,7 @@ function App() {
                             from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                             to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
                           />
-                          {transfer.status === "failed" && transfer.errorMessage && <p className="transfer-error">{transfer.errorMessage}</p>}
+                          {transfer.status === "failed" && transfer.errorMessage && <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>}
                         </div>
                         <span className="transfer-history-size">{size === null ? "" : formatBytes(size)}</span>
                         <div className="transfer-outcome">
@@ -2534,7 +2548,7 @@ function App() {
                       to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
                     />
                     {transfer.status === "failed" && transfer.errorMessage && (
-                      <p className="transfer-error">{transfer.errorMessage}</p>
+                      <p className="transfer-error">{transferErrorMessage(transfer.errorMessage, location ? location.userLabel || location.displayName : undefined)}</p>
                     )}
                   </div>
                   <span>{size === null ? "" : formatBytes(size)}</span>
