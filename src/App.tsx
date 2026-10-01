@@ -474,7 +474,7 @@ function App() {
     }
   }, []);
 
-  const loadPlannedMoves = useCallback(async () => {
+  const loadPlannedMoves = useCallback(async (options?: { silent?: boolean }) => {
     try {
       const [moves, preflight, validation] = await Promise.all([
         invoke<PlannedMove[]>("list_planned_moves"),
@@ -485,7 +485,9 @@ function App() {
       setPlanPreflight(preflight);
       setPlanValidation(validation);
     } catch (cause) {
-      setError(String(cause));
+      if (!options?.silent) {
+        setError(String(cause));
+      }
     }
   }, []);
 
@@ -719,7 +721,7 @@ function App() {
     }
 
     previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
-    void loadPlannedMoves();
+    void loadPlannedMoves({ silent: true });
   }, [connectedDriveFingerprint, loadPlannedMoves]);
 
   const locationForDrive = (persistentIdentifier: string | null) =>
