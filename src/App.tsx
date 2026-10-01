@@ -474,22 +474,34 @@ function App() {
     }
   }, []);
 
+  const fetchPlannedMoves = useCallback(async () => {
+    const [moves, preflight, validation] = await Promise.all([
+      invoke<PlannedMove[]>("list_planned_moves"),
+      invoke<PlanPreflight>("get_plan_preflight"),
+      invoke<PlanLiveValidation>("validate_plan"),
+    ]);
+    return { moves, preflight, validation };
+  }, []);
+
+  const applyPlannedMoves = useCallback((snapshot: {
+    moves: PlannedMove[];
+    preflight: PlanPreflight;
+    validation: PlanLiveValidation;
+  }) => {
+    setPlannedMoves(snapshot.moves);
+    setPlanPreflight(snapshot.preflight);
+    setPlanValidation(snapshot.validation);
+  }, []);
+
   const loadPlannedMoves = useCallback(async (options?: { silent?: boolean }) => {
     try {
-      const [moves, preflight, validation] = await Promise.all([
-        invoke<PlannedMove[]>("list_planned_moves"),
-        invoke<PlanPreflight>("get_plan_preflight"),
-        invoke<PlanLiveValidation>("validate_plan"),
-      ]);
-      setPlannedMoves(moves);
-      setPlanPreflight(preflight);
-      setPlanValidation(validation);
+      applyPlannedMoves(await fetchPlannedMoves());
     } catch (cause) {
       if (!options?.silent) {
         setError(String(cause));
       }
     }
-  }, []);
+  }, [applyPlannedMoves, fetchPlannedMoves]);
 
   const copyPlannedFiles = useCallback(async () => {
     if (!planValidation || !planPreflight) return;
@@ -734,14 +746,44 @@ function App() {
     }
 
     // macOS can report a newly mounted removable volume before the filesystem
-    // is fully ready. Give reconnects a moment to settle before validating the
-    // plan, and cancel this refresh if drive state changes again meanwhile.
-    const timeout = window.setTimeout(() => {
-      void loadPlannedMoves({ silent: true });
-    }, 1000);
+    // is fully ready. Keep the existing Waiting state while reconnect settles.
+    // Only publish a reconnect snapshot once validation says the plan is ready;
+    // otherwise retry quietly. A later drive-state change cancels the retries.
+    let cancelled = false;
+    let timeout: number | undefined;
+    let attempts = 0;
 
-    return () => window.clearTimeout(timeout);
-  }, [connectedDriveFingerprint, loadPlannedMoves]);
+    const refreshAfterReconnect = async () => {
+      attempts += 1;
+      try {
+        const snapshot = await fetchPlannedMoves();
+        if (cancelled) return;
+
+        if (snapshot.validation.ready || attempts >= 5) {
+          applyPlannedMoves(snapshot);
+          return;
+        }
+      } catch {
+        if (cancelled) return;
+      }
+
+      timeout = window.setTimeout(() => void refreshAfterReconnect(), 1000);
+    };
+
+    timeout = window.setTimeout(() => void refreshAfterReconnect(), 1000);
+
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
+    };
+  }, [
+    applyPlannedMoves,
+    connectedDriveFingerprint,
+    fetchPlannedMoves,
+    loadPlannedMoves,
+  ]);
 
   const locationForDrive = (persistentIdentifier: string | null) =>
     persistentIdentifier
