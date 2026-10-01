@@ -1887,23 +1887,153 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         .lock()
         .map_err(|_| "Unable to access catalogue migration state.".to_string())?;
     if !migrated.contains(path) {
-        migrate_database(&mut connection)?;
+        migrate_database(&mut connection, path)?;
         migrated.insert(path.to_path_buf());
     }
 
     Ok(connection)
 }
 
+// The catalogue schema this build writes, stored in SQLite's `user_version`.
+// Catalogues from before schema versions existed read as 0. They are brought
+// up to date by the checks in `migrate_schema`, then stamped with this number.
+//
+// To change the schema: add a step at the end of `migrate_schema` that checks
+// before it writes, bump this number, and add a fixture test for a catalogue
+// at the previous version. See DATABASE.md.
+const SCHEMA_VERSION: i64 = 1;
+
+const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Media Mapper, so this version can't use it. Open it with the newer version of Media Mapper.";
+
+fn schema_version(connection: &Connection) -> Result<i64, String> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("Unable to read catalogue version: {error}"))
+}
+
+// Brings a catalogue up to `SCHEMA_VERSION`.
+//
+// The upgrade runs in one IMMEDIATE transaction. That takes the write lock
+// before anything is read, so a second copy of the app waits for the first
+// to finish instead of migrating at the same time. If the upgrade fails or
+// the app is killed part way, nothing is kept and the catalogue stays exactly
+// as it was, ready to be upgraded again on the next open.
+fn migrate_database(connection: &mut Connection, path: &Path) -> Result<(), String> {
+    // Reading the version takes no write lock, so a current catalogue opens
+    // without writing, even while a scan holds the write lock.
+    let version = schema_version(connection)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        return Err(NEWER_CATALOGUE_MESSAGE.to_string());
+    }
+
+    // WAL is stored in the file, and can't be changed inside a transaction.
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
+
+    back_up_before_migration(connection, path)?;
+
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to start catalogue update: {error}"))?;
+
+    // Another copy of the app may have upgraded it while this one waited.
+    let version = schema_version(&transaction)?;
+    if version > SCHEMA_VERSION {
+        return Err(NEWER_CATALOGUE_MESSAGE.to_string());
+    }
+    if version < SCHEMA_VERSION {
+        migrate_schema(&transaction)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|error| format!("Unable to record catalogue version: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to save catalogue update: {error}"))
+}
+
+// Where the copy taken before upgrading to `SCHEMA_VERSION` is kept:
+// `catalogue.sqlite3` is backed up to `catalogue-before-schema-1.sqlite3`.
+fn schema_backup_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "catalogue".to_string());
+    path.with_file_name(format!("{stem}-before-schema-{SCHEMA_VERSION}.sqlite3"))
+}
+
+static BACKUP_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Keeps a copy of an existing catalogue before its first upgrade to this
+// schema version. The upgrade itself is transactional, so this guards
+// against a mistake in a migration step rather than against interruption.
+//
+// The copy is written under a temporary name and then linked into place,
+// which never replaces an existing file. A backup that already exists was
+// taken before an earlier attempt at this upgrade, so it is kept. If the copy
+// can't be made, the catalogue is not upgraded.
+fn back_up_before_migration(connection: &Connection, path: &Path) -> Result<(), String> {
+    let has_catalogue: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'drives')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to inspect catalogue: {error}"))?;
+    if !has_catalogue {
+        return Ok(());
+    }
+
+    let backup = schema_backup_path(path);
+    if fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(());
+    }
+
+    let mut temporary = backup.clone().into_os_string();
+    temporary.push(format!(
+        ".{}-{}.partial",
+        std::process::id(),
+        BACKUP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temporary = PathBuf::from(temporary);
+
+    let result = connection
+        .execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
+        .map_err(|error| error.to_string())
+        .and_then(|_| match fs::hard_link(&temporary, &backup) {
+            Ok(()) => Ok(()),
+            // Another copy of the app finished its backup first.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_file()) {
+                    Ok(())
+                } else {
+                    Err(error.to_string())
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        });
+    // Only ever this attempt's own temporary file.
+    let _ = fs::remove_file(&temporary);
+
+    result.map_err(|error| {
+        eprintln!("Media Mapper catalogue backup failed: {error}");
+        "Media Mapper couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Media Mapper.".to_string()
+    })
+}
+
 // Creates any missing tables, indexes and columns, and upgrades data from
-// older schema versions. Every step checks first, so it is safe to run on a
-// database that is already current.
-fn migrate_database(connection: &mut Connection) -> Result<(), String> {
+// older catalogues. Every step checks first, so it is safe to run on a
+// catalogue that is already current. It runs inside `migrate_database`'s
+// transaction, so it must not start its own.
+fn migrate_schema(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE IF NOT EXISTS drives (
                 persistent_identifier TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -2049,29 +2179,21 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| format!("Unable to read catalogue paths: {error}"))?
         };
 
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| format!("Unable to migrate catalogue parent paths: {error}"))?;
-        {
-            let mut update = transaction
-                .prepare("UPDATE files SET parent_path = ?1 WHERE id = ?2")
-                .map_err(|error| format!("Unable to prepare parent path migration: {error}"))?;
+        let mut update = connection
+            .prepare("UPDATE files SET parent_path = ?1 WHERE id = ?2")
+            .map_err(|error| format!("Unable to prepare parent path migration: {error}"))?;
 
-            for (id, relative_path) in existing_paths {
-                let parent_path = Path::new(&relative_path)
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+        for (id, relative_path) in existing_paths {
+            let parent_path = Path::new(&relative_path)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-                update
-                    .execute(params![parent_path, id])
-                    .map_err(|error| format!("Unable to migrate catalogue parent path: {error}"))?;
-            }
+            update
+                .execute(params![parent_path, id])
+                .map_err(|error| format!("Unable to migrate catalogue parent path: {error}"))?;
         }
-        transaction
-            .commit()
-            .map_err(|error| format!("Unable to commit parent path migration: {error}"))?;
     }
 
     if !file_columns.contains("unreadable") {
@@ -2191,13 +2313,9 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
         };
 
         if planned_move_columns.contains("destination_drive_id") {
-            let transaction = connection
-                .transaction()
-                .map_err(|error| format!("Unable to start planned move migration: {error}"))?;
-
             // The migrated rows reference `drive:` locations through a foreign
             // key, so those locations must exist before the rows are copied.
-            sync_drive_locations(&transaction)?;
+            sync_drive_locations(connection)?;
 
             // Tables created before locations existed only have
             // `destination_drive_id`. Referencing `destination_location_id`
@@ -2212,7 +2330,7 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                     "'drive:' || destination_drive_id"
                 };
 
-            transaction
+            connection
                 .execute_batch(&format!(
                     "CREATE TABLE planned_moves_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2260,10 +2378,6 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| {
                     format!("Unable to migrate planned moves to locations: {error}")
                 })?;
-
-            transaction
-                .commit()
-                .map_err(|error| format!("Unable to commit planned move migration: {error}"))?;
         }
     }
 
@@ -5003,10 +5117,12 @@ mod tests {
         }
 
         fn remove_files(&self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = self.0.clone().into_os_string();
-                file.push(suffix);
-                let _ = fs::remove_file(file);
+            for path in [self.0.clone(), schema_backup_path(&self.0)] {
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut file = path.clone().into_os_string();
+                    file.push(suffix);
+                    let _ = fs::remove_file(file);
+                }
             }
         }
     }
@@ -5309,6 +5425,848 @@ mod tests {
         }
 
         assert_planned_moves_migrated(&database.0);
+    }
+
+    // Catalogues as each historical build left them on disk. Each is the
+    // schema that build created for a new catalogue, with the same data, so
+    // every upgrade path to the current schema is exercised.
+    //
+    // 6e7d838: the first catalogue. No summary totals or parent paths.
+    const FIXTURE_6E7D838: &str = "
+        PRAGMA journal_mode = WAL;
+
+        CREATE TABLE drives (
+            persistent_identifier TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            filesystem TEXT,
+            total_bytes INTEGER,
+            available_bytes INTEGER,
+            last_mount_point TEXT,
+            last_seen_at INTEGER NOT NULL,
+            last_scanned_at INTEGER
+        );
+
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            is_directory INTEGER NOT NULL,
+            size_bytes INTEGER,
+            modified_at INTEGER,
+            UNIQUE(drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_files_drive_path ON files(drive_id, relative_path);
+
+        INSERT INTO drives VALUES
+            ('UUID-A', 'Source', 'apfs', 500000000000, 200000000000, '/Volumes/Source', 900, 1000),
+            ('UUID-B', 'Archive', 'exfat', 2000000000000, 1500000000000, '/Volumes/Archive', 1900, 2000);
+
+        INSERT INTO files (drive_id, relative_path, name, is_directory, size_bytes, modified_at) VALUES
+            ('UUID-A', 'Films', 'Films', 1, NULL, 10),
+            ('UUID-A', 'Films/Été 2024', 'Été 2024', 1, NULL, 20),
+            ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov', 0, 100, 50),
+            ('UUID-A', 'notes.txt', 'notes.txt', 0, 7, 60),
+            ('UUID-B', 'Backup', 'Backup', 1, NULL, 70);
+    ";
+
+    // a66b9e3: summary totals on drives and parent paths on files, with the
+    // name and parent indexes.
+    const FIXTURE_A66B9E3: &str = "
+        PRAGMA journal_mode = WAL;
+
+        CREATE TABLE drives (
+            persistent_identifier TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            filesystem TEXT,
+            total_bytes INTEGER,
+            available_bytes INTEGER,
+            last_mount_point TEXT,
+            last_seen_at INTEGER NOT NULL,
+            last_scanned_at INTEGER,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            directory_count INTEGER NOT NULL DEFAULT 0,
+            catalogued_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent_path TEXT NOT NULL DEFAULT '',
+            is_directory INTEGER NOT NULL,
+            size_bytes INTEGER,
+            modified_at INTEGER,
+            UNIQUE(drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_files_drive_path ON files(drive_id, relative_path);
+        CREATE INDEX idx_files_drive_name ON files(drive_id, name COLLATE NOCASE);
+        CREATE INDEX idx_files_drive_parent ON files(drive_id, parent_path);
+
+        INSERT INTO drives VALUES
+            ('UUID-A', 'Source', 'apfs', 500000000000, 200000000000, '/Volumes/Source', 900, 1000, 2, 2, 107),
+            ('UUID-B', 'Archive', 'exfat', 2000000000000, 1500000000000, '/Volumes/Archive', 1900, 2000, 0, 1, 0);
+
+        INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at) VALUES
+            ('UUID-A', 'Films', 'Films', '', 1, NULL, 10),
+            ('UUID-A', 'Films/Été 2024', 'Été 2024', 'Films', 1, NULL, 20),
+            ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov', 'Films/Été 2024', 0, 100, 50),
+            ('UUID-A', 'notes.txt', 'notes.txt', '', 0, 7, 60),
+            ('UUID-B', 'Backup', 'Backup', '', 1, NULL, 70);
+    ";
+
+    // 7b80a78: planned moves pointing straight at a destination drive.
+    const FIXTURE_7B80A78_PLAN: &str = "
+        CREATE TABLE planned_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_drive_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(source_drive_id, source_relative_path),
+            FOREIGN KEY(source_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            FOREIGN KEY(destination_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_planned_moves_destination
+            ON planned_moves(destination_drive_id, destination_relative_path);
+
+        INSERT INTO planned_moves VALUES
+            (7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'UUID-B', 'Video/Café clip.mov', 123);
+    ";
+
+    // c77c108: a locations table, without user labels, beside the
+    // drive-based planned moves.
+    const FIXTURE_C77C108_LOCATIONS: &str = "
+        CREATE TABLE locations (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('external_drive', 'local_folder')),
+            display_name TEXT NOT NULL,
+            drive_id TEXT,
+            local_path TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            CHECK(
+                (kind = 'external_drive' AND drive_id IS NOT NULL AND local_path IS NULL)
+                OR
+                (kind = 'local_folder' AND drive_id IS NULL AND local_path IS NOT NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX idx_locations_drive ON locations(drive_id) WHERE drive_id IS NOT NULL;
+        CREATE UNIQUE INDEX idx_locations_local_path ON locations(local_path) WHERE local_path IS NOT NULL;
+
+        INSERT INTO locations VALUES
+            ('drive:UUID-A', 'external_drive', 'Source', 'UUID-A', NULL, 0),
+            ('drive:UUID-B', 'external_drive', 'Archive', 'UUID-B', NULL, 0);
+    ";
+
+    // e46eacb: planned moves point at locations, which can be folders on
+    // this Mac.
+    const FIXTURE_E46EACB_PLAN: &str = "
+        INSERT INTO locations VALUES
+            ('local:Exports', 'local_folder', 'Exports', NULL, '/Users/test/Exports', 5);
+
+        CREATE TABLE planned_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_location_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(source_drive_id, source_relative_path),
+            FOREIGN KEY(source_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            FOREIGN KEY(destination_location_id) REFERENCES locations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_planned_moves_destination
+            ON planned_moves(destination_location_id, destination_relative_path);
+
+        INSERT INTO planned_moves VALUES
+            (7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 123),
+            (8, 'UUID-A', 'notes.txt', 'local:Exports', 'notes.txt', 124);
+    ";
+
+    // 5a6f81a: user labels on locations.
+    const FIXTURE_5A6F81A_LABELS: &str = "
+        ALTER TABLE locations ADD COLUMN user_label TEXT;
+        UPDATE locations SET user_label = 'Mars' WHERE id = 'drive:UUID-B';
+    ";
+
+    // 759b5aa: unreadable folders recorded by scans.
+    const FIXTURE_759B5AA_UNREADABLE: &str = "
+        ALTER TABLE drives ADD COLUMN unreadable_folder_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE files ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0;
+        UPDATE files SET unreadable = 1 WHERE relative_path = 'Backup';
+        UPDATE drives SET unreadable_folder_count = 1 WHERE persistent_identifier = 'UUID-B';
+    ";
+
+    // a180b23 to 66426ad (main before schema versions): transfer history.
+    // It holds every outcome history can show, including a cancel and a
+    // record left `verifying` by a crash.
+    const FIXTURE_66426AD_TRANSFERS: &str = "
+        CREATE TABLE transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            planned_move_id INTEGER,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_location_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            total_bytes INTEGER,
+            copied_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL
+                CHECK(status IN ('pending', 'copying', 'verifying', 'completed', 'failed')),
+            error_message TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER
+        );
+
+        CREATE INDEX idx_transfers_status ON transfers(status);
+        CREATE INDEX idx_transfers_created ON transfers(created_at);
+
+        INSERT INTO transfers VALUES
+            (1, 3, 'UUID-A', 'old.mov', 'drive:UUID-B', 'old.mov', 9, 9, 'completed', NULL, 300, 301, 302),
+            (2, 7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 100, 40, 'failed', 'Copy cancelled.', 400, 401, 402),
+            (3, 7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 100, 100, 'verifying', NULL, 500, 501, NULL);
+    ";
+
+    // What a catalogue held at each historical build, so the checks know
+    // what must have survived.
+    #[derive(Clone, Copy)]
+    struct Holds {
+        planned_moves: bool,
+        local_folder: bool,
+        labels: bool,
+        unreadable: bool,
+        transfers: bool,
+    }
+
+    fn historical_fixtures() -> Vec<(&'static str, String, Holds)> {
+        let nothing = Holds {
+            planned_moves: false,
+            local_folder: false,
+            labels: false,
+            unreadable: false,
+            transfers: false,
+        };
+        let e46eacb = format!("{FIXTURE_A66B9E3}{FIXTURE_C77C108_LOCATIONS}{FIXTURE_E46EACB_PLAN}");
+        let labels = format!("{e46eacb}{FIXTURE_5A6F81A_LABELS}");
+        let unreadable = format!("{labels}{FIXTURE_759B5AA_UNREADABLE}");
+        let main = format!("{unreadable}{FIXTURE_66426AD_TRANSFERS}");
+        let with_plan = Holds {
+            planned_moves: true,
+            ..nothing
+        };
+        let with_local = Holds {
+            local_folder: true,
+            ..with_plan
+        };
+        let with_labels = Holds {
+            labels: true,
+            ..with_local
+        };
+        let with_unreadable = Holds {
+            unreadable: true,
+            ..with_labels
+        };
+        vec![
+            ("6e7d838", FIXTURE_6E7D838.to_string(), nothing),
+            ("a66b9e3", FIXTURE_A66B9E3.to_string(), nothing),
+            (
+                "7b80a78",
+                format!("{FIXTURE_A66B9E3}{FIXTURE_7B80A78_PLAN}"),
+                with_plan,
+            ),
+            (
+                "c77c108",
+                format!("{FIXTURE_A66B9E3}{FIXTURE_7B80A78_PLAN}{FIXTURE_C77C108_LOCATIONS}"),
+                with_plan,
+            ),
+            ("e46eacb", e46eacb, with_local),
+            ("5a6f81a", labels, with_labels),
+            ("759b5aa", unreadable, with_unreadable),
+            (
+                "66426ad",
+                main,
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
+        ]
+    }
+
+    fn create_fixture(path: &Path, sql: &str) {
+        Connection::open(path).unwrap().execute_batch(sql).unwrap();
+    }
+
+    // What a launch does to the catalogue: `initialise_database` upgrades
+    // it, then gives every drive a location.
+    fn launch(path: &Path) -> Result<Connection, String> {
+        let connection = open_database(path)?;
+        sync_drive_locations(&connection)?;
+        Ok(connection)
+    }
+
+    // Each table's columns as (name, type, not null, default, primary key),
+    // and the catalogue's indexes. Column order is left out: columns added
+    // by ALTER TABLE come last, which no query depends on.
+    fn schema_shape(connection: &Connection) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+        let tables: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let columns = tables
+            .into_iter()
+            .map(|table| {
+                let mut columns: Vec<String> = connection
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "{} {} notnull={} default={:?} pk={}",
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                columns.sort();
+                (table, columns)
+            })
+            .collect();
+        let indexes = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (columns, indexes)
+    }
+
+    fn assert_catalogue_survived(connection: &Connection, holds: Holds, fixture: &str) {
+        let context = format!("upgrading the {fixture} catalogue");
+
+        // Drives: identity, names, capacity, last mount point, scan times and
+        // totals.
+        let drives: Vec<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        )> = connection
+            .prepare(
+                "SELECT persistent_identifier, name, filesystem, total_bytes,
+                            available_bytes, last_mount_point, last_seen_at,
+                            last_scanned_at, file_count, directory_count,
+                            catalogued_bytes, unreadable_folder_count
+                     FROM drives ORDER BY persistent_identifier",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let archive_unreadable = i64::from(holds.unreadable);
+        assert_eq!(
+            drives,
+            [
+                (
+                    "UUID-A".to_string(),
+                    "Source".to_string(),
+                    "apfs".to_string(),
+                    500_000_000_000,
+                    200_000_000_000,
+                    "/Volumes/Source".to_string(),
+                    900,
+                    1000,
+                    2,
+                    2,
+                    107,
+                    0
+                ),
+                (
+                    "UUID-B".to_string(),
+                    "Archive".to_string(),
+                    "exfat".to_string(),
+                    2_000_000_000_000,
+                    1_500_000_000_000,
+                    "/Volumes/Archive".to_string(),
+                    1900,
+                    2000,
+                    0,
+                    1,
+                    0,
+                    archive_unreadable
+                ),
+            ],
+            "{context}"
+        );
+
+        // The same view the Drives screen reads.
+        let catalogued = catalogued_drives(connection).unwrap();
+        let source = catalogued
+            .iter()
+            .find(|drive| drive.persistent_identifier == "UUID-A")
+            .unwrap();
+        assert_eq!(source.last_scanned_at, Some(1000), "{context}");
+        assert_eq!(source.last_connected_at, Some(900), "{context}");
+
+        // Every catalogue entry, with exact names and parent folders.
+        let files: Vec<(String, String, String, String, bool, Option<i64>, i64, bool)> = connection
+            .prepare(
+                "SELECT drive_id, relative_path, name, parent_path, is_directory,
+                        size_bytes, modified_at, unreadable
+                 FROM files ORDER BY drive_id, relative_path",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let entry = |drive: &str,
+                     path: &str,
+                     name: &str,
+                     parent: &str,
+                     folder: bool,
+                     size: Option<i64>,
+                     modified: i64,
+                     unreadable: bool| {
+            (
+                drive.to_string(),
+                path.to_string(),
+                name.to_string(),
+                parent.to_string(),
+                folder,
+                size,
+                modified,
+                unreadable,
+            )
+        };
+        assert_eq!(
+            files,
+            [
+                entry("UUID-A", "Films", "Films", "", true, None, 10, false),
+                entry(
+                    "UUID-A",
+                    "Films/Été 2024",
+                    "Été 2024",
+                    "Films",
+                    true,
+                    None,
+                    20,
+                    false
+                ),
+                entry(
+                    "UUID-A",
+                    "Films/Été 2024/Café clip.mov",
+                    "Café clip.mov",
+                    "Films/Été 2024",
+                    false,
+                    Some(100),
+                    50,
+                    false
+                ),
+                entry(
+                    "UUID-A",
+                    "notes.txt",
+                    "notes.txt",
+                    "",
+                    false,
+                    Some(7),
+                    60,
+                    false
+                ),
+                entry(
+                    "UUID-B",
+                    "Backup",
+                    "Backup",
+                    "",
+                    true,
+                    None,
+                    70,
+                    holds.unreadable
+                ),
+            ],
+            "{context}"
+        );
+
+        // Locations: one per drive, plus any folder on this Mac, with labels.
+        let locations: Vec<(String, String, Option<String>, Option<String>)> = connection
+            .prepare("SELECT id, display_name, user_label, local_path FROM locations ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_locations = vec![
+            ("drive:UUID-A".to_string(), "Source".to_string(), None, None),
+            (
+                "drive:UUID-B".to_string(),
+                "Archive".to_string(),
+                holds.labels.then(|| "Mars".to_string()),
+                None,
+            ),
+        ];
+        if holds.local_folder {
+            expected_locations.push((
+                "local:Exports".to_string(),
+                "Exports".to_string(),
+                None,
+                Some("/Users/test/Exports".to_string()),
+            ));
+        }
+        assert_eq!(locations, expected_locations, "{context}");
+
+        // Planned moves keep their ids, sources, destinations and dates.
+        let plans: Vec<(i64, String, String, String, String, i64)> = connection
+            .prepare(
+                "SELECT id, source_drive_id, source_relative_path,
+                        destination_location_id, destination_relative_path, created_at
+                 FROM planned_moves ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_plans = Vec::new();
+        if holds.planned_moves {
+            expected_plans.push((
+                7,
+                "UUID-A".to_string(),
+                "Films/Été 2024/Café clip.mov".to_string(),
+                "drive:UUID-B".to_string(),
+                "Video/Café clip.mov".to_string(),
+                123,
+            ));
+        }
+        if holds.local_folder {
+            expected_plans.push((
+                8,
+                "UUID-A".to_string(),
+                "notes.txt".to_string(),
+                "local:Exports".to_string(),
+                "notes.txt".to_string(),
+                124,
+            ));
+        }
+        assert_eq!(plans, expected_plans, "{context}");
+        // The plan is readable the way the Plan screen reads it.
+        assert_eq!(
+            plan_preflight(connection).unwrap().move_count,
+            expected_plans.len() as i64,
+            "{context}"
+        );
+
+        // Transfer history is kept exactly, including unfinished records,
+        // which recovery (not migration) resolves.
+        let transfers: Vec<(i64, String, Option<String>)> = list_transfer_records(connection)
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.id, record.status, record.error_message))
+            .collect();
+        let mut expected_transfers = Vec::new();
+        if holds.transfers {
+            expected_transfers = vec![
+                (3, "verifying".to_string(), None),
+                (2, "failed".to_string(), Some("Copy cancelled.".to_string())),
+                (1, "completed".to_string(), None),
+            ];
+        }
+        let mut sorted = transfers.clone();
+        sorted.sort_by_key(|record| std::cmp::Reverse(record.0));
+        assert_eq!(sorted, expected_transfers, "{context}");
+
+        let broken: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0, "{context}");
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "{context}");
+    }
+
+    #[test]
+    fn every_historical_catalogue_upgrades_keeping_its_data() {
+        let current = TestDatabase::new("schema-current");
+        let current_shape = schema_shape(&open_database(&current.0).unwrap());
+
+        for (commit, sql, holds) in historical_fixtures() {
+            let database = TestDatabase::new(&format!("schema-{commit}"));
+            create_fixture(&database.0, &sql);
+
+            let connection = launch(&database.0)
+                .unwrap_or_else(|error| panic!("the {commit} catalogue must upgrade: {error}"));
+
+            assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+            assert_eq!(
+                schema_shape(&connection),
+                current_shape,
+                "the {commit} catalogue must end with the current schema"
+            );
+            assert_catalogue_survived(&connection, holds, commit);
+
+            // Reopening, as the next launch does, changes nothing.
+            drop(connection);
+            let mut again = Connection::open(&database.0).unwrap();
+            migrate_database(&mut again, &database.0).unwrap();
+            sync_drive_locations(&again).unwrap();
+            assert_catalogue_survived(&again, holds, commit);
+        }
+    }
+
+    #[test]
+    fn a_failed_upgrade_leaves_the_catalogue_exactly_as_it_was() {
+        let database = TestDatabase::new("schema-atomic");
+        // The first catalogue, plus a drive-based planned move whose source
+        // drive is missing. The rebuilt plan table refuses that row, so the
+        // upgrade fails at its last step, after the earlier steps have
+        // added columns and filled in parent paths. A real catalogue can't
+        // reach this state; it stands in for any failure part way.
+        create_fixture(
+            &database.0,
+            &format!(
+                "{FIXTURE_6E7D838}
+                 PRAGMA foreign_keys = OFF;
+                 {FIXTURE_7B80A78_PLAN}
+                 INSERT INTO planned_moves VALUES (9, 'UUID-GONE', 'x.mov', 'UUID-B', 'x.mov', 1);"
+            ),
+        );
+        let before = schema_shape(&Connection::open(&database.0).unwrap());
+
+        assert!(open_database(&database.0).is_err());
+
+        let connection = Connection::open(&database.0).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 0);
+        assert_eq!(
+            schema_shape(&connection),
+            before,
+            "no step of a failed upgrade may be kept"
+        );
+        let plans: i64 = connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(plans, 2);
+
+        // Once the cause is gone, the next open upgrades it in full,
+        // including the parent paths an earlier partial attempt would have
+        // left blank.
+        connection
+            .execute("DELETE FROM planned_moves WHERE id = 9", [])
+            .unwrap();
+        drop(connection);
+        let connection = launch(&database.0).unwrap();
+        assert_catalogue_survived(
+            &connection,
+            Holds {
+                planned_moves: true,
+                local_folder: false,
+                labels: false,
+                unreadable: false,
+                transfers: false,
+            },
+            "6e7d838 after a failed upgrade",
+        );
+    }
+
+    #[test]
+    fn two_app_instances_upgrading_at_once_both_succeed() {
+        // `open_database` serialises upgrades within one app. A second copy
+        // of the app (`open -n`) shares only the file, so each thread here
+        // calls the migration directly on its own connection.
+        let database = TestDatabase::new("schema-two-instances");
+        create_fixture(
+            &database.0,
+            &format!("{FIXTURE_6E7D838}{FIXTURE_7B80A78_PLAN}"),
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = database.0.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut connection = Connection::open(&path).unwrap();
+                    connection.busy_timeout(Duration::from_secs(20)).unwrap();
+                    connection
+                        .execute_batch("PRAGMA foreign_keys = ON;")
+                        .unwrap();
+                    barrier.wait();
+                    migrate_database(&mut connection, &path)
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread
+                .join()
+                .unwrap()
+                .expect("every instance must open the catalogue");
+        }
+
+        let connection = launch(&database.0).unwrap();
+        assert_catalogue_survived(
+            &connection,
+            Holds {
+                planned_moves: true,
+                local_folder: false,
+                labels: false,
+                unreadable: false,
+                transfers: false,
+            },
+            "6e7d838 by two instances",
+        );
+    }
+
+    #[test]
+    fn a_catalogue_from_a_newer_version_is_left_untouched() {
+        let database = TestDatabase::new("schema-newer");
+        open_database(&database.0).unwrap();
+        Connection::open(&database.0)
+            .unwrap()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let before = schema_shape(&Connection::open(&database.0).unwrap());
+
+        let mut connection = Connection::open(&database.0).unwrap();
+        assert_eq!(
+            migrate_database(&mut connection, &database.0).unwrap_err(),
+            NEWER_CATALOGUE_MESSAGE
+        );
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION + 1);
+        assert_eq!(schema_shape(&connection), before);
+        assert!(!schema_backup_path(&database.0).exists());
+    }
+
+    #[test]
+    fn an_existing_catalogue_is_backed_up_once_before_its_upgrade() {
+        let database = TestDatabase::new("schema-backup");
+        create_fixture(&database.0, FIXTURE_6E7D838);
+
+        open_database(&database.0).unwrap();
+
+        // The backup is the catalogue as it was: old schema, same data.
+        let backup_path = schema_backup_path(&database.0);
+        let backup = Connection::open(&backup_path).unwrap();
+        assert_eq!(schema_version(&backup).unwrap(), 0);
+        let reference = TestDatabase::new("schema-backup-reference");
+        create_fixture(&reference.0, FIXTURE_6E7D838);
+        assert_eq!(
+            schema_shape(&backup),
+            schema_shape(&Connection::open(&reference.0).unwrap())
+        );
+        let files: i64 = backup
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(files, 5);
+        drop(backup);
+
+        // No stray temporary files are left beside it.
+        let directory = database.0.parent().unwrap();
+        let stem = database
+            .0
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let leftovers: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&stem) && name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // An existing backup is never replaced by a later attempt.
+        let other = TestDatabase::new("schema-backup-kept");
+        create_fixture(&other.0, FIXTURE_6E7D838);
+        fs::write(schema_backup_path(&other.0), b"earlier backup").unwrap();
+        open_database(&other.0).unwrap();
+        assert_eq!(
+            fs::read(schema_backup_path(&other.0)).unwrap(),
+            b"earlier backup"
+        );
+    }
+
+    #[test]
+    fn a_new_or_current_catalogue_is_not_backed_up() {
+        let database = TestDatabase::new("schema-no-backup");
+        open_database(&database.0).unwrap();
+        assert!(!schema_backup_path(&database.0).exists());
+
+        // Opening a current catalogue in a later run doesn't back it up.
+        let mut connection = Connection::open(&database.0).unwrap();
+        migrate_database(&mut connection, &database.0).unwrap();
+        assert!(!schema_backup_path(&database.0).exists());
     }
 
     // A temporary folder standing in for a mounted volume.
