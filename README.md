@@ -26,4 +26,6 @@ cd src-tauri && cargo test --lib       # Rust tests
 
 CI runs these, plus `cargo fmt --check`, on every pull request and push to `main` ([workflow](.github/workflows/ci.yml)).
 
+Production builds (`npm run tauri build`) are checked with the smoke test in [RELEASE-TESTING.md](RELEASE-TESTING.md). Safety and recovery coverage is mapped in [SAFETY-MATRIX.md](SAFETY-MATRIX.md).
+
 The catalogue is a SQLite database at `~/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`.

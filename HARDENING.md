@@ -112,11 +112,45 @@ The full matrix is in [SAFETY-MATRIX.md](SAFETY-MATRIX.md). It covers 63 cases w
 - [ ] Gap 5 deferred. See SAFETY-MATRIX F2.
 - [ ] Manual cases M1–M11 need a session with real drives. See SAFETY-MATRIX F5.
 
+## Phase 3: Release build validation (done 2026-10-01)
+
+The repeatable procedure and its results are in [RELEASE-TESTING.md](RELEASE-TESTING.md). `npm run tauri build` produces a working unsigned `.app` and `.dmg`.
+
+The bundled app was driven end to end on disk images, with a separate home folder so the real catalogue was never opened. These all passed:
+
+- drive detection and scanning
+- browsing, including offline
+- search
+- planning, preview and capacity checks
+- copying and verifying to a drive and to a folder on this Mac
+- history and Show in Finder
+- cancel
+- force-kill and ⌘Q mid-copy, then recovery and retry
+- destination and source ejected mid-copy
+- persistence across relaunches
+
+Still to do:
+
+- [ ] Section 5 of RELEASE-TESTING.md (first launch from Finder, macOS privacy prompts) needs a person at the Mac.
+- [ ] Opening a file (R10) needs a run by hand.
+
+Findings P3-1 to P3-11 are listed in RELEASE-TESTING.md. They are:
+
+- **Blockers:** the identifier, and the invalid bundle signature for distribution.
+- **Should fix before V1:**
+  - choosing arm64 or universal
+  - privacy usage descriptions
+  - stderr-only logging
+  - the contradictory "Space after transfer"
+  - the minimum macOS version
+- **Phase 5:** VoiceOver can't reach the row buttons in Browse.
+- **Phase 6:** raw OS errors, "folder" for a drive, "1 files" and "1 results".
+
 ## Later phases
 
 - [x] Phase 1: baseline
 - [x] Phase 2: safety and recovery matrix, except the manual runs
-- [ ] Phase 3: release build validation, and `RELEASE-TESTING.md`
+- [x] Phase 3: release build validation, and `RELEASE-TESTING.md` (except the Finder-launch permission checks)
 - [ ] Phase 4: database and migration hardening, including fixtures for historical schemas and a written strategy
 - [ ] Phase 5: accessibility and keyboard QA
 - [ ] Phase 6: error message audit

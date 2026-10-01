@@ -52,7 +52,7 @@ Run the suite with `cargo test --manifest-path src-tauri/Cargo.toml`. The out-of
 | # | Test | Expected result | How | Coverage | Result | Follow-up |
 |---|---|---|---|---|---|---|
 | S1 | Source drive disconnected before execution | Refused before any record | Auto: `live_validation_reports_offline_source_and_destination`, `planned_transfer_executes_only_after_final_live_validation` | Existing | Pass | |
-| S2 | Source disconnected during the copy | Copy fails; partial removed; plan kept; source drive unharmed | Manual: M1 | Manual | Not run | Error copy is raw (Phase 6) |
+| S2 | Source disconnected during the copy | Copy fails; partial removed; plan kept; source drive unharmed | Manual: M1 | Manual | Pass (disk image, release build; RELEASE-TESTING R17) | Error copy is raw (Phase 6). Repeat with a physical drive. |
 | S3 | Source disconnected during verification | As S2; never completed | Manual: M2 | Manual | Not run | |
 | S4 | Source removed after planning | Refused before any record | Auto: `transfer_refuses_a_catalogued_source_that_is_gone` | Existing | Pass | |
 | S5 | Source deleted during the copy | Never completed; partial removed; plan kept | Auto: `source_deleted_during_the_copy_is_never_completed` | New | Pass | |
@@ -70,7 +70,7 @@ Run the suite with `cargo test --manifest-path src-tauri/Cargo.toml`. The out-of
 | # | Test | Expected result | How | Coverage | Result | Follow-up |
 |---|---|---|---|---|---|---|
 | D1 | Destination disconnected before execution | Refused before any record | Auto: `planned_transfer_refuses_offline_destination_before_creating_record` | Existing | Pass | |
-| D2 | Destination disconnected during the copy | Stops promptly; never completed; plan kept | Auto (folder deleted or renamed): `destination_deleted_during_copy_stops_the_copy`, `destination_renamed_during_copy_stops_the_copy_promptly`; Manual: M3 | Existing / Manual | Pass / Not run | |
+| D2 | Destination disconnected during the copy | Stops promptly; never completed; plan kept | Auto (folder deleted or renamed): `destination_deleted_during_copy_stops_the_copy`, `destination_renamed_during_copy_stops_the_copy_promptly`; Manual: M3 | Existing / Manual | Pass / Pass (disk image, release build; RELEASE-TESTING R16) | Repeat with a physical drive |
 | D3 | Destination disconnected during verification | Never completed | Auto: `destination_renamed_during_verification_is_never_completed`; Manual: M4 | Existing / Manual | Pass / Not run | |
 | D4 | Destination folder disappears | As D2 | Auto: `destination_deleted_during_copy_stops_the_copy` | Existing | Pass | |
 | D5 | Destination folder on this Mac removed after planning | Refused before any record | Auto: `live_validation_checks_local_destination_folder` | Existing | Pass | F2 |
@@ -88,8 +88,8 @@ Run the suite with `cargo test --manifest-path src-tauri/Cargo.toml`. The out-of
 | # | Test | Expected result | How | Coverage | Result | Follow-up |
 |---|---|---|---|---|---|---|
 | A1 | Quit (⌘Q) during the copy | On relaunch: failed ("Interrupted…"), partial removed, plan kept | Manual: M5. Auto (simulated state): `interrupted_copy_is_recovered_at_startup_and_retry_succeeds` | Manual / Existing | Not run / Pass | F1 |
-| A2 | Force-kill during the copy | As A1 | Manual: M6. Auto: same test as A1 | Manual / Existing | Not run / Pass | |
-| A3 | Quit during verification | As A1; never completed | Manual: M7. Auto: `interrupted_verification_is_never_marked_complete` | Manual / Existing | Not run / Pass | |
+| A2 | Force-kill during the copy | As A1 | Manual: M6. Auto: same test as A1 | Manual / Existing | Pass (release build; RELEASE-TESTING R13) / Pass | |
+| A3 | Quit during verification | As A1; never completed | Manual: M7. Auto: `interrupted_verification_is_never_marked_complete` | Manual / Existing | Pass (release build; RELEASE-TESTING R14) / Pass | ⌘Q quits at once, without asking (F1) |
 | A4 | Force-kill during verification | As A3 | Manual: M8. Auto: same test as A3 | Manual / Existing | Not run / Pass | |
 | A5 | Killed after the record was written, before the copy began | Failed on relaunch; retry succeeds | Auto: `interrupted_pending_record_is_recovered_and_retried` | New | Pass | |
 | A6 | Relaunch after the copy completed but before bookkeeping finished | Copy compared with the source again, then completed | Auto: `copy_finalised_before_a_crash_is_confirmed_and_completed` | Existing | Pass | |
@@ -163,9 +163,9 @@ Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destin
    shasum -a 256 "<source>"
    ```
    Compare against a hash taken before the test.
-7. Optionally, read the raw records:
+7. Optionally, read the raw records. Use plain `sqlite3`: `-readonly` fails on this WAL database when the app has no connection open.
    ```bash
-   sqlite3 -readonly ~/Library/Application\ Support/com.mediamapper.app/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
+   sqlite3 ~/Library/Application\ Support/com.mediamapper.app/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
    ```
 
 **Cases**
@@ -192,4 +192,4 @@ Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destin
 | F2 | The copy creates the destination's parent folders with `create_dir_all`. If a folder on this Mac is deleted between the final validation and the copy, that folder would be recreated. For external drives, `/Volumes` is root-owned, so a missing mount point can't be recreated. The fix is to create folders only beneath an existing location root. | Safe to defer |
 | F3 | Source and destination I/O failures show raw OS errors, such as `Unable to copy file: Input/output error (os error 5)`. | Phase 6 |
 | F4 | Verification compares against the source as it is when read. A source rewritten after the final validation and before the copy is opened, without changing its size or date, is copied as it now is. Validation compares size and date with the catalogue, not contents. | Known limitation |
-| F5 | Manual cases M1–M11 need a session with real drives. | Before V1 |
+| F5 | M1, M3, M6 and M7 passed on the release build using disk images ([RELEASE-TESTING.md](RELEASE-TESTING.md)). M1–M11 still need a run with physical drives. | Before V1 |
