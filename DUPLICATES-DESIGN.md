@@ -1,6 +1,6 @@
 # Duplicate awareness: proposed design
 
-**Status: proposal, awaiting approval.** Nothing in this document is built yet.
+**Status: decisions made 2026-10-01 (see the end of this document). Waiting for the go-ahead to build.** Nothing in this document is built yet.
 
 The V1 goal is information only. Media Mapper says which files appear more than once, where the copies are, why it thinks they match, and how much space the confirmed extra copies take. It never deletes, never suggests deleting a particular copy, and never ranks one copy as "the original".
 
@@ -158,10 +158,10 @@ Each step is a small, separately tested commit:
 - **"Identical" means identical when checked.** A file rewritten later with the same size and date wouldn't be noticed until it is checked again. This is the same limit as SAFETY-MATRIX F4.
 - **Files under 1 MB** are never checked, only shown as probable.
 
-## Decisions needed
+## Decisions (2026-10-01)
 
-1. **Placement:** a Duplicates entry under Browse (recommended), or a section on the Browse landing itself.
-2. **Content check:** started by hand only (recommended), or also offered after a scan finishes.
-3. **Minimum size for content checks:** 1 MB (recommended), or another threshold.
-4. **Hash:** SHA-256 with the `sha2` crate (recommended), or BLAKE3, which is faster but less familiar.
-5. **Step 5,** hashing during copy verification: defer (recommended), or include in V1.
+1. **Placement:** a Duplicates entry under Browse, opening its own view.
+2. **Content check:** started by hand only, never in the background or prompted after a scan.
+3. **Minimum size for content checks:** 1 MB. Smaller files are shown only as probable.
+4. **Hash:** SHA-256 with the `sha2` crate. This was the default; no alternative was asked for.
+5. **Step 5,** hashing during copy verification: deferred past V1. The copy engine stays untouched.
