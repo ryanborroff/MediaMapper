@@ -121,7 +121,12 @@ fn clear_scan_cancel(drive_id: &str) {
 fn cancel_scan(persistent_identifier: String) -> Result<(), String> {
     cancelled_scans()
         .lock()
-        .map_err(|_| "Unable to access scan cancellation state.".to_string())?
+        .map_err(|_| {
+            present_error(
+                "Unable to access scan cancellation state.",
+                "cancel the scan",
+            )
+        })?
         .insert(persistent_identifier);
     Ok(())
 }
@@ -390,13 +395,15 @@ fn resolve_transfer_paths(
         destination_local_path,
     )) = planned
     else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
 
     let source_drive = connected_drives
         .iter()
         .find(|drive| drive.persistent_identifier.as_deref() == Some(source_drive_id.as_str()))
-        .ok_or_else(|| "The source drive is not connected.".to_string())?;
+        .ok_or_else(|| {
+            "The source drive isn't connected. Connect it, then copy again.".to_string()
+        })?;
 
     let source = PathBuf::from(&source_drive.mount_point).join(&source_relative_path);
 
@@ -409,7 +416,10 @@ fn resolve_transfer_paths(
             let drive = connected_drives
                 .iter()
                 .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
-                .ok_or_else(|| "The destination drive is not connected.".to_string())?;
+                .ok_or_else(|| {
+                    "The destination drive isn't connected. Connect it, then copy again."
+                        .to_string()
+                })?;
 
             PathBuf::from(&drive.mount_point)
         }
@@ -532,7 +542,7 @@ fn verifying_outcome(
         Ok(true) => VerifyingOutcome::Finalised(copied_bytes),
         Ok(false) => VerifyingOutcome::Failed(MISMATCHED_DESTINATION_MESSAGE),
         Err(error) => {
-            eprintln!("Media Mapper transfer recovery: {error}");
+            log_diagnostic(&format!("Transfer recovery: {error}"));
             VerifyingOutcome::Undetermined
         }
     }
@@ -781,7 +791,7 @@ fn recover_interrupted_transfers(
             Ok(true) => recovery.temporary_files_removed += 1,
             Ok(false) => {}
             // One stuck file must not stop the rest being cleaned up.
-            Err(error) => eprintln!("Media Mapper transfer recovery: {error}"),
+            Err(error) => log_diagnostic(&format!("Transfer recovery: {error}")),
         }
     }
 
@@ -817,7 +827,7 @@ fn recover_transfers_at_startup(app: &tauri::AppHandle) -> Result<(), String> {
                 let _ = app.emit("transfers-recovered", ());
             }
             Ok(_) => {}
-            Err(error) => eprintln!("Media Mapper transfer recovery failed: {error}"),
+            Err(error) => log_diagnostic(&format!("Transfer recovery failed: {error}")),
         }
     });
 
@@ -936,7 +946,7 @@ fn execute_planned_transfer_reporting(
     }
 
     let Some((destination_location_id, _)) = &destination else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
 
     // Transfers copy one file. Folder moves can be planned and previewed, but
@@ -1165,7 +1175,10 @@ fn execute_transfer_paths_reporting(
             // compares it with the source again, but the error must not
             // suggest that nothing was copied.
             if let Err(error) = record_completion() {
-                eprintln!("Media Mapper transfer {}: {error}", transfer.id);
+                log_diagnostic(&format!(
+                    "Transfer {} was copied but not recorded: {error}",
+                    transfer.id
+                ));
                 return Err(COPIED_NOT_RECORDED.to_string());
             }
         }
@@ -1242,7 +1255,7 @@ fn create_transfer_record(
         total_bytes,
     )) = planned
     else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
 
     let created_at = now_unix();
@@ -1361,7 +1374,12 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
     Ok(())
 }
 
-const SOURCE_NOT_A_FILE: &str = "The source is no longer a file, so it was not copied.";
+const SOURCE_NOT_A_FILE: &str =
+    "The source is no longer a file, so it was not copied. Rescan the source drive to update the catalogue.";
+
+const DESTINATION_EXISTS: &str = "There's already a file at the destination. Media Mapper never replaces existing files, so nothing was copied. Remove it from the plan, or choose another destination.";
+
+const DESTINATION_APPEARED: &str = "A file appeared at the destination during the copy. Media Mapper never replaces existing files, so the copy was discarded and that file was left as it is.";
 
 // Opens a file for reading only if the path itself is a regular file. A
 // symbolic link at the path is never followed, so a source swapped for a
@@ -1417,7 +1435,10 @@ fn files_are_identical_with_progress(
         .ok_or_else(|| SOURCE_NOT_A_FILE.to_string())?;
     let second_file = open_regular_file(second)
         .map_err(|error| format!("Unable to open copied file for verification: {error}"))?
-        .ok_or_else(|| "The copied file is no longer a file.".to_string())?;
+        .ok_or_else(|| {
+            "The copy changed while it was being checked, so it was discarded. Copy again."
+                .to_string()
+        })?;
     bypass_cache(&second_file)?;
 
     if first_file
@@ -1493,10 +1514,7 @@ fn rename_exclusive(source: &Path, destination: &Path) -> Result<(), String> {
     let error = std::io::Error::last_os_error();
 
     if error.kind() == std::io::ErrorKind::AlreadyExists {
-        return Err(format!(
-            "Destination already exists: {}",
-            destination.display()
-        ));
+        return Err(DESTINATION_APPEARED.to_string());
     }
 
     Err(format!(
@@ -1593,7 +1611,7 @@ fn transfer_temporary_path(
     ));
 
     if temporary == destination {
-        return Err("The destination has the same name as a transfer temporary file.".to_string());
+        return Err("That name is reserved for Media Mapper's temporary copies. Remove the file from the plan and choose another name.".to_string());
     }
 
     Ok(temporary)
@@ -1630,10 +1648,7 @@ where
     // Anything at the destination counts, including a link to nothing,
     // which `exists()` would report as absent.
     if fs::symlink_metadata(destination).is_ok() {
-        return Err(format!(
-            "Destination already exists: {}",
-            destination.display()
-        ));
+        return Err(DESTINATION_EXISTS.to_string());
     }
 
     if temporary.parent() != destination.parent() || temporary == destination {
@@ -1695,13 +1710,13 @@ where
         loop {
             let count = reader
                 .read(&mut buffer)
-                .map_err(|error| format!("Unable to copy file: {error}"))?;
+                .map_err(|error| format!("Unable to read the source file: {error}"))?;
             if count == 0 {
                 break;
             }
             writer
                 .write_all(&buffer[..count])
-                .map_err(|error| format!("Unable to copy file: {error}"))?;
+                .map_err(|error| format!("Unable to write the copy: {error}"))?;
             copied += count as u64;
             on_progress(TransferStage::Copying, copied)?;
             check_destination(false)?;
@@ -1727,7 +1742,7 @@ where
             on_progress(TransferStage::Verifying, verified)?;
             check_destination(false)
         })? {
-            return Err("Copied file failed byte-for-byte verification.".to_string());
+            return Err(VERIFICATION_FAILED.to_string());
         }
 
         // Finalise with no-overwrite semantics. A destination created after
@@ -1762,6 +1777,9 @@ where
 // folder is still where it was. Each check is a single metadata lookup.
 const DESTINATION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const DESTINATION_UNAVAILABLE: &str = "The destination became unavailable during the copy.";
+
+// A serious failure: say so, and what it may mean.
+const VERIFICATION_FAILED: &str = "The copy didn't match the original when it was checked, so it was discarded. The original is untouched. Copy again. If it happens again, the source or destination drive may be failing.";
 
 // Whether a path still leads to exactly this open file.
 fn path_leads_to(path: &Path, file: &fs::File) -> bool {
@@ -2021,7 +2039,7 @@ fn back_up_before_migration(connection: &Connection, path: &Path) -> Result<(), 
     let _ = fs::remove_file(&temporary);
 
     result.map_err(|error| {
-        eprintln!("Media Mapper catalogue backup failed: {error}");
+        log_diagnostic(&format!("Catalogue backup failed: {error}"));
         "Media Mapper couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Media Mapper.".to_string()
     })
 }
@@ -2479,6 +2497,8 @@ fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
     sync_drive_locations(&connection)
 }
 
+const DRIVE_WITHOUT_IDENTITY: &str = "This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.";
+
 // Parses `diskutil info` output into its `Key: Value` pairs.
 fn parse_diskutil_info(text: &str) -> std::collections::HashMap<String, String> {
     text.lines()
@@ -2602,6 +2622,207 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
 // window, so a slow query or `diskutil` call would freeze the interface.
 // Commands that touch SQLite or the filesystem are async and hand their work
 // to the blocking thread pool through this helper, as `scan_drive` does.
+
+// User-facing errors.
+//
+// Internal failures are built as "Unable to <step>: <detail>", where the
+// detail is a SQLite or macOS error that means nothing to a user, and can
+// name paths and internal ids. Commands pass every error through
+// `present_error`. It logs the detail and shows what happened and what to do
+// next. Messages already written for the window pass through unchanged.
+
+// Failures that are internal however they are worded.
+const INTERNAL_ERROR_PREFIXES: &[&str] = &[
+    "Unable to ",
+    "Background task failed",
+    "Drive scan task failed",
+    "Destination location ",
+    "Transfers need a catalogue",
+    "Exclusive transfer finalisation",
+    "Temporary path contains",
+    "Destination path contains",
+    "Source path contains",
+    "Destination has no parent",
+    "The temporary file must sit",
+    "External drive location has no",
+    "Folder location has no path",
+    "Copied file is too large",
+    "Transfer completed, but the plan could not be cleared",
+    "External drive discovery is implemented",
+    "The transfer record no longer exists",
+];
+
+// Copy steps that read the source, and steps that write the destination, so
+// an I/O error can say which drive failed.
+const SOURCE_STEPS: &[&str] = &[
+    "Unable to open source file",
+    "Unable to read the source file",
+    "Unable to open source for verification",
+    "Unable to verify source file",
+];
+const DESTINATION_STEPS: &[&str] = &[
+    "Unable to create destination folder",
+    "Unable to create temporary destination file",
+    "Unable to track temporary destination file",
+    "Unable to write the copy",
+    "Unable to flush copied file",
+    "Unable to sync copied file",
+    "Unable to open copied file for verification",
+    "Unable to verify copied file",
+    "Unable to copy the file's dates",
+    "Unable to finalise copied file",
+];
+
+const CATALOGUE_BUSY: &str =
+    "Media Mapper is still finishing another task, such as a scan. Try again in a moment.";
+const CATALOGUE_DAMAGED: &str = "Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.mediamapper.app) before trying anything else.";
+const MAC_FULL: &str =
+    "This Mac is out of space, so Media Mapper couldn't save its catalogue. Free some space, then try again.";
+
+// The macOS error number in an `io::Error` message, as in "(os error 5)".
+fn os_error_code(error: &str) -> Option<i32> {
+    let start = error.rfind("(os error ")? + "(os error ".len();
+    let digits: String = error[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn is_internal_error(error: &str) -> bool {
+    INTERNAL_ERROR_PREFIXES
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+        || error.contains("(os error ")
+}
+
+// The window's wording for an internal failure, or `None` when `error` is
+// already written for the window.
+fn user_message(error: &str, action: &str) -> Option<String> {
+    if !is_internal_error(error) {
+        return None;
+    }
+
+    let lower = error.to_lowercase();
+    if lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("database is busy")
+    {
+        return Some(CATALOGUE_BUSY.to_string());
+    }
+    if lower.contains("malformed") || lower.contains("not a database") {
+        return Some(CATALOGUE_DAMAGED.to_string());
+    }
+    if lower.contains("database or disk is full") {
+        return Some(MAC_FULL.to_string());
+    }
+
+    let source = SOURCE_STEPS.iter().any(|step| error.starts_with(step));
+    let destination = DESTINATION_STEPS.iter().any(|step| error.starts_with(step));
+    let message = match (os_error_code(error), source, destination) {
+        // ENOSPC
+        (Some(28), _, true) => {
+            "The destination ran out of space during the copy. Free some space there, then copy again."
+        }
+        (Some(28), _, _) => MAC_FULL,
+        // EROFS
+        (Some(30), _, true) => {
+            "The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to."
+        }
+        // EACCES, EPERM
+        (Some(1 | 13), true, _) => {
+            "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again."
+        }
+        (Some(1 | 13), _, true) => {
+            "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again."
+        }
+        // ENOENT
+        (Some(2), true, _) => {
+            "The source file is no longer there. Rescan the source drive to update the catalogue."
+        }
+        // EIO, ENXIO, ENODEV, and ENOENT at the destination
+        (Some(5 | 6 | 19), true, _) => {
+            "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        }
+        (Some(2 | 5 | 6 | 19), _, true) => {
+            "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        }
+        (Some(1 | 13), _, _) => {
+            return Some(format!(
+                "macOS didn't let Media Mapper {action}. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again."
+            ));
+        }
+        _ if action == "copy the file" => {
+            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+        }
+        _ => {
+            return Some(format!(
+                "Media Mapper couldn't {action}. Try again. If it keeps happening, quit and reopen Media Mapper."
+            ));
+        }
+    };
+    Some(message.to_string())
+}
+
+// What a command returns to the window. Internal detail goes to the log.
+fn present_error(error: &str, action: &str) -> String {
+    match user_message(error, action) {
+        Some(message) => {
+            log_diagnostic(&format!("Couldn't {action}: {error}"));
+            message
+        }
+        None => error.to_string(),
+    }
+}
+
+// Transfer history keeps each attempt's error as recorded, so the log and
+// the record agree. The window is shown the user-facing wording.
+fn present_transfer_error(error: &str) -> String {
+    if error == INTERRUPTED_TRANSFER_MESSAGE {
+        return "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+            .to_string();
+    }
+    user_message(error, "copy the file").unwrap_or_else(|| error.to_string())
+}
+
+// The diagnostics log: `~/Library/Logs/com.mediamapper.app/media-mapper.log`.
+// Set at startup. stderr alone is lost when the app is opened from Finder.
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+// The log is moved to `media-mapper.log.1`, replacing any older one, once it
+// passes this size.
+const LOG_LIMIT_BYTES: u64 = 1_000_000;
+
+fn log_diagnostic(message: &str) {
+    eprintln!("Media Mapper: {message}");
+    if let Some(path) = LOG_FILE.get() {
+        append_log(path, message);
+    }
+}
+
+fn append_log(path: &Path, message: &str) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_LIMIT_BYTES) {
+        let mut previous = path.to_path_buf().into_os_string();
+        previous.push(".1");
+        let _ = fs::rename(path, previous);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{} {message}", now_unix());
+    }
+}
+
+// Runs a command's work off the main thread and turns any failure into a
+// message for the window. `action` completes "Media Mapper couldn't …".
+async fn run_command<T, F>(action: &str, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking(work)
+        .await
+        .map_err(|error| present_error(&error, action))
+}
+
 async fn run_blocking<T, F>(work: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -2681,7 +2902,7 @@ fn note_connected_drives(database: &Path, drives: &[DriveInfo]) {
 
 #[tauri::command]
 async fn list_external_drives(app: tauri::AppHandle) -> Result<Vec<DriveInfo>, String> {
-    run_blocking(move || {
+    run_command("check which drives are connected", move || {
         let drives = external_drives()?;
         if let Ok(database) = database_path(&app) {
             note_connected_drives(&database, &drives);
@@ -2747,7 +2968,7 @@ fn catalogued_drives(connection: &Connection) -> Result<Vec<CataloguedDrive>, St
 
 #[tauri::command]
 async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>, String> {
-    run_blocking(move || {
+    run_command("load your drives", move || {
         let connection = open_database(&database_path(&app)?)?;
         catalogued_drives(&connection)
     })
@@ -2931,11 +3152,11 @@ fn scan_drive_job(
         let drive_id = drive
             .persistent_identifier
             .clone()
-            .ok_or_else(|| "This drive does not provide a stable volume identifier.".to_string())?;
+            .ok_or_else(|| DRIVE_WITHOUT_IDENTITY.to_string())?;
         let root = PathBuf::from(&drive.mount_point);
 
         if !root.is_dir() {
-            return Err("The drive mount point is no longer available.".to_string());
+            return Err("The drive was disconnected. Reconnect it, then scan again.".to_string());
         }
 
         let mut connection = open_database(&database)?;
@@ -3090,10 +3311,21 @@ async fn scan_drive(
     app: tauri::AppHandle,
     persistent_identifier: String,
 ) -> Result<ScanResult, String> {
+    scan_connected_drive(app, persistent_identifier)
+        .await
+        .map_err(|error| present_error(&error, "scan this drive"))
+}
+
+async fn scan_connected_drive(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+) -> Result<ScanResult, String> {
     let drive = external_drives()?
         .into_iter()
         .find(|drive| drive.persistent_identifier.as_deref() == Some(&persistent_identifier))
-        .ok_or_else(|| "That drive is no longer connected.".to_string())?;
+        .ok_or_else(|| {
+            "That drive is no longer connected. Reconnect it, then scan again.".to_string()
+        })?;
 
     let database = database_path(&app)?;
     let progress_app = app.clone();
@@ -3118,7 +3350,7 @@ async fn list_catalogue_entries(
     persistent_identifier: String,
     parent_path: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    run_blocking(move || {
+    run_command("open this folder", move || {
         let connection = open_database(&database_path(&app)?)?;
 
         let mut statement = connection
@@ -3220,7 +3452,7 @@ async fn search_catalogue(
     persistent_identifier: String,
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    run_blocking(move || {
+    run_command("search this drive", move || {
         let tokens = search_tokens(query.trim());
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -3287,7 +3519,7 @@ async fn search_all_catalogues(
     app: tauri::AppHandle,
     query: String,
 ) -> Result<Vec<LibrarySearchResult>, String> {
-    run_blocking(move || {
+    run_command("search your drives", move || {
         let tokens = search_tokens(query.trim());
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -3447,7 +3679,7 @@ fn find_probable_duplicates(connection: &Connection) -> Result<Vec<DuplicateGrou
 
 #[tauri::command]
 async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
-    run_blocking(move || {
+    run_command("find duplicates", move || {
         let connection = open_database(&database_path(&app)?)?;
         find_probable_duplicates(&connection)
     })
@@ -3456,7 +3688,7 @@ async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup
 
 #[tauri::command]
 async fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String> {
-    run_blocking(move || {
+    run_command("list the largest files", move || {
         let connection = open_database(&database_path(&app)?)?;
 
         let mut statement = connection
@@ -3505,16 +3737,14 @@ fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
-        return Err(
-            "Planned paths must be relative paths without empty, '.' or '..' folders.".to_string(),
-        );
+        return Err("Folder names can't be empty, “.” or “..”. Choose another folder.".to_string());
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
-    run_blocking(move || {
+    run_command("load your locations", move || {
         let connection = open_database(&database_path(&app)?)?;
         let mut statement = connection
             .prepare(
@@ -3550,7 +3780,7 @@ async fn set_drive_label(
     persistent_identifier: String,
     label: String,
 ) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("save the label", move || {
         let trimmed = label.trim();
 
         // Counted in UTF-16 units, as the label field's maxLength counts them,
@@ -3571,7 +3801,10 @@ async fn set_drive_label(
             .map_err(|error| format!("Unable to save drive label: {error}"))?;
 
         if changed == 0 {
-            return Err("That drive is not in the Media Mapper catalogue.".to_string());
+            return Err(
+                "That drive is no longer in Media Mapper. Scan it again, then add the label."
+                    .to_string(),
+            );
         }
 
         Ok(())
@@ -3591,18 +3824,18 @@ async fn add_local_folder_location(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<Location, String> {
-    run_blocking(move || {
+    run_command("add that folder", move || {
         let candidate = PathBuf::from(path.trim());
 
         if !candidate.is_absolute() {
-            return Err("The selected folder must have an absolute path.".to_string());
+            return Err("Choose a folder on this Mac.".to_string());
         }
 
         let metadata = fs::metadata(&candidate)
             .map_err(|error| format!("Unable to inspect selected folder: {error}"))?;
 
         if !metadata.is_dir() {
-            return Err("The selected location is not a folder.".to_string());
+            return Err("That isn't a folder. Choose a folder on this Mac.".to_string());
         }
 
         let canonical = fs::canonicalize(&candidate)
@@ -3711,14 +3944,14 @@ fn plan_move(
             params![destination_location_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
+        .map_err(|_| {
+            "That destination is no longer in Media Mapper. Choose another location.".to_string()
+        })?;
 
     let same_drive = destination_drive_id.as_deref() == Some(source_drive_id);
 
     if same_drive && source_relative_path == destination_relative_path {
-        return Err(
-            "The planned destination is the same as the current catalogue location.".to_string(),
-        );
+        return Err("That's where it already is. Choose a different destination.".to_string());
     }
 
     let source_is_directory = match transaction.query_row(
@@ -3730,7 +3963,10 @@ fn plan_move(
     ) {
         Ok(value) => value != 0,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err("The source item is not present in the catalogue.".to_string());
+            return Err(
+                "That item is no longer in the catalogue. Rescan its drive, then try again."
+                    .to_string(),
+            );
         }
         Err(error) => {
             return Err(format!("Unable to validate planned move source: {error}"));
@@ -3743,7 +3979,9 @@ fn plan_move(
             .to_lowercase()
             .starts_with(&format!("{}/", source_relative_path.to_lowercase()))
     {
-        return Err("A folder cannot be planned inside itself.".to_string());
+        return Err(
+            "A folder can't be planned inside itself. Choose a different destination.".to_string(),
+        );
     }
 
     // Planning must not silently target a location that is already occupied.
@@ -3791,7 +4029,7 @@ fn plan_move(
 
             if fs::symlink_metadata(Path::new(local_path).join(destination_relative_path)).is_ok() {
                 return Err(
-                    "That destination already exists in the folder on this Mac.".to_string()
+                    "There's already a file with that name in that folder on this Mac. Media Mapper never replaces existing files, so choose another destination.".to_string()
                 );
             }
         }
@@ -3823,7 +4061,10 @@ fn plan_move(
         .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
 
     if destination_already_planned {
-        return Err("Another planned move already uses that destination.".to_string());
+        return Err(
+            "Another planned file is already going to that destination. Choose a different folder."
+                .to_string(),
+        );
     }
 
     transaction
@@ -3872,7 +4113,7 @@ async fn create_planned_move(
     destination_location_id: String,
     destination_relative_path: String,
 ) -> Result<i64, String> {
-    run_blocking(move || {
+    run_command("add this to the plan", move || {
         let mut connection = open_database(&database_path(&app)?)?;
         plan_move(
             &mut connection,
@@ -3887,7 +4128,7 @@ async fn create_planned_move(
 
 #[tauri::command]
 async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String> {
-    run_blocking(move || {
+    run_command("load the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         let mut statement = connection
             .prepare(
@@ -4007,8 +4248,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "missing_destination".to_string(),
                 message: format!(
-                    "The destination for planned move {} is no longer available.",
-                    planned.id
+                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    file_name_of(&planned.source_relative_path)
                 ),
                 move_id: Some(planned.id),
                 location_id: None,
@@ -4050,8 +4291,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "missing_source".to_string(),
                 message: format!(
-                    "{} is no longer present in the catalogue.",
-                    planned.source_relative_path
+                    "{} is no longer in the catalogue. Rescan its drive, or remove it from the plan.",
+                    file_name_of(&planned.source_relative_path)
                 ),
                 move_id: Some(planned.id),
                 location_id: None,
@@ -4074,7 +4315,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "overlapping_source".to_string(),
                 message: format!(
-                    "{} overlaps another planned source. Its files are counted only once.",
+                    "{} overlaps another planned item. Its files are counted only once.",
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
@@ -4153,7 +4394,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "unknown_source_size".to_string(),
                 message: format!(
-                    "{} contains files whose size is unknown.",
+                    "{} contains files whose size is unknown. Rescan its drive to measure them.",
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
@@ -4176,7 +4417,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     issues.push(PlanPreflightIssue {
                         code: "insufficient_capacity".to_string(),
                         message: format!(
-                            "{display_name} does not have enough catalogued free space for the known planned data."
+                            "{display_name} didn't have enough free space for the planned files at its last scan. Free some space there, or plan fewer files."
                         ),
                         move_id: None,
                         location_id: Some(location_id.clone()),
@@ -4243,6 +4484,11 @@ fn parse_df_available(text: &str) -> Option<u64> {
 // A validation message naming a destination as the user knows it, never by
 // its path or location id, such as "The destination “Backup” is not
 // currently connected." Without a usable name the destination goes unnamed.
+// The last part of a catalogue path. Messages name the file, not its path.
+fn file_name_of(relative_path: &str) -> &str {
+    relative_path.rsplit('/').next().unwrap_or(relative_path)
+}
+
 fn destination_message(subject: &str, name: Option<&str>, problem: &str) -> String {
     match name {
         Some(name) if !name.is_empty() => format!("{subject} “{name}” {problem}"),
@@ -4298,7 +4544,7 @@ fn validate_plan_live(
         move_id,
         source_drive_id,
         source_relative_path,
-        destination_location_id,
+        _destination_location_id,
         destination_kind,
         destination_drive_id,
         destination_local_path,
@@ -4309,8 +4555,8 @@ fn validate_plan_live(
             None => issues.push(PlanPreflightIssue {
                 code: "source_drive_offline".to_string(),
                 message: format!(
-                    "The source drive for {} is not connected.",
-                    source_relative_path
+                    "The drive that holds {} isn't connected.",
+                    file_name_of(&source_relative_path)
                 ),
                 move_id: Some(move_id),
                 location_id: None,
@@ -4323,8 +4569,8 @@ fn validate_plan_live(
                         issues.push(PlanPreflightIssue {
                             code: "source_missing_on_disk".to_string(),
                             message: format!(
-                                "{} is in the catalogue but is not currently present on the connected source drive.",
-                                source_relative_path
+                                "{} is in the catalogue but no longer on the source drive. Rescan the drive, or remove it from the plan.",
+                                file_name_of(&source_relative_path)
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4334,8 +4580,8 @@ fn validate_plan_live(
                         issues.push(PlanPreflightIssue {
                             code: "source_unreadable_on_disk".to_string(),
                             message: format!(
-                                "{} cannot currently be checked on the source drive.",
-                                source_relative_path
+                                "Media Mapper can't check {} on the source drive right now. Make sure the drive is connected and readable.",
+                                file_name_of(&source_relative_path)
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4373,8 +4619,8 @@ fn validate_plan_live(
                                 issues.push(PlanPreflightIssue {
                                     code: "source_type_changed".to_string(),
                                     message: format!(
-                                        "{} has changed type since it was catalogued.",
-                                        source_relative_path
+                                        "{} has changed type since it was catalogued. Rescan the source drive before copying.",
+                                        file_name_of(&source_relative_path)
                                     ),
                                     move_id: Some(move_id),
                                     location_id: None,
@@ -4390,8 +4636,8 @@ fn validate_plan_live(
                                     issues.push(PlanPreflightIssue {
                                         code: "source_changed".to_string(),
                                         message: format!(
-                                            "{} has changed since it was catalogued. Rescan the source drive before transferring.",
-                                            source_relative_path
+                                            "{} has changed since it was catalogued. Rescan the source drive before copying.",
+                                            file_name_of(&source_relative_path)
                                         ),
                                         move_id: Some(move_id),
                                         location_id: None,
@@ -4434,8 +4680,8 @@ fn validate_plan_live(
                 Ok(_) => issues.push(PlanPreflightIssue {
                     code: "destination_exists".to_string(),
                     message: format!(
-                        "{} already exists at the planned destination.",
-                        relative_path
+                        "{} already exists at the planned destination. Media Mapper never replaces existing files, so remove it from the plan or choose another destination.",
+                        file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4444,8 +4690,8 @@ fn validate_plan_live(
                 Err(_) => issues.push(PlanPreflightIssue {
                     code: "destination_unreadable".to_string(),
                     message: format!(
-                        "Media Mapper cannot confirm whether {} is clear at the planned destination.",
-                        relative_path
+                        "Media Mapper can't check whether {} is free at the destination. Make sure the destination is connected and readable.",
+                        file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4465,7 +4711,7 @@ fn validate_plan_live(
                         message: destination_message(
                             "The destination",
                             destination_name.as_deref(),
-                            "is not currently connected.",
+                            "isn't connected. Connect it to copy.",
                         ),
                         move_id: Some(move_id),
                         location_id: None,
@@ -4481,7 +4727,7 @@ fn validate_plan_live(
                             message: destination_message(
                                 "The destination folder",
                                 destination_name.as_deref(),
-                                "is no longer available.",
+                                "is no longer available. Check that it still exists, or choose another destination.",
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4492,7 +4738,7 @@ fn validate_plan_live(
                             message: destination_message(
                                 "The destination",
                                 destination_name.as_deref(),
-                                "is no longer a folder.",
+                                "is no longer a folder. Choose another destination.",
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4501,7 +4747,7 @@ fn validate_plan_live(
                 }
                 None => issues.push(PlanPreflightIssue {
                     code: "destination_folder_missing".to_string(),
-                    message: "The planned local destination no longer has a folder path."
+                    message: "The folder on this Mac chosen for these files is no longer set. Remove them from the plan, then add them again."
                         .to_string(),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4510,8 +4756,8 @@ fn validate_plan_live(
             _ => issues.push(PlanPreflightIssue {
                 code: "destination_missing".to_string(),
                 message: format!(
-                    "Destination {} is no longer available.",
-                    destination_location_id
+                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    file_name_of(&source_relative_path)
                 ),
                 move_id: Some(move_id),
                 location_id: None,
@@ -4597,7 +4843,7 @@ fn validate_plan_live(
 
 #[tauri::command]
 async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, String> {
-    run_blocking(move || {
+    run_command("check the plan", move || {
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
         validate_plan_live(&connection, &drives)
@@ -4607,9 +4853,15 @@ async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, Stri
 
 #[tauri::command]
 async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, String> {
-    run_blocking(move || {
+    run_command("load transfer history", move || {
         let connection = open_database(&database_path(&app)?)?;
-        list_transfer_records(&connection)
+        let mut records = list_transfer_records(&connection)?;
+        for record in &mut records {
+            if let Some(error) = &record.error_message {
+                record.error_message = Some(present_transfer_error(error));
+            }
+        }
+        Ok(records)
     })
     .await
 }
@@ -4620,7 +4872,7 @@ async fn execute_planned_move(
     planned_move_id: i64,
     run_id: u64,
 ) -> Result<TransferRecord, String> {
-    run_blocking(move || {
+    run_command("copy the file", move || {
         // Discover the physical drives immediately before execution. This is
         // deliberately inside the blocking worker because diskutil and file
         // verification must never block the window thread.
@@ -4642,7 +4894,7 @@ async fn execute_planned_move(
 
 #[tauri::command]
 async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
-    run_blocking(move || {
+    run_command("check the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         plan_preflight(&connection)
     })
@@ -4686,7 +4938,7 @@ async fn list_planned_folder_entries(
     destination_location_id: String,
     parent_path: String,
 ) -> Result<Vec<PlannedFolderEntry>, String> {
-    run_blocking(move || {
+    run_command("show the planned organisation", move || {
         if !parent_path.is_empty() {
             validate_catalogue_relative_path(&parent_path)?;
         }
@@ -4874,13 +5126,13 @@ async fn list_planned_folder_entries(
 
 #[tauri::command]
 async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("remove this from the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         let changed = connection
             .execute("DELETE FROM planned_moves WHERE id = ?1", params![id])
             .map_err(|error| format!("Unable to remove planned move: {error}"))?;
         if changed == 0 {
-            return Err("That planned move no longer exists.".to_string());
+            return Err("That item is no longer in the plan.".to_string());
         }
         Ok(())
     })
@@ -4893,7 +5145,7 @@ async fn open_catalogued_file(
     drive_id: String,
     relative_path: String,
 ) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("open the file", move || {
         validate_catalogue_relative_path(&relative_path)?;
 
         let connection = open_database(&database_path(&app)?)?;
@@ -4908,8 +5160,13 @@ async fn open_catalogued_file(
 
         match is_directory {
             Some(0) => {}
-            Some(_) => return Err("That catalogue entry is a folder.".to_string()),
-            None => return Err("That file is no longer in the catalogue.".to_string()),
+            Some(_) => return Err("That's a folder, not a file.".to_string()),
+            None => {
+                return Err(
+                    "That file is no longer in the catalogue. Rescan its drive to update the catalogue."
+                        .to_string(),
+                )
+            }
         }
 
         let drives = external_drives()?;
@@ -4926,7 +5183,7 @@ async fn open_catalogued_file(
         let output = std::process::Command::new("/usr/bin/open")
             .arg(&path)
             .output()
-            .map_err(|_| "Unable to ask macOS to open the file.".to_string())?;
+            .map_err(|_| "macOS couldn't open the file. Try opening it from Finder.".to_string())?;
         if !output.status.success() {
             return Err(open_failure_message(&String::from_utf8_lossy(
                 &output.stderr,
@@ -4942,8 +5199,9 @@ async fn open_catalogued_file(
 // symlinks and requiring the result to stay on the drive means a link inside
 // the catalogue cannot hand the opener a file somewhere else.
 fn resolve_catalogued_file(mount_point: &Path, relative_path: &str) -> Result<PathBuf, String> {
-    let unavailable =
-        || "The file is not currently available at its catalogued location.".to_string();
+    let unavailable = || {
+        "The file isn't where the catalogue says. It may have been moved or deleted since the last scan. Rescan the drive to update the catalogue.".to_string()
+    };
     let mount = fs::canonicalize(mount_point).map_err(|_| unavailable())?;
     let path = fs::canonicalize(mount.join(relative_path)).map_err(|_| unavailable())?;
     if !path.starts_with(&mount) {
@@ -5031,7 +5289,7 @@ fn completed_transfer_file(
 
 #[tauri::command]
 async fn reveal_transferred_file(app: tauri::AppHandle, transfer_id: i64) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("show the file in Finder", move || {
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
         let path = completed_transfer_file(&connection, transfer_id, &drives)?;
@@ -5041,7 +5299,7 @@ async fn reveal_transferred_file(app: tauri::AppHandle, transfer_id: i64) -> Res
             .arg("-R")
             .arg(&path)
             .spawn()
-            .map_err(|_| "Unable to show the file in Finder.".to_string())?;
+            .map_err(|_| "Finder couldn't show the file. It may have been moved or renamed since it was copied.".to_string())?;
 
         Ok(())
     })
@@ -5053,14 +5311,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            if let Ok(directory) = app.path().app_log_dir() {
+                if fs::create_dir_all(&directory).is_ok() {
+                    let _ = LOG_FILE.set(directory.join("media-mapper.log"));
+                }
+            }
+
             // A failure here must not stop the app from opening. Commands
             // open the database themselves and will report the same error.
             if let Err(error) = initialise_database(app.handle()) {
-                eprintln!("Media Mapper database initialisation failed: {error}");
+                log_diagnostic(&format!("Catalogue initialisation failed: {error}"));
             }
 
             if let Err(error) = recover_transfers_at_startup(app.handle()) {
-                eprintln!("Media Mapper transfer recovery failed: {error}");
+                log_diagnostic(&format!("Transfer recovery failed: {error}"));
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -6309,7 +6573,7 @@ mod tests {
         for unavailable in ["Films", "Films/missing.mov"] {
             assert_eq!(
                 resolve_catalogued_file(&volume, unavailable).unwrap_err(),
-                "The file is not currently available at its catalogued location."
+                "The file isn't where the catalogue says. It may have been moved or deleted since the last scan. Rescan the drive to update the catalogue."
             );
         }
     }
@@ -6450,7 +6714,7 @@ mod tests {
 
         // Another source cannot claim the same destination in other case.
         let error = plan("Folder/clip.mp4", "drive:UUID-B", "VIDEO/NEW.mp4").unwrap_err();
-        assert!(error.contains("Another planned move"), "{error}");
+        assert!(error.contains("Another planned file"), "{error}");
 
         // The same source can still re-plan, keeping its id.
         assert_eq!(
@@ -6954,7 +7218,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             offline.message,
-            "The destination “Backup” is not currently connected."
+            "The destination “Backup” isn't connected. Connect it to copy."
         );
     }
 
@@ -7086,7 +7350,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             issue.message,
-            "The destination folder “Local” is no longer available."
+            "The destination folder “Local” is no longer available. Check that it still exists, or choose another destination."
         );
 
         fs::write(&local_path, b"not a folder").unwrap();
@@ -7098,7 +7362,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             issue.message,
-            "The destination “Local” is no longer a folder."
+            "The destination “Local” is no longer a folder. Choose another destination."
         );
         fs::remove_file(&local_path).unwrap();
 
@@ -7108,6 +7372,274 @@ mod tests {
         assert!(valid.ready, "{:?}", valid.issues);
 
         fs::remove_dir_all(&local_path).unwrap();
+    }
+
+    // Technical words that must never reach the window.
+    fn assert_plain(message: &str) {
+        for leak in [
+            "os error",
+            "SQLite",
+            "sqlite",
+            "rusqlite",
+            "database",
+            "Unable to",
+            "/Volumes",
+            "/Users",
+            "drive:",
+            "local:",
+            "UUID",
+            "panicked",
+        ] {
+            assert!(!message.contains(leak), "{message:?} contains {leak:?}");
+        }
+    }
+
+    #[test]
+    fn internal_errors_become_plain_messages() {
+        let cases = [
+            // Catalogue states.
+            (
+                "Unable to query catalogue: database is locked",
+                "open this folder",
+                CATALOGUE_BUSY,
+            ),
+            (
+                "Unable to open catalogue database: database disk image is malformed",
+                "load your drives",
+                CATALOGUE_DAMAGED,
+            ),
+            (
+                "Unable to save planned move: file is not a database",
+                "add this to the plan",
+                CATALOGUE_DAMAGED,
+            ),
+            (
+                "Unable to save drive label: database or disk is full",
+                "save the label",
+                MAC_FULL,
+            ),
+            // Copy failures name the side that failed.
+            (
+                "Unable to write the copy: No space left on device (os error 28)",
+                "copy the file",
+                "The destination ran out of space during the copy. Free some space there, then copy again.",
+            ),
+            (
+                "Unable to create temporary destination file: Read-only file system (os error 30)",
+                "copy the file",
+                "The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to.",
+            ),
+            (
+                "Unable to create temporary destination file: Permission denied (os error 13)",
+                "copy the file",
+                "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again.",
+            ),
+            (
+                "Unable to open source file: Operation not permitted (os error 1)",
+                "copy the file",
+                "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again.",
+            ),
+            (
+                "Unable to read the source file: Input/output error (os error 5)",
+                "copy the file",
+                "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to verify source file: Device not configured (os error 6)",
+                "copy the file",
+                "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to open source file: No such file or directory (os error 2)",
+                "copy the file",
+                "The source file is no longer there. Rescan the source drive to update the catalogue.",
+            ),
+            (
+                "Unable to sync copied file: Input/output error (os error 5)",
+                "copy the file",
+                "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to create destination folder: No such file or directory (os error 2)",
+                "copy the file",
+                "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            // Anything else says what couldn't be done.
+            (
+                "Unable to create transfer record: constraint failed",
+                "copy the file",
+                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Destination location drive:UUID-B has no drive identity.",
+                "copy the file",
+                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Unable to inspect selected folder: Operation not permitted (os error 1)",
+                "add that folder",
+                "macOS didn't let Media Mapper add that folder. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again.",
+            ),
+            (
+                "Unable to read /Volumes: Input/output error (os error 5)",
+                "check which drives are connected",
+                "Media Mapper couldn't check which drives are connected. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Background task failed: task 7 panicked",
+                "load the plan",
+                "Media Mapper couldn't load the plan. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+        ];
+        for (internal, action, expected) in cases {
+            let shown = present_error(internal, action);
+            assert_eq!(shown, expected, "for {internal:?}");
+            assert_plain(&shown);
+        }
+    }
+
+    #[test]
+    fn messages_written_for_the_window_pass_through() {
+        for message in [
+            TRANSFER_CANCELLED,
+            COPIED_NOT_RECORDED,
+            DESTINATION_UNAVAILABLE,
+            DESTINATION_EXISTS,
+            DESTINATION_APPEARED,
+            VERIFICATION_FAILED,
+            SOURCE_NOT_A_FILE,
+            NEWER_CATALOGUE_MESSAGE,
+            DRIVE_WITHOUT_IDENTITY,
+            "Scan cancelled.",
+            "A transfer is running. Wait for it to finish, then scan the drive.",
+            "That file points outside its drive, so it was not opened.",
+        ] {
+            assert_eq!(present_error(message, "copy the file"), message);
+            assert_plain(message);
+        }
+        // The window recognises these by their wording.
+        assert_eq!(TRANSFER_CANCELLED, "Copy cancelled.");
+        assert!(COPIED_NOT_RECORDED.starts_with(
+            "The file was copied and verified, but Media Mapper couldn't save that it finished."
+        ));
+        assert_eq!(
+            DESTINATION_UNAVAILABLE,
+            "The destination became unavailable during the copy."
+        );
+    }
+
+    #[test]
+    fn transfer_history_shows_failures_in_plain_words() {
+        assert_eq!(
+            present_transfer_error(INTERRUPTED_TRANSFER_MESSAGE),
+            "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+        );
+        assert_eq!(
+            present_transfer_error("Unable to copy file: Input/output error (os error 5)"),
+            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+        );
+        assert_eq!(
+            present_transfer_error("Unable to read the source file: Input/output error (os error 5)"),
+            "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        );
+        assert_eq!(
+            present_transfer_error(TRANSFER_CANCELLED),
+            TRANSFER_CANCELLED
+        );
+        assert_eq!(
+            present_transfer_error(DESTINATION_EXISTS),
+            DESTINATION_EXISTS
+        );
+    }
+
+    #[test]
+    fn plan_issues_name_files_not_paths_or_ids() {
+        let database = TestDatabase::new("issue-wording");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov',
+                         'Films/Été 2024', 0, 100)",
+                [],
+            )
+            .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Films/Été 2024/Café clip.mov",
+            "drive:UUID-B",
+            "Video/Café clip.mov",
+        )
+        .unwrap();
+
+        let live = validate_plan_live(&connection, &[]).unwrap();
+        let source = live
+            .issues
+            .iter()
+            .find(|issue| issue.code == "source_drive_offline")
+            .unwrap();
+        assert_eq!(
+            source.message,
+            "The drive that holds Café clip.mov isn't connected."
+        );
+
+        // A source that has left the catalogue.
+        connection
+            .execute("DELETE FROM files WHERE drive_id = 'UUID-A'", [])
+            .unwrap();
+        let preflight = plan_preflight(&connection).unwrap();
+        let missing = preflight
+            .issues
+            .iter()
+            .find(|issue| issue.code == "missing_source")
+            .unwrap();
+        assert_eq!(
+            missing.message,
+            "Café clip.mov is no longer in the catalogue. Rescan its drive, or remove it from the plan."
+        );
+
+        for issue in live.issues.iter().chain(&preflight.issues) {
+            assert_plain(&issue.message);
+            assert!(!issue.message.contains("Films/"), "{}", issue.message);
+        }
+    }
+
+    #[test]
+    fn the_diagnostics_log_appends_and_rolls_over() {
+        let directory = std::env::temp_dir().join(format!(
+            "media-mapper-log-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("media-mapper.log");
+
+        append_log(&log, "Couldn't copy the file: first");
+        append_log(&log, "Couldn't copy the file: second");
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+
+        // Past the limit, the log moves aside and a new one starts.
+        fs::write(&log, vec![b'x'; LOG_LIMIT_BYTES as usize + 1]).unwrap();
+        append_log(&log, "after rollover");
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .trim_end()
+                .split_once(' ')
+                .unwrap()
+                .1,
+            "after rollover"
+        );
+        assert!(directory.join("media-mapper.log.1").exists());
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -7463,7 +7995,7 @@ mod tests {
 
         let error = rename_exclusive(&temporary, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_APPEARED);
         assert_eq!(fs::read(&destination).unwrap(), b"existing contents");
         assert_eq!(fs::read(&temporary).unwrap(), b"new contents");
     }
@@ -7486,7 +8018,7 @@ mod tests {
 
         let error = copy_file_verified(&source, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_EXISTS);
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
     }
@@ -8584,7 +9116,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let error =
             execute_transfer_paths(&connection, move_id, &source, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_EXISTS);
 
         assert_eq!(fs::read(&source).unwrap(), b"new source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
@@ -8609,7 +9141,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             .error_message
             .as_deref()
             .unwrap_or("")
-            .contains("Destination already exists"));
+            .contains(DESTINATION_EXISTS));
         assert!(source.exists());
     }
 
@@ -8827,7 +9359,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
 
         let error = create_transfer_record(&connection, 999).unwrap_err();
 
-        assert!(error.contains("planned move no longer exists"), "{error}");
+        assert_eq!(error, "That file is no longer in the plan.");
         assert!(list_transfer_records(&connection).unwrap().is_empty());
     }
 
@@ -9925,7 +10457,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
             .unwrap_err();
 
-        assert!(error.contains("not currently present"), "{error}");
+        assert!(error.contains("no longer on the source drive"), "{error}");
         assert!(list_transfer_records(&fixture.connection)
             .unwrap()
             .is_empty());
@@ -10003,7 +10535,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         )
         .unwrap_err();
 
-        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(error, DESTINATION_APPEARED);
         assert_eq!(fs::read(&fixture.destination).unwrap(), b"arrived mid-copy");
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
         assert_eq!(
@@ -10372,10 +10904,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             fs::write(source, &changed).unwrap()
         });
 
-        assert!(
-            error.contains("failed byte-for-byte verification"),
-            "{error}"
-        );
+        assert!(error == VERIFICATION_FAILED, "{error}");
         assert_failed_without_copy(&fixture);
     }
 
@@ -10388,10 +10917,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             fs::write(source, &changed).unwrap()
         });
 
-        assert!(
-            error.contains("failed byte-for-byte verification"),
-            "{error}"
-        );
+        assert!(error == VERIFICATION_FAILED, "{error}");
         assert_failed_without_copy(&fixture);
     }
 
@@ -10504,7 +11030,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             &mut |_, _| panic!("nothing may be copied"),
         )
         .unwrap_err();
-        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(error, DESTINATION_EXISTS);
 
         assert_eq!(fs::read_link(&fixture.destination).unwrap(), missing);
         assert!(!missing.exists());
@@ -10780,7 +11306,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
                         &fixture.drives,
                     )
                     .unwrap_err();
-                    assert!(error.contains("no longer exists"), "{error}");
+                    assert_eq!(error, "That file is no longer in the plan.");
                     assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
                 }
                 Interruption::FinalisedThenReplaced => {
@@ -10889,7 +11415,10 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         )
         .unwrap_err();
 
-        assert!(!error.is_empty());
+        assert_eq!(
+            present_error(&error, "copy the file"),
+            "The destination ran out of space during the copy. Free some space there, then copy again."
+        );
         assert!(!destination.exists());
         assert!(partial_files(destination.parent().unwrap()).is_empty());
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
