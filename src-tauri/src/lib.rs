@@ -839,6 +839,9 @@ fn issue_blocks_move(
     }
 }
 
+const FOLDER_TRANSFER_UNSUPPORTED: &str =
+    "Folders can't be copied yet. Plan the files inside the folder instead.";
+
 #[cfg(test)]
 fn execute_planned_transfer(
     connection: &Connection,
@@ -929,6 +932,25 @@ fn execute_planned_transfer_reporting(
     let Some((destination_location_id, _)) = &destination else {
         return Err("The planned move no longer exists.".to_string());
     };
+
+    // Transfers copy one file. Folder moves can be planned and previewed, but
+    // copying one is refused here, before any record or folder is created,
+    // rather than relying on the window to leave them out.
+    let source_is_directory: bool = connection
+        .query_row(
+            "SELECT COALESCE(f.is_directory, 0) != 0
+             FROM planned_moves p
+             LEFT JOIN files f
+               ON f.drive_id = p.source_drive_id
+              AND f.relative_path = p.source_relative_path
+             WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to read planned transfer: {error}"))?;
+    if source_is_directory {
+        return Err(FOLDER_TRANSFER_UNSUPPORTED.to_string());
+    }
 
     // Only issues that concern this move stop it. A problem with another
     // planned move, such as its drive being disconnected, does not.
@@ -9413,6 +9435,40 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(fs::read_link(&fixture.destination).unwrap(), missing);
         assert!(!missing.exists());
         assert!(partial_files(&archive).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[test]
+    fn planned_folder_is_refused_before_any_record_is_made() {
+        let mut fixture = transfer_fixture_with(
+            "matrix-folder-move",
+            "Films/film.mov",
+            "Archive/film.mov",
+            b"inside a folder".to_vec(),
+        );
+        // Plan the folder itself instead of the file inside it.
+        fixture
+            .connection
+            .execute("DELETE FROM planned_moves", [])
+            .unwrap();
+        let folder_move = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            "Films",
+            "drive:UUID-B",
+            "Archive/Films",
+        )
+        .unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, folder_move, &fixture.drives)
+            .unwrap_err();
+
+        assert_eq!(error, FOLDER_TRANSFER_UNSUPPORTED);
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.destination_volume.0.join("Archive").exists());
+        assert!(planned_move_exists(&fixture.connection, folder_move));
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
     }
 
