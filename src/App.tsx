@@ -821,6 +821,25 @@ function App() {
     to: formatLocationPath(move.destinationLocationName, move.destinationRelativePath),
   });
 
+  const previewPlannedDestination = async (locationId: string) => {
+    const location = locations.find((item) => item.id === locationId);
+    if (!location || location.kind !== "external_drive" || !location.driveId) {
+      return;
+    }
+
+    const drive = catalogued.find(
+      (item) => item.persistentIdentifier === location.driveId,
+    );
+    if (!drive) {
+      return;
+    }
+
+    setSearchQuery("");
+    setSearchResults([]);
+    setActiveView("browse");
+    await openFolder(drive, "");
+  };
+
   const beginDriveLabelEdit = (persistentIdentifier: string, currentLabel: string | null) => {
     setEditingDriveLabelId(persistentIdentifier);
     setDriveLabelDraft(currentLabel ?? "");
@@ -1731,6 +1750,15 @@ function App() {
                       <div>
                         <span className="plan-capacity-label">Destination</span>
                         <strong>{destination.displayName}</strong>
+                        {destination.kind === "external_drive" && (
+                          <button
+                            type="button"
+                            className="plan-preview-button"
+                            onClick={() => void previewPlannedDestination(destination.locationId)}
+                          >
+                            Preview organisation
+                          </button>
+                        )}
                       </div>
                       <div>
                         <span className="plan-capacity-label">Planned</span>
