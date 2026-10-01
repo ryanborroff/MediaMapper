@@ -1580,10 +1580,21 @@ function App() {
     const knownBytes = planPreflight?.knownBytes ?? fileMoves.reduce((sum, move) => sum + (move.sourceSizeBytes ?? 0), 0);
     const sourceIds = Array.from(new Set(plannedMoves.map((move) => move.sourceDriveId)));
     const destinationIds = Array.from(new Set(plannedMoves.map((move) => move.destinationLocationId)));
+    const planIssues = [
+      ...(planValidation?.issues ?? []),
+      ...(planPreflight?.issues ?? []),
+    ];
+    const offlineSourceNames = planIssues
+      .filter((issue) => issue.code === "source_drive_offline" && issue.moveId !== null)
+      .flatMap((issue) => {
+        const move = plannedMoves.find((item) => item.id === issue.moveId);
+        return move ? [sourceDriveName(move.sourceDriveId)] : [];
+      });
     const missingNames = Array.from(new Set([
       ...sourceIds
         .filter((id) => !connectedIds.has(id))
         .map((id) => sourceDriveName(id)),
+      ...offlineSourceNames,
       ...destinationIds.flatMap((id) => {
         const location = locations.find((item) => item.id === id);
         if (!location || location.kind === "local_folder") return [];
@@ -1592,10 +1603,6 @@ function App() {
           : [];
       }),
     ]));
-    const planIssues = [
-      ...(planValidation?.issues ?? []),
-      ...(planPreflight?.issues ?? []),
-    ];
     const planReady = isPlanReady(plannedMoves, planValidation, planPreflight);
     const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
 
