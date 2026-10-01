@@ -3739,6 +3739,7 @@ struct PreflightMove {
     destination_location_id: String,
     destination_display_name: Option<String>,
     destination_kind: Option<String>,
+    destination_local_path: Option<String>,
     destination_available_bytes: Option<i64>,
 }
 
@@ -3752,6 +3753,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                         p.destination_location_id,
                         COALESCE(NULLIF(l.user_label, ''), l.display_name),
                         l.kind,
+                        l.local_path,
                         CASE WHEN l.kind = 'external_drive' THEN d.available_bytes ELSE NULL END
                  FROM planned_moves p
                  LEFT JOIN locations l ON l.id = p.destination_location_id
@@ -3769,7 +3771,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     destination_location_id: row.get(3)?,
                     destination_display_name: row.get(4)?,
                     destination_kind: row.get(5)?,
-                    destination_available_bytes: row.get(6)?,
+                    destination_local_path: row.get(6)?,
+                    destination_available_bytes: row.get(7)?,
                 })
             })
             .map_err(|error| format!("Unable to read plan preflight: {error}"))?;
@@ -3814,7 +3817,15 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     0,
                     0,
                     0,
-                    planned.destination_available_bytes,
+                    match destination_kind.as_str() {
+                        "local_folder" => planned
+                            .destination_local_path
+                            .as_deref()
+                            .and_then(|path| free_bytes_at(Path::new(path)).ok())
+                            .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
+                            .map(|free| free.min(i64::MAX as u64) as i64),
+                        _ => planned.destination_available_bytes,
+                    },
                 )
             });
         destination.2 += 1;
