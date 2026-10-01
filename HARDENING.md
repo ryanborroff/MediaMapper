@@ -99,33 +99,23 @@ Each gap is classed as **Blocker**, **Should fix before V1** or **Safe to defer*
 15. **Should fix before V1.** **Many backend errors reach the window raw**, as `Unable to … : <rusqlite/io error>`. Some include full paths, such as `Destination already exists: /Volumes/…`, and some include location ids, such as `Destination location … has no drive identity.` That's Phase 6.
 16. **Should fix before V1.** Accessibility hasn't been audited. The folder picker is `role="dialog"` without modal focus management, and transfer progress uses `aria-live`. That's Phase 5.
 
-## Phase 2 test plan (awaiting approval)
+## Phase 2: Safety and recovery matrix (done 2026-10-01)
 
-The full matrix will live in `SAFETY-MATRIX.md`. For each case it records the test, the expected result, whether it's automated or manual, current coverage, the result and any follow-up.
+The full matrix is in [SAFETY-MATRIX.md](SAFETY-MATRIX.md). It covers 63 cases with expected results, the tests covering them, results and follow-ups, plus exact steps for the 11 manual cases that need real drives.
 
-Every automated test uses the existing fixtures (`transfer_fixture`, `progress_fixture`, `simulate_interrupted_transfer`) on temporary folders and never real drives. Each one asserts these invariants:
-
-- The source bytes are unchanged.
-- No final destination file exists unless the status is `completed`, and a `completed` destination is byte-identical to the source.
-- No `.partial` file remains after a cancel or failure that the app itself observed.
-- The plan item remains unless the move completed.
-- History is truthful.
-
-| Group | Cases | How |
-| --- | --- | --- |
-| Normal | single file; multi-file loop (sequential calls); 5+ MB multi-chunk; different simulated volumes; local-folder destination; nested new folders; spaces; Unicode NFC and NFD; zero-byte; exact-fit capacity; capacity one byte short | automated |
-| Cancellation | before the first chunk; mid-copy (exists); during verification; between files (a cancel set before the next call must not be lost, gap 4); after some files are complete (earlier files stay valid, the rest stay planned) | automated. The between-files case first shows the race, then guards the fix. |
-| Source failure | offline before execution (exists); removed after planning (exists); changed after planning (exists); replaced by a symlink before validation (exists) and between validation and open (gap 2); remounted at a new mount point (exists); modified during the copy, so verification fails; deleted mid-copy | automated, except that a physical disconnect during the copy or verification is **manual** |
-| Destination failure | offline before execution (exists); folder renamed or deleted during the copy or verification (exists); folder made read-only; destination exists before execution (exists) or appears during the copy (exists); dangling symlink at the destination (gap 6); insufficient space at validation (exists) or changed since planning (exists) | automated. ENOSPC mid-copy is semi-automated with a small `hdiutil` disk image, opt-in and `#[ignore]` by default. A physical unplug is **manual**. |
-| App interruption | killed in `pending`, in `copying` (exists), in `verifying` before the rename (exists), and after the rename but before bookkeeping (exists); relaunch; retry; stale partial (exists); unrelated file at the partial path (exists); folder or link at the partial path | simulated state is automated. A real quit or force-kill (`kill -9`) during the copy and verification is **manual**, with a script. |
-| Concurrency | second execution while one runs (exists); same move twice (exists); scan refused while a transfer holds the lock; reads during a scan (exists); bookkeeping contention (exists) plus contention beyond the timeout (gap 3) | automated |
-| Recovery invariants | for every interrupted state: correct status after relaunch, never a false `completed`, source intact, a mismatched destination never trusted, cleanup limited to `.mediamapper-transfer-<id>-<ts>.partial`, a retry that succeeds, a finalised copy not copied twice, plan and history consistent | automated, as a table-driven test across all the states |
-| Backend refusal | folder move sent straight to `execute_planned_move` is refused before a record is created (gap 1) | automated |
-
-The fixes for gaps 1–4 come as separate small commits, each test-first. Each test is shown failing before its fix where the gap is real. Manual cases get exact steps in `SAFETY-MATRIX.md`: a real external drive, unplugging it during the copy or verification, force-quitting, then relaunching and checking that history, the plan and the disk agree.
+- [x] 26 new automated tests. Rust tests went from 80 to 105, plus 1 opt-in disk-image test. All pass.
+- [x] Gap 1 fixed (`08bc9e7`): folder moves are refused by the backend before any record is made.
+- [x] Gap 2 fixed (`1b6db0d`): transfer sources are opened without following links, and must be regular files. Before this, a source swapped for a link after validation had the link's target copied and completed.
+- [x] Gap 3 fixed (`de3f8de`): a verified copy whose completion couldn't be saved is reported as copied, not as "Nothing was copied".
+- [x] Gap 4 fixed (`9379763`): a cancel is tied to its copy run, so it can't be cleared as the next file starts. A file whose run is already cancelled makes no record.
+- [x] Gap 6 fixed (`ff51ef9`): a dangling link at the destination is refused before copying.
+- [ ] Gap 5 deferred. See SAFETY-MATRIX F2.
+- [ ] Manual cases M1–M11 need a session with real drives. See SAFETY-MATRIX F5.
 
 ## Later phases
 
+- [x] Phase 1: baseline
+- [x] Phase 2: safety and recovery matrix, except the manual runs
 - [ ] Phase 3: release build validation, and `RELEASE-TESTING.md`
 - [ ] Phase 4: database and migration hardening, including fixtures for historical schemas and a written strategy
 - [ ] Phase 5: accessibility and keyboard QA

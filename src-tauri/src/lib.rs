@@ -9138,6 +9138,41 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
     }
 
     #[test]
+    fn file_is_copied_into_a_folder_on_this_mac() {
+        let mut fixture = transfer_fixture("matrix-local-folder");
+        let folder = fixture.destination_volume.0.join("Mac folder");
+        fs::create_dir_all(&folder).unwrap();
+        fixture
+            .connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Mac folder', ?1, 1)",
+                params![folder.to_string_lossy()],
+            )
+            .unwrap();
+        fixture
+            .connection
+            .execute("DELETE FROM planned_moves", [])
+            .unwrap();
+        fixture.move_id = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            "film.mov",
+            "local:test",
+            "Archive/film.mov",
+        )
+        .unwrap();
+        fixture.destination = folder.join("Archive/film.mov");
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+        assert_eq!(transfer.destination_location_id, "local:test");
+    }
+
+    #[test]
     fn deeply_nested_new_folders_are_created_for_the_copy() {
         let fixture = transfer_fixture_with(
             "matrix-nested",
