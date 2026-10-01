@@ -1237,7 +1237,7 @@ function App() {
               </label>
 
               <label>
-                <span>Folder</span>
+                <span>Subfolder <span className="field-optional">(optional)</span></span>
                 {(() => {
                   const destination = locations.find(
                     (location) => location.id === planDestinationLocationId,
@@ -1256,7 +1256,7 @@ function App() {
                         void openDestinationFolderPicker(planDestinationFolder);
                       }}
                     >
-                      <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
+                      <span className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
                         {planDestinationFolder || "Top level"}
                       </span>
                       <span className="folder-picker-choose">Choose…</span>
@@ -1264,7 +1264,7 @@ function App() {
                   ) : (
                     <div className="folder-picker-readonly">
                       {destination?.kind === "local_folder"
-                        ? "Selected folder"
+                        ? `Copy directly to ${destination.userLabel ?? destination.displayName}`
                         : "Choose a location first"}
                     </div>
                   );
@@ -1723,6 +1723,31 @@ function App() {
                   </strong>
                 </div>
               </section>
+
+              {planPreflight && planPreflight.destinations.length > 0 && (
+                <section className="plan-capacity" aria-label="Destination capacity">
+                  {planPreflight.destinations.map((destination) => (
+                    <div className="plan-capacity-row" key={destination.locationId}>
+                      <div>
+                        <span className="plan-capacity-label">Destination</span>
+                        <strong>{destination.displayName}</strong>
+                      </div>
+                      <div>
+                        <span className="plan-capacity-label">Planned</span>
+                        <strong>{formatBytes(destination.knownBytes)}</strong>
+                      </div>
+                      <div>
+                        <span className="plan-capacity-label">Space after transfer</span>
+                        <strong className={destination.capacitySufficient === false ? "plan-capacity-insufficient" : undefined}>
+                          {destination.projectedAvailableBytes === null
+                            ? "Not available"
+                            : formatBytes(destination.projectedAvailableBytes)}
+                        </strong>
+                      </div>
+                    </div>
+                  ))}
+                </section>
+              )}
 
               {missingNames.length > 0 && (
                 <section className="connect-instruction">
