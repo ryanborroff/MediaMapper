@@ -544,7 +544,7 @@ function App() {
         : {
           stopped: false,
           cancelled: false,
-          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals stay in place.${skippedNote}`,
+          message: `${completed.toLocaleString()} ${completed === 1 ? "file" : "files"} copied and verified. Originals remain untouched.${skippedNote}`,
         });
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
@@ -1571,7 +1571,7 @@ function App() {
                   <p>Preparing transfer…</p>
                 )}
                 <p>File {fileIndex.toLocaleString()} of {moves.length.toLocaleString()}</p>
-                <p>Originals stay in place.</p>
+                <p>Originals remain untouched.</p>
                 <button className="plan-transfer-cancel" type="button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
                   {cancellingCopy ? "Cancelling…" : "Cancel"}
                 </button>
@@ -2452,7 +2452,7 @@ function App() {
                   </div>
                 );
               })()}
-              <p>Each file is copied and verified before the next one starts. Originals stay in place.</p>
+              <p>Each file is copied and verified before the next one starts. Originals remain untouched.</p>
               <div>
                 <button className="secondary-button" disabled={cancellingCopy} onClick={() => void cancelCopy()}>
                   {cancellingCopy ? "Cancelling…" : "Cancel copy"}
@@ -2571,7 +2571,7 @@ function App() {
                     <div>
                       <strong>Copy planned files</strong>
                       <span>
-                        Copies are verified before completion. Originals stay in place.
+                        Copies are verified before completion. Originals remain untouched.
                       </span>
                       {folderMoveCount > 0 && (
                         <span>
