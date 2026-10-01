@@ -216,6 +216,6 @@ What changed:
 - [x] Phase 4: database and migration hardening, and `DATABASE.md`
 - [x] Phase 5: accessibility and keyboard QA, and `ACCESSIBILITY.md` (except the VoiceOver run by hand)
 - [x] Phase 6: error message audit, and `ERROR-MESSAGES.md`
-- [ ] Phase 7: duplicate awareness. Needs the design approved first.
+- [~] Phase 7: duplicate awareness. The proposal, [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md), is waiting for approval. Nothing is built yet.
 - [ ] Phase 8: shipping audit
 - [ ] Phase 9: `RELEASE-READINESS.md`
