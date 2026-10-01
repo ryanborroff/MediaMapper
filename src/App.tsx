@@ -720,8 +720,27 @@ function App() {
       return;
     }
 
+    const previousConnectedCount = previousConnectedDriveFingerprint.current
+      ? previousConnectedDriveFingerprint.current.split("\n").length
+      : 0;
+    const currentConnectedCount = connectedDriveFingerprint
+      ? connectedDriveFingerprint.split("\n").length
+      : 0;
     previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
-    void loadPlannedMoves({ silent: true });
+
+    if (currentConnectedCount <= previousConnectedCount) {
+      void loadPlannedMoves({ silent: true });
+      return;
+    }
+
+    // macOS can report a newly mounted removable volume before the filesystem
+    // is fully ready. Give reconnects a moment to settle before validating the
+    // plan, and cancel this refresh if drive state changes again meanwhile.
+    const timeout = window.setTimeout(() => {
+      void loadPlannedMoves({ silent: true });
+    }, 1000);
+
+    return () => window.clearTimeout(timeout);
   }, [connectedDriveFingerprint, loadPlannedMoves]);
 
   const locationForDrive = (persistentIdentifier: string | null) =>
