@@ -1332,12 +1332,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--text);
   font: inherit;
   font-size: 14px;
-  outline: none;
 }
 
+/* The shared focus ring marks the field. The faint halo it replaces was
+   too low in contrast to show where focus was. */
 .browse-global-search:focus {
   border-color: var(--border-strong);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 14%, transparent);
 }
 
 .browse-search-block .hidden-items-toggle {
@@ -1426,6 +1426,28 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .browse-result-meta > span:first-child {
   min-width: 0;
+}
+
+/* A file result's location opens its folder. It reads as the plain path. */
+.browse-result-meta > .browse-result-location {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.browse-result-location:hover {
+  color: var(--text-body);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .browse-result-name .browse-drive-state {
@@ -2139,8 +2161,9 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--text-muted);
 }
 
+/* "From" and "To". --text-disabled was below 4.5:1 for this live text. */
 .transfer-path > span {
-  color: var(--text-disabled);
+  color: var(--text-muted);
 }
 
 .plan-remove-button,
@@ -2496,3 +2519,23 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   }
 }
 
+
+/* Read by VoiceOver, not shown. !important beats rules such as
+   `.transfer-path > span` that style every span in a container. */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* Sections and headings that receive focus from code, so VoiceOver reads
+   them, get no ring: they aren't controls. */
+[tabindex="-1"]:focus-visible {
+  outline: none;
+}

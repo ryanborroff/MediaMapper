@@ -467,6 +467,32 @@ function App() {
     message: string;
   } | null>(null);
 
+  // Where keyboard focus goes after the next render. Used when a control
+  // replaces itself or closes, which would otherwise drop focus to the
+  // window. With `onlyIfLost`, focus stays wherever the user has moved it.
+  const [pendingFocus, setPendingFocus] = useState<{ selector: string; onlyIfLost?: boolean } | null>(null);
+  useEffect(() => {
+    if (!pendingFocus) return;
+    setPendingFocus(null);
+    const active = document.activeElement as HTMLButtonElement | null;
+    const lost = !active || active === document.body || active.disabled || !active.isConnected;
+    if (pendingFocus.onlyIfLost && !lost) return;
+    document.querySelector<HTMLElement>(pendingFocus.selector)?.focus();
+  }, [pendingFocus]);
+
+  // Read out by VoiceOver: each copy stage, copy outcomes and scan results.
+  // Figures that change many times a second stay out of it.
+  const [announcement, setAnnouncement] = useState("");
+  // Cleared once read, so reading through the page later doesn't meet it.
+  useEffect(() => {
+    if (!announcement) return;
+    const timeout = window.setTimeout(() => setAnnouncement(""), 8000);
+    return () => window.clearTimeout(timeout);
+  }, [announcement]);
+  const liveRegion = (
+    <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
+  );
+
   const loadLocations = useCallback(async () => {
     try {
       setLocations(await invoke<Location[]>("list_locations"));
@@ -541,6 +567,7 @@ function App() {
     setExecutionResult(null);
     setShowCopyConfirmation(false);
     setExecutionProgress({ moves: readyMoves, completed: 0 });
+    setPendingFocus({ selector: '[data-focus="transfer-progress"]' });
 
     let completed = 0;
     let currentMove: PlannedMove | undefined;
@@ -601,6 +628,7 @@ function App() {
       setFileProgress(null);
       setExecutingPlan(false);
       setExecutionProgress(null);
+      setPendingFocus({ selector: '[data-focus="transfer-result"]', onlyIfLost: true });
     }
   }, [
     loadPlannedMoves,
@@ -609,6 +637,24 @@ function App() {
     planValidation,
     plannedMoves,
   ]);
+
+  const copyStage = (() => {
+    if (!executionProgress) return "";
+    const { moves, completed } = executionProgress;
+    const current = moves[Math.min(completed, moves.length - 1)];
+    const stage = fileProgress?.plannedMoveId === current.id && fileProgress.stage === "verifying"
+      ? "Verifying"
+      : "Copying";
+    return `${stage} ${current.sourceName}, file ${Math.min(completed + 1, moves.length)} of ${moves.length}.`;
+  })();
+  useEffect(() => {
+    if (copyStage) setAnnouncement(copyStage);
+  }, [copyStage]);
+  useEffect(() => {
+    if (!executionResult) return;
+    const heading = executionResult.cancelled ? "Copy cancelled." : executionResult.stopped ? "Copy stopped." : "Copy finished.";
+    setAnnouncement(`${heading} ${executionResult.message}`);
+  }, [executionResult]);
 
   const cancelCopy = async () => {
     cancelRequested.current = true;
@@ -698,6 +744,20 @@ function App() {
     planPanel.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
     planLocationSelect.current?.focus({ preventScroll: true });
   }, [selectedPlanEntry]);
+
+  // Opening the folder picker, or moving to another folder in it, puts focus
+  // on its first folder, or on Choose this folder when there are none.
+  useEffect(() => {
+    if (!folderPickerOpen || folderPickerLoading) return;
+    document.querySelector<HTMLElement>(
+      ".folder-picker-list button, .folder-picker-footer button",
+    )?.focus();
+  }, [folderPickerOpen, folderPickerLoading, folderPickerPath]);
+
+  const closeFolderPicker = () => {
+    setFolderPickerOpen(false);
+    setPendingFocus({ selector: '[data-focus="folder-picker-trigger"]' });
+  };
 
   // A refusal describes the destination it was given; once the user picks
   // another item, location or folder it no longer applies.
@@ -865,6 +925,11 @@ function App() {
     setDriveLabelDraft(currentLabel ?? "");
   };
 
+  const closeDriveLabelEditor = (persistentIdentifier: string) => {
+    setEditingDriveLabelId(null);
+    setPendingFocus({ selector: `[data-focus="label-${CSS.escape(persistentIdentifier)}"]` });
+  };
+
   const saveDriveLabel = async (persistentIdentifier: string) => {
     setSavingDriveLabel(true);
     setError(null);
@@ -877,6 +942,7 @@ function App() {
       await loadLocations();
       setEditingDriveLabelId(null);
       setDriveLabelDraft("");
+      setPendingFocus({ selector: `[data-focus="label-${CSS.escape(persistentIdentifier)}"]` });
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1071,7 +1137,16 @@ function App() {
       .catch((reason) => setError(String(reason)));
   };
 
+  // The row whose Add to plan opened the panel. Focus returns there when the
+  // panel closes, to Add to plan or to the Remove that replaced it.
+  const planReturnRow = useRef("");
+  const closePlanPanel = () => {
+    setSelectedPlanEntry(null);
+    setPendingFocus({ selector: `[data-row-action="${CSS.escape(planReturnRow.current)}"] button` });
+  };
+
   const beginPlanMove = (drive: CataloguedDrive, entry: CatalogueEntry) => {
+    planReturnRow.current = `${drive.persistentIdentifier}:${entry.relativePath}`;
     setSelectedPlanEntry(entry);
     setPlanSourceDrive(drive);
     // Do not preselect the source drive. Planning should begin with an
@@ -1133,7 +1208,7 @@ function App() {
       await loadPlannedMoves();
       if (browserDrive) await openFolder(browserDrive, browserPath);
 
-      setSelectedPlanEntry(null);
+      closePlanPanel();
       setPlanDestinationFolder("");
     } catch (cause) {
       setPlanError(String(cause));
@@ -1217,15 +1292,25 @@ function App() {
       proposedDestinationPath === selectedPlanEntry.relativePath;
 
     return (
-  <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
+  <section
+    className="plan-move-panel compact-plan-panel"
+    ref={planPanel}
+    aria-labelledby="plan-panel-heading"
+    onKeyDown={(event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closePlanPanel();
+      }
+    }}
+  >
             <div className="plan-move-heading">
               <div>
-                <h2>Add to plan</h2>
+                <h2 id="plan-panel-heading">Add to plan</h2>
                 <p className="plan-file-summary" title={selectedPlanEntry.name}>
                   {selectedPlanEntry.name}
                 </p>
               </div>
-              <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
+              <button className="plan-cancel-button" onClick={closePlanPanel}>Cancel</button>
             </div>
 
             <div className="plan-fields compact-plan-fields">
@@ -1276,7 +1361,7 @@ function App() {
               </label>
 
               <label>
-                <span>Subfolder <span className="field-optional">(optional)</span></span>
+                <span id="plan-subfolder-label">Subfolder <span className="field-optional">(optional)</span></span>
                 {(() => {
                   const destination = locations.find(
                     (location) => location.id === planDestinationLocationId,
@@ -1288,17 +1373,20 @@ function App() {
                     <button
                       type="button"
                       className="folder-picker-button"
+                      data-focus="folder-picker-trigger"
                       aria-expanded={folderPickerOpen}
+                      aria-controls="folder-picker"
+                      aria-labelledby="plan-subfolder-label folder-picker-path folder-picker-choose"
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
                         void openDestinationFolderPicker(planDestinationFolder);
                       }}
                     >
-                      <span className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
+                      <span id="folder-picker-path" className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
                         {planDestinationFolder || "Top level"}
                       </span>
-                      <span className="folder-picker-choose">Choose…</span>
+                      <span id="folder-picker-choose" className="folder-picker-choose">Choose…</span>
                     </button>
                   ) : (
                     <div className="folder-picker-readonly">
@@ -1315,21 +1403,42 @@ function App() {
               const parts = folderPickerPath ? folderPickerPath.split("/") : [];
 
               return (
-                <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
+                <div
+                  className="folder-picker"
+                  id="folder-picker"
+                  role="group"
+                  aria-labelledby="folder-picker-heading"
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      // Closes the picker only, not the panel around it.
+                      event.preventDefault();
+                      event.stopPropagation();
+                      closeFolderPicker();
+                    }
+                  }}
+                >
                   <div className="folder-picker-header">
-                    <strong>Choose folder</strong>
-                    <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
+                    <strong id="folder-picker-heading">Choose folder</strong>
+                    <button type="button" onClick={closeFolderPicker}>Cancel</button>
                   </div>
                   <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
-                    <button type="button" onClick={() => void openDestinationFolderPicker("")}>
+                    <button
+                      type="button"
+                      aria-current={parts.length === 0 ? "location" : undefined}
+                      onClick={() => void openDestinationFolderPicker("")}
+                    >
                       Top level
                     </button>
                     {parts.map((part, index) => {
                       const path = parts.slice(0, index + 1).join("/");
                       return (
                         <span key={path}>
-                          <span>/</span>
-                          <button type="button" onClick={() => void openDestinationFolderPicker(path)}>
+                          <span aria-hidden="true">/</span>
+                          <button
+                            type="button"
+                            aria-current={index === parts.length - 1 ? "location" : undefined}
+                            onClick={() => void openDestinationFolderPicker(path)}
+                          >
                             {part}
                           </button>
                         </span>
@@ -1347,7 +1456,7 @@ function App() {
                         key={entry.relativePath}
                         onClick={() => void openDestinationFolderPicker(entry.relativePath)}
                       >
-                        <span>{entry.name}</span><span>›</span>
+                        <span>{entry.name}</span><span aria-hidden="true">›</span>
                       </button>
                     ))}
                   </div>
@@ -1357,7 +1466,7 @@ function App() {
                       className="browse-button"
                       onClick={() => {
                         setPlanDestinationFolder(folderPickerPath);
-                        setFolderPickerOpen(false);
+                        closeFolderPicker();
                       }}
                     >
                       Choose this folder
@@ -1431,9 +1540,13 @@ function App() {
     setScanComplete(null);
     setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
     setError(null);
+    const name = driveDisplayName(drive.persistentIdentifier, drive.name);
+    setAnnouncement(`Scanning ${name}.`);
+    setPendingFocus({ selector: `[data-focus="cancel-scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
     try {
       const result = await invoke<ScanResult>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
+      setAnnouncement(`Scan of ${name} complete. ${result.fileCount.toLocaleString()} files, ${result.directoryCount.toLocaleString()} folders.${result.unreadableFolderCount > 0 ? ` ${unreadableSummary(result)}` : ""}`);
       // A scan can add a drive's location or rename it, and changes the names
       // and sizes planned moves show, so reload those alongside the drives.
       await Promise.all([refresh(), loadLocations(), loadPlannedMoves()]);
@@ -1458,6 +1571,7 @@ function App() {
       const message = String(cause);
       if (message.includes("Scan cancelled.")) {
         setScanCancelledId(drive.persistentIdentifier);
+        setAnnouncement("Scan cancelled.");
         window.setTimeout(() => setScanCancelledId(null), 4000);
       } else {
         setError(message);
@@ -1466,6 +1580,7 @@ function App() {
       setScanningId(null);
       setCancellingId(null);
       setScanProgress(null);
+      setPendingFocus({ selector: `[data-focus="scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
     }
   };
 
@@ -1497,25 +1612,26 @@ function App() {
             <button className="sidebar-item active" type="button" aria-current="page">Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content transfers-home">
           <header className="app-header">
             <div>
-              <h1>Transfers</h1>
+              <h1 tabIndex={-1} data-focus="page-heading">Transfers</h1>
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           {executionProgress && (() => {
             const { moves, completed } = executionProgress;
             const current = moves[Math.min(completed, moves.length - 1)];
             const paths = plannedMovePaths(current);
             return (
-              <section className="transfer-active-card" aria-live="polite">
+              <section className="transfer-active-card">
                 <span className="transfer-active-label">COPYING</span>
                 <h2>{current.sourceName}</h2>
                 <TransferPaths from={paths.from} to={paths.to} />
-                <div className="transfer-file-progress">
+                <div className="transfer-file-progress" aria-hidden="true">
                   <span style={{ width: `${moves.length ? (completed / moves.length) * 100 : 0}%` }} />
                 </div>
                 <p>{Math.min(completed + 1, moves.length)} of {moves.length} files · Each file is verified before the next begins.</p>
@@ -1524,12 +1640,24 @@ function App() {
           })()}
 
           {!executionProgress && executionResult && (
-            <section className={`transfer-result-card ${executionResult.cancelled ? "cancelled" : executionResult.stopped ? "failed" : "completed"}`}>
+            <section
+              className={`transfer-result-card ${executionResult.cancelled ? "cancelled" : executionResult.stopped ? "failed" : "completed"}`}
+              tabIndex={-1}
+              data-focus="transfer-result"
+            >
               <div>
                 <strong>{executionResult.cancelled ? "Copy cancelled" : executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
                 <p>{executionResult.message}</p>
               </div>
-              <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+              <button
+                className="section-action"
+                onClick={() => {
+                  setExecutionResult(null);
+                  setPendingFocus({ selector: '[data-focus="page-heading"]' });
+                }}
+              >
+                Dismiss
+              </button>
             </section>
           )}
 
@@ -1562,16 +1690,16 @@ function App() {
               </div>
             ) : (
               <>
-                <div className="transfer-history-new">
+                <div className="transfer-history-new" role="list">
                   {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
                     const outcome = transferOutcome(transfer);
                     const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
                     const location = locations.find((item) => item.id === transfer.destinationLocationId);
                     return (
-                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id}>
+                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id} role="listitem">
                         <span className="transfer-history-mark" aria-hidden="true">{outcome.tone === "completed" ? "✓" : outcome.tone === "failed" ? "×" : "–"}</span>
                         <div className="transfer-item">
-                          <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                          <strong id={`transfer-name-${transfer.id}`}>{fileName(transfer.sourceRelativePath)}</strong>
                           <TransferPaths
                             from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                             to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
@@ -1580,6 +1708,7 @@ function App() {
                             <button
                               className="transfer-reveal-button"
                               type="button"
+                              aria-describedby={`transfer-name-${transfer.id}`}
                               onClick={() => {
                                 setError(null);
                                 void invoke("reveal_transferred_file", { transferId: transfer.id })
@@ -1656,15 +1785,16 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content plan-home">
           <header className="app-header">
             <div>
-              <h1>Planned transfers</h1>
+              <h1 tabIndex={-1} data-focus="page-heading">Planned transfers</h1>
               <p className="intro">Organise your files. Decide what goes where. Copy only when you’re ready.</p>
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           {executionProgress && (() => {
             const { moves, completed } = executionProgress;
@@ -1680,7 +1810,12 @@ function App() {
             const fileIndex = Math.min(completed + 1, moves.length);
 
             return (
-              <section className="plan-transfer-progress" aria-live="polite">
+              <section
+                className="plan-transfer-progress"
+                tabIndex={-1}
+                data-focus="transfer-progress"
+                aria-label="Transfer in progress"
+              >
                 <span className="plan-transfer-progress-label">
                   {currentFileProgress
                     ? (currentFileProgress.stage === "copying" ? "COPYING" : "VERIFYING")
@@ -1718,7 +1853,7 @@ function App() {
           })()}
 
           {!executionProgress && executionResult && (
-            <section className="plan-transfer-progress" aria-live="polite">
+            <section className="plan-transfer-progress" tabIndex={-1} data-focus="transfer-result">
               <span className="plan-transfer-progress-label">
                 {executionResult.cancelled ? "TRANSFER CANCELLED" : executionResult.stopped ? "TRANSFER STOPPED" : "TRANSFER COMPLETE"}
               </span>
@@ -1727,7 +1862,14 @@ function App() {
                 <button className="section-action" type="button" onClick={() => setActiveView("transfers")}>
                   View transfers
                 </button>
-                <button className="browse-button" type="button" onClick={() => setExecutionResult(null)}>
+                <button
+                  className="browse-button"
+                  type="button"
+                  onClick={() => {
+                    setExecutionResult(null);
+                    setPendingFocus({ selector: '[data-focus="page-heading"]' });
+                  }}
+                >
                   {executionResult.stopped ? "Dismiss" : "Done"}
                 </button>
               </div>
@@ -1790,6 +1932,9 @@ function App() {
                           {destination.projectedAvailableBytes === null
                             ? "Not available"
                             : formatBytes(destination.projectedAvailableBytes)}
+                          {destination.capacitySufficient === false && (
+                            <span className="visually-hidden"> (not enough space)</span>
+                          )}
                         </strong>
                       </div>
                     </div>
@@ -1816,35 +1961,75 @@ function App() {
                 </section>
               )}
 
-              <section className="plan-file-list">
+              <section className="plan-file-list" role="list" aria-label="Planned files">
                 {plannedMoves.map((move) => {
                   const paths = plannedMovePaths(move);
                   return (
-                    <div className="plan-file-row" key={move.id}>
+                    <div className="plan-file-row" key={move.id} role="listitem">
                       <div className="transfer-item">
-                        <strong>{move.sourceName}</strong>
-                        <span className="transfer-path" title={paths.from}>{paths.from}</span>
-                        <span className="transfer-path" title={paths.to}><span className="plan-destination-arrow">→</span>{paths.to}</span>
+                        <strong id={`plan-move-${move.id}`}>{move.sourceName}</strong>
+                        <span className="transfer-path" title={paths.from}><span className="visually-hidden">From </span>{paths.from}</span>
+                        <span className="transfer-path" title={paths.to}><span className="plan-destination-arrow" aria-hidden="true">→</span><span className="visually-hidden">To </span>{paths.to}</span>
                       </div>
                       <div className="plan-file-side">
                         <span>{formatBytes(move.sourceSizeBytes)}</span>
-                        <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                        <button
+                          className="plan-remove-button"
+                          disabled={executingPlan}
+                          aria-describedby={`plan-move-${move.id}`}
+                          onClick={() => void removePlannedMove(move.id)}
+                        >
+                          Remove
+                        </button>
                       </div>
                     </div>
                   );
                 })}
               </section>
 
-              <section className="plan-review">
+              <section
+                className="plan-review"
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && showCopyConfirmation && !executingPlan) {
+                    event.preventDefault();
+                    setShowCopyConfirmation(false);
+                    setPendingFocus({ selector: '[data-focus="plan-continue"]' });
+                  }
+                }}
+              >
                 <div>
-                  <span>{showCopyConfirmation ? "Each file is copied and verified. Originals remain untouched." : "Originals remain untouched."}</span>
+                  <span tabIndex={showCopyConfirmation ? -1 : undefined} data-focus="copy-confirmation">
+                    {showCopyConfirmation ? "Each file is copied and verified. Originals remain untouched." : "Originals remain untouched."}
+                  </span>
                   {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
                 </div>
                 {!showCopyConfirmation ? (
-                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Continue</button>
+                  <button
+                    className="section-action"
+                    data-focus="plan-continue"
+                    disabled={!canCopy}
+                    onClick={() => {
+                      setExecutionResult(null);
+                      setShowCopyConfirmation(true);
+                      // The confirmation text, not Copy and verify, so pressing
+                      // Return twice can't start a copy.
+                      setPendingFocus({ selector: '[data-focus="copy-confirmation"]' });
+                    }}
+                  >
+                    Continue
+                  </button>
                 ) : (
                   <div className="plan-copy-actions">
-                    <button className="secondary-button" disabled={executingPlan} onClick={() => setShowCopyConfirmation(false)}>Cancel</button>
+                    <button
+                      className="secondary-button"
+                      disabled={executingPlan}
+                      onClick={() => {
+                        setShowCopyConfirmation(false);
+                        setPendingFocus({ selector: '[data-focus="plan-continue"]' });
+                      }}
+                    >
+                      Cancel
+                    </button>
                     <button className="section-action" disabled={!canCopy} onClick={() => void copyPlannedFiles()}>
                       {executingPlan ? "Copying…" : "Copy and verify"}
                     </button>
@@ -1876,6 +2061,7 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content browse-home">
           <header className="app-header">
             <div>
@@ -1883,7 +2069,7 @@ function App() {
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           <section className="browse-search-block">
             <input
@@ -1902,37 +2088,43 @@ function App() {
           </section>
 
           {libraryQuery.trim() ? (
-            <section className="browse-results" aria-live="polite">
-              <div className="browse-results-heading">
+            <section className="browse-results">
+              <div className="browse-results-heading" role="status">
                 <span>{librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} results`}</span>
               </div>
               {librarySearching ? <div className="browser-message">Searching catalogues…</div>
               : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-              : visibleLibraryResults.map((result) => {
+              : <div role="list" aria-label="Search results">{visibleLibraryResults.map((result, index) => {
                 const driveName = driveDisplayName(result.driveId, result.driveName);
                 const location = formatLocationPath(driveName, parentFolder(result.relativePath));
                 const plannedMove = plannedMoveBySource.get(`${result.driveId}\u0000${result.relativePath}`);
                 return (
+                  // A click anywhere on the row opens its folder. Keyboard and
+                  // VoiceOver use the buttons inside it: the name, the
+                  // location, and Add to plan or Remove.
                   <div
                     className="browse-result-row"
                     key={`${result.driveId}:${result.relativePath}`}
-                    role="button"
-                    tabIndex={0}
+                    role="listitem"
                     onClick={() => void openLibraryResult(result)}
-                    onKeyDown={(event) => {
-                      // Enter on the name or action buttons belongs to them.
-                      if (event.key === "Enter" && event.target === event.currentTarget) {
-                        event.preventDefault();
-                        void openLibraryResult(result);
-                      }
-                    }}
                   >
                     <span className="browse-result-name">
                       {result.isDirectory ? (
-                        <strong>{result.name}</strong>
+                        <button
+                          className="file-open-button browse-result-open"
+                          id={`result-name-${index}`}
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void openLibraryResult(result);
+                          }}
+                        >
+                          {result.name}
+                        </button>
                       ) : (
                         <button
                           className="file-open-button browse-result-open"
+                          id={`result-name-${index}`}
                           type="button"
                           title={`Open ${result.name}`}
                           onClick={(event) => {
@@ -1947,18 +2139,33 @@ function App() {
                         </button>
                       )}
                       <span className="browse-result-meta">
-                        <span title={location}>{location}</span>
+                        {result.isDirectory ? (
+                          <span title={location}>{location}</span>
+                        ) : (
+                          <button
+                            className="browse-result-location"
+                            type="button"
+                            title={`Show in ${location}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void openLibraryResult(result);
+                            }}
+                          >
+                            {location}
+                          </button>
+                        )}
                         {!connectedIds.has(result.driveId) && <span className="browse-drive-state">Drive offline</span>}
                       </span>
                     </span>
                     <span className="browse-result-size">{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
-                    <span className="row-action">
+                    <span className="row-action" data-row-action={`${result.driveId}:${result.relativePath}`}>
                       {result.isDirectory ? (
                         <FolderChevron />
                       ) : plannedMove ? (
                         <button
                           className="plan-remove-button"
                           type="button"
+                          aria-describedby={`result-name-${index}`}
                           disabled={executingPlan}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -1970,6 +2177,7 @@ function App() {
                       ) : (
                         <button
                           type="button"
+                          aria-describedby={`result-name-${index}`}
                           onClick={(event) => {
                             event.stopPropagation();
                             const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
@@ -1986,7 +2194,7 @@ function App() {
                     </span>
                   </div>
                 );
-              })}
+              })}</div>}
             </section>
           ) : (
             <section className="browse-drives">
@@ -2051,7 +2259,7 @@ function App() {
 
     return (
       <main className="app-navigation-shell">
-        <aside className="app-sidebar">
+        <aside className="app-sidebar" aria-label="Media Mapper">
           <div className="sidebar-brand">MediaMapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
@@ -2060,21 +2268,29 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content browse-detail">
           <header className="app-header browse-detail-header">
             <div>
               <nav className="browse-detail-breadcrumb" aria-label="Browse path">
                 <button type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>All files</button>
-                <span>/</span>
-                <button type="button" className={pathParts.length === 0 ? "current" : undefined} onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
+                <span aria-hidden="true">/</span>
+                <button
+                  type="button"
+                  className={pathParts.length === 0 ? "current" : undefined}
+                  aria-current={pathParts.length === 0 ? "location" : undefined}
+                  onClick={() => void openFolder(liveDrive, "")}
+                >
+                  {liveDriveName}
+                </button>
                 {pathParts.map((part, index) => {
                   const path = pathParts.slice(0, index + 1).join("/");
                   const current = index === pathParts.length - 1;
                   return (
                     <span className="browse-detail-crumb" key={path}>
-                      <span>/</span>
+                      <span aria-hidden="true">/</span>
                       {current
-                        ? <span className="current">{part}</span>
+                        ? <span className="current" aria-current="location">{part}</span>
                         : <button type="button" onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
                     </span>
                   );
@@ -2100,13 +2316,13 @@ function App() {
             </label>
           </section>
           {searchQuery.trim() && (
-            <div className="browse-results-heading">
+            <div className="browse-results-heading" role="status">
               {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} results`}
             </div>
           )}
 
-        {error && <div className="notice error">{error}</div>}
-        {searchQuery.trim() && <section className="file-browser" aria-live="polite">
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {searchQuery.trim() && <section className="file-browser">
           <div className="file-browser-head">
             <span>Name</span><span>Modified</span><span>Size</span><span>Action</span>
           </div>
@@ -2156,7 +2372,7 @@ function App() {
             <div className="browser-message">This folder is empty in the catalogue and plan.</div>
           ) : (
             <>
-              {visibleEntries.map((entry) => {
+              {visibleEntries.map((entry, index) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
                 const plannedFolderPrefix = `${entry.relativePath}/`;
                 const containsPlannedChanges =
@@ -2189,8 +2405,6 @@ function App() {
                       dragOverFolderPath === entry.relativePath ? "folder-drop-target" : "",
                     ].filter(Boolean).join(" ")}
                     key={entry.relativePath}
-                    role="button"
-                    tabIndex={0}
                     draggable
                     onDragStart={(event) => {
                       setDraggedEntry(entry);
@@ -2239,23 +2453,31 @@ function App() {
 
                       void planEntryToFolder(source, entry.relativePath);
                     }}
+                    // A click anywhere on a folder's row opens it, and a
+                    // double-click on a file's row opens the file. Keyboard
+                    // and VoiceOver use the name button for both.
                     onClick={openRow}
                     onDoubleClick={openFile}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && entry.isDirectory) {
-                        event.preventDefault();
-                        openRow();
-                      }
-                    }}
                   >
-                    <span className={entry.isDirectory ? "file-name" : "file-name file-name-openable"}>
+                    <span className="file-name file-name-openable">
 
                       <span className="file-name-text">
                         {entry.isDirectory ? (
-                          <span className="file-name-primary">{entry.name}</span>
+                          <button
+                            className="file-name-primary file-open-button"
+                            id={`entry-name-${index}`}
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openRow();
+                            }}
+                          >
+                            {entry.name}
+                          </button>
                         ) : (
                           <button
                             className="file-name-primary file-open-button"
+                            id={`entry-name-${index}`}
                             type="button"
                             title={`Open ${entry.name}`}
                             onClick={(event) => {
@@ -2296,11 +2518,12 @@ function App() {
                         ? (dragOverFolderPath === entry.relativePath ? "Drop to move here" : "Folder")
                         : formatBytes(entry.sizeBytes)}
                     </span>
-                    <span className="row-action">
+                    <span className="row-action" data-row-action={`${liveDrive.persistentIdentifier}:${entry.relativePath}`}>
                       {entry.isDirectory && <FolderChevron />}
                       {!entry.isDirectory && !plannedMove && (
                         <button
                           type="button"
+                          aria-describedby={`entry-name-${index}`}
                           onClick={(event) => {
                             event.stopPropagation();
                             beginPlanMove(liveDrive, entry);
@@ -2313,6 +2536,7 @@ function App() {
                         <button
                           className="plan-remove-button"
                           type="button"
+                          aria-describedby={`entry-name-${index}`}
                           disabled={executingPlan}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -2331,17 +2555,20 @@ function App() {
                 .filter((planned) =>
                   !entries.some((entry) => entry.relativePath === planned.destinationRelativePath),
                 )
-                .map((planned) => (
-                  <button
+                .map((planned) => {
+                  // Only a planned folder can be opened. A planned file is
+                  // plain text rather than a dimmed button.
+                  const Row = planned.isDirectory ? "button" : "div";
+                  return (
+                  <Row
                     className={`file-row planned-arrival-row ${planned.isDirectory ? "folder-row" : ""}`}
                     key={`planned:${planned.moveId}:${planned.destinationRelativePath}`}
-                    type="button"
-                    disabled={!planned.isDirectory}
-                    onClick={() => {
-                      if (planned.isDirectory) {
-                        void openFolder(liveDrive, planned.destinationRelativePath);
+                    {...(planned.isDirectory
+                      ? {
+                        type: "button" as const,
+                        onClick: () => void openFolder(liveDrive, planned.destinationRelativePath),
                       }
-                    }}
+                      : {})}
                   >
                     <span className="file-name">
 
@@ -2353,11 +2580,15 @@ function App() {
                           : plannedFromPath(planned)}
                       </span>
                     </span>
-                    <span aria-label="Not on the drive yet">—</span>
+                    <span>
+                      <span aria-hidden="true">—</span>
+                      <span className="visually-hidden">Not on the drive yet</span>
+                    </span>
                     <span>{planned.isDirectory ? "Folder" : formatBytes(planned.sizeBytes)}</span>
                     <span className="row-action">{planned.isDirectory && <FolderChevron />}</span>
-                  </button>
-                ))}
+                  </Row>
+                  );
+                })}
             </>
           )}
         </section>}
@@ -2380,18 +2611,26 @@ function App() {
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
         </nav>
       </aside>
+      {liveRegion}
       <div className="app-content">
       <header className="app-header">
         <div>
           <p className="eyebrow">DRIVES</p>
           <h1>Your storage</h1>
         </div>
-        <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
+        <button
+          className="refresh-button"
+          data-focus="refresh"
+          onClick={() => {
+            void refresh().then(() => setPendingFocus({ selector: '[data-focus="refresh"]', onlyIfLost: true }));
+          }}
+          disabled={loading || scanningId !== null}
+        >
           {loading ? "Checking…" : "Refresh"}
         </button>
       </header>
 
-      {error && <div className="notice error">{error}</div>}
+      {error && <div className="notice error" role="alert">{error}</div>}
 
       {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Search all drives</h2></div>
@@ -2449,7 +2688,7 @@ function App() {
                       const label = location?.userLabel ?? null;
                       return (
                         <>
-                          <h3>{label ?? drive.name}</h3>
+                          <h3 id={`drive-name-${drive.persistentIdentifier}`}>{label ?? drive.name}</h3>
                           {label && <div className="drive-volume-name">{drive.name}</div>}
                           {drive.persistentIdentifier && (
                             editingDriveLabelId === drive.persistentIdentifier ? (
@@ -2459,17 +2698,23 @@ function App() {
                                   maxLength={40}
                                   value={driveLabelDraft}
                                   placeholder="Drive label"
+                                  aria-label={`Label for ${drive.name}`}
                                   onChange={(event) => setDriveLabelDraft(event.target.value)}
                                   onKeyDown={(event) => {
                                     if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier!);
-                                    if (event.key === "Escape") setEditingDriveLabelId(null);
+                                    if (event.key === "Escape") closeDriveLabelEditor(drive.persistentIdentifier!);
                                   }}
                                 />
                                 <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier!)}>Save</button>
-                                <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                                <button disabled={savingDriveLabel} onClick={() => closeDriveLabelEditor(drive.persistentIdentifier!)}>Cancel</button>
                               </div>
                             ) : (
-                              <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}>
+                              <button
+                                className="drive-label-button"
+                                data-focus={`label-${drive.persistentIdentifier}`}
+                                aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                                onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}
+                              >
                                 {label ? "Edit name" : "Add label"}
                               </button>
                             )
@@ -2480,8 +2725,22 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      {catalogue && <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}>Browse</button>}
-                      <button className="scan-button" disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
+                      {catalogue && (
+                        <button
+                          className="browse-button"
+                          aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                          onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}
+                        >
+                          Browse
+                        </button>
+                      )}
+                      <button
+                        className="scan-button"
+                        data-focus={`scan-${drive.persistentIdentifier}`}
+                        aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                        disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier}
+                        onClick={() => void scan(drive)}
+                      >
                         {scanning ? "Scanning…" : catalogue ? "Rescan" : "Scan"}
                       </button>
                     </div>
@@ -2499,14 +2758,19 @@ function App() {
                     <span className="unreadable-note">Couldn't read {catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
                   )}
                 </div>
-                <div className="scan-status-slot" aria-live="polite">
+                <div className="scan-status-slot">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-progress">
                       <div className="scan-progress-row">
                         <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : "Scanning catalogue…"}</strong>
                         <div className="scan-progress-actions">
                           <span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span>
-                          <button className="cancel-scan-button" disabled={cancellingId === drive.persistentIdentifier} onClick={() => void cancelScan(drive.persistentIdentifier!)}>
+                          <button
+                            className="cancel-scan-button"
+                            data-focus={`cancel-scan-${drive.persistentIdentifier}`}
+                            disabled={cancellingId === drive.persistentIdentifier}
+                            onClick={() => void cancelScan(drive.persistentIdentifier!)}
+                          >
                             {cancellingId === drive.persistentIdentifier ? "Cancelling…" : "Cancel scan"}
                           </button>
                         </div>
@@ -2547,7 +2811,7 @@ function App() {
                       const label = location?.userLabel ?? null;
                       return (
                         <>
-                          <h3>{label ?? drive.name}</h3>
+                          <h3 id={`drive-name-${drive.persistentIdentifier}`}>{label ?? drive.name}</h3>
                           {label && <div className="drive-volume-name">{drive.name}</div>}
                           {editingDriveLabelId === drive.persistentIdentifier ? (
                             <div className="drive-label-editor">
@@ -2556,17 +2820,23 @@ function App() {
                                 maxLength={40}
                                 value={driveLabelDraft}
                                 placeholder="Drive label"
+                                aria-label={`Label for ${drive.name}`}
                                 onChange={(event) => setDriveLabelDraft(event.target.value)}
                                 onKeyDown={(event) => {
                                   if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier);
-                                  if (event.key === "Escape") setEditingDriveLabelId(null);
+                                  if (event.key === "Escape") closeDriveLabelEditor(drive.persistentIdentifier);
                                 }}
                               />
                               <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier)}>Save</button>
-                              <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                              <button disabled={savingDriveLabel} onClick={() => closeDriveLabelEditor(drive.persistentIdentifier)}>Cancel</button>
                             </div>
                           ) : (
-                            <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}>
+                            <button
+                              className="drive-label-button"
+                              data-focus={`label-${drive.persistentIdentifier}`}
+                              aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                              onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}
+                            >
                               {label ? "Edit name" : "Add label"}
                             </button>
                           )}
@@ -2576,7 +2846,13 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>Browse</button>
+                      <button
+                        className="browse-button"
+                        aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                        onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}
+                      >
+                        Browse
+                      </button>
                     </div>
                   </div>
                 </div>
