@@ -1329,6 +1329,44 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
     Ok(())
 }
 
+const SOURCE_NOT_A_FILE: &str = "The source is no longer a file, so it was not copied.";
+
+// Opens a file for reading only if the path itself is a regular file. A
+// symbolic link at the path is never followed, so a source swapped for a
+// link after validation cannot hand the copy some other file. Non-blocking
+// mode keeps a named pipe from stalling the open; it changes nothing for
+// regular files. Returns None for anything that is not a regular file.
+fn open_regular_file(path: &Path) -> std::io::Result<Option<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(target_os = "macos")]
+    const ELOOP: i32 = 62;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(target_os = "macos"))]
+    const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(not(target_os = "macos"))]
+    const ELOOP: i32 = 40;
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(ELOOP) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
 // Compares a source with its copy byte for byte. The copy is read with the
 // cache bypassed, so its bytes come from the drive.
 fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
@@ -1342,10 +1380,12 @@ fn files_are_identical_with_progress(
     second: &Path,
     on_progress: &mut dyn FnMut(u64) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let first_file = fs::File::open(first)
-        .map_err(|error| format!("Unable to open source for verification: {error}"))?;
-    let second_file = fs::File::open(second)
-        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?;
+    let first_file = open_regular_file(first)
+        .map_err(|error| format!("Unable to open source for verification: {error}"))?
+        .ok_or_else(|| SOURCE_NOT_A_FILE.to_string())?;
+    let second_file = open_regular_file(second)
+        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?
+        .ok_or_else(|| "The copied file is no longer a file.".to_string())?;
     bypass_cache(&second_file)?;
 
     if first_file
@@ -1581,8 +1621,9 @@ where
     let mut temporary_handle: Option<fs::File> = None;
 
     let mut attempt = || -> Result<u64, String> {
-        let source_file = fs::File::open(source)
-            .map_err(|error| format!("Unable to open source file: {error}"))?;
+        let source_file = open_regular_file(source)
+            .map_err(|error| format!("Unable to open source file: {error}"))?
+            .ok_or_else(|| SOURCE_NOT_A_FILE.to_string())?;
         let mut reader = BufReader::new(source_file);
 
         let temporary_file = fs::OpenOptions::new()
@@ -9470,6 +9511,63 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert!(!fixture.destination_volume.0.join("Archive").exists());
         assert!(planned_move_exists(&fixture.connection, folder_move));
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    // Validation refuses a source that is a link, but the source could be
+    // swapped for one after validation. The copy must not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn copy_never_follows_a_source_replaced_by_a_link() {
+        let fixture = progress_fixture("matrix-source-link-race");
+        let elsewhere = fixture.volume.0.join("elsewhere.mov");
+        fs::write(&elsewhere, b"not the planned file").unwrap();
+        fs::remove_file(&fixture.source).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fixture.source).unwrap();
+
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, SOURCE_NOT_A_FILE);
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"not the planned file");
+        assert!(fs::symlink_metadata(&fixture.source)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let _ = &fixture.database;
+    }
+
+    // A named pipe would block an ordinary open until something wrote to it.
+    #[cfg(unix)]
+    #[test]
+    fn copy_refuses_a_source_that_is_not_a_regular_file() {
+        let fixture = progress_fixture("matrix-source-fifo");
+        fs::remove_file(&fixture.source).unwrap();
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fixture.source)
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, SOURCE_NOT_A_FILE);
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        let _ = &fixture.database;
     }
 
     #[test]
