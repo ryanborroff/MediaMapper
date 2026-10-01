@@ -3820,14 +3820,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                         .map(|free| free.min(i64::MAX as u64) as i64),
                     _ => planned.destination_available_bytes,
                 };
-                (
-                    destination_name,
-                    destination_kind,
-                    0,
-                    0,
-                    0,
-                    available_bytes,
-                )
+                (destination_name, destination_kind, 0, 0, 0, available_bytes)
             });
         destination.2 += 1;
 
@@ -4726,7 +4719,9 @@ async fn open_catalogued_file(
             .output()
             .map_err(|_| "Unable to ask macOS to open the file.".to_string())?;
         if !output.status.success() {
-            return Err(open_failure_message(&String::from_utf8_lossy(&output.stderr)));
+            return Err(open_failure_message(&String::from_utf8_lossy(
+                &output.stderr,
+            )));
         }
 
         Ok(())
@@ -5244,8 +5239,11 @@ mod tests {
         fs::write(volume.join("Films/Down.by.Law.1986.mkv"), b"film").unwrap();
         fs::write(root.0.join("outside.txt"), b"elsewhere").unwrap();
         std::os::unix::fs::symlink(root.0.join("outside.txt"), volume.join("escape.txt")).unwrap();
-        std::os::unix::fs::symlink(volume.join("Films/Down.by.Law.1986.mkv"), volume.join("alias.mkv"))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            volume.join("Films/Down.by.Law.1986.mkv"),
+            volume.join("alias.mkv"),
+        )
+        .unwrap();
 
         let resolved = resolve_catalogued_file(&volume, "Films/Down.by.Law.1986.mkv").unwrap();
         assert!(resolved.ends_with("Drive/Films/Down.by.Law.1986.mkv"));
@@ -5271,7 +5269,10 @@ mod tests {
             ),
             "No app on this Mac can open this type of file."
         );
-        assert_eq!(open_failure_message("something else"), "macOS couldn't open this file.");
+        assert_eq!(
+            open_failure_message("something else"),
+            "macOS couldn't open this file."
+        );
     }
 
     #[cfg(unix)]
@@ -5828,9 +5829,23 @@ mod tests {
 
         let local = plan_preflight(&connection).unwrap();
         assert_eq!(local.known_bytes, 25);
-        assert_eq!(local.destinations[0].available_bytes, None);
-        assert_eq!(local.destinations[0].projected_available_bytes, None);
-        assert_eq!(local.destinations[0].capacity_sufficient, None);
+        assert_eq!(local.destinations[0].kind, "local_folder");
+        match local.destinations[0].available_bytes {
+            Some(available) => {
+                assert_eq!(
+                    local.destinations[0].projected_available_bytes,
+                    Some(available.saturating_sub(25))
+                );
+                assert_eq!(
+                    local.destinations[0].capacity_sufficient,
+                    Some(25 <= available)
+                );
+            }
+            None => {
+                assert_eq!(local.destinations[0].projected_available_bytes, None);
+                assert_eq!(local.destinations[0].capacity_sufficient, None);
+            }
+        }
     }
 
     fn test_drive(id: &str, name: &str, mount_point: &Path, available: u64) -> DriveInfo {

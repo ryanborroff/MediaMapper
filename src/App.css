@@ -650,23 +650,22 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 }
 
 .planned-arrival-row .file-name-primary {
-  color: var(--text-muted);
-  font-style: italic;
+  color: var(--text);
+  font-style: normal;
+  font-weight: 500;
 }
 
-.planned-tag {
-  display: inline-block;
-  margin-right: 8px;
-  padding: 1px 5px;
-  border: 1px solid var(--tag-border);
-  border-radius: 4px;
-  color: var(--text-body);
+.planned-state-label,
+.planned-folder-note {
+  margin-top: 3px;
+  color: var(--text-muted);
   font-size: 11px;
-  font-style: normal;
-  font-weight: 600;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-  vertical-align: 1px;
+  font-weight: 500;
+}
+
+.planned-arrival-row .planned-path {
+  margin-top: 2px;
+  font-size: 12px;
 }
 
 /* Row action: visible on hover or keyboard focus, always reachable by Tab. */
@@ -1626,6 +1625,21 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .plan-capacity-insufficient {
   color: var(--error-text);
+}
+
+.plan-preview-button {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.plan-preview-button:hover {
+  color: var(--text);
 }
 
 .connect-instruction {

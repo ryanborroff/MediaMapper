@@ -821,6 +821,25 @@ function App() {
     to: formatLocationPath(move.destinationLocationName, move.destinationRelativePath),
   });
 
+  const previewPlannedDestination = async (locationId: string) => {
+    const location = locations.find((item) => item.id === locationId);
+    if (!location || location.kind !== "external_drive" || !location.driveId) {
+      return;
+    }
+
+    const drive = catalogued.find(
+      (item) => item.persistentIdentifier === location.driveId,
+    );
+    if (!drive) {
+      return;
+    }
+
+    setSearchQuery("");
+    setSearchResults([]);
+    setActiveView("browse");
+    await openFolder(drive, "");
+  };
+
   const beginDriveLabelEdit = (persistentIdentifier: string, currentLabel: string | null) => {
     setEditingDriveLabelId(persistentIdentifier);
     setDriveLabelDraft(currentLabel ?? "");
@@ -1731,6 +1750,15 @@ function App() {
                       <div>
                         <span className="plan-capacity-label">Destination</span>
                         <strong>{destination.displayName}</strong>
+                        {destination.kind === "external_drive" && (
+                          <button
+                            type="button"
+                            className="plan-preview-button"
+                            onClick={() => void previewPlannedDestination(destination.locationId)}
+                          >
+                            Preview organisation
+                          </button>
+                        )}
                       </div>
                       <div>
                         <span className="plan-capacity-label">Planned</span>
@@ -2110,6 +2138,14 @@ function App() {
             <>
               {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
+                const plannedFolderPrefix = `${entry.relativePath}/`;
+                const containsPlannedChanges =
+                  entry.isDirectory &&
+                  plannedMoves.some(
+                    (move) =>
+                      move.destinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
+                      move.destinationRelativePath.startsWith(plannedFolderPrefix),
+                  );
 
                 const openRow = () => {
                   if (entry.isDirectory) {
@@ -2214,6 +2250,9 @@ function App() {
                             {entry.name}
                           </button>
                         )}
+                        {containsPlannedChanges && (
+                          <span className="planned-folder-note">Contains planned changes</span>
+                        )}
                         {entry.unreadable && (
                           <span className="unreadable-note">Couldn't be read during the last scan</span>
                         )}
@@ -2287,9 +2326,8 @@ function App() {
                     <span className="file-name">
 
                       <span className="file-name-text">
-                        <span className="file-name-primary">
-                          <span className="planned-tag">Planned</span>{planned.name}
-                        </span>
+                        <span className="file-name-primary planned-file-name">{planned.name}</span>
+                        <span className="planned-state-label">Planned</span>
                         {planned.isNewFolder
                           ? <span className="planned-path">New folder in the plan</span>
                           : plannedFromPath(planned)}
