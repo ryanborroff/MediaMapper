@@ -96,7 +96,7 @@ Each gap is classed as **Blocker**, **Should fix before V1** or **Safe to defer*
 
 ### Error copy and accessibility
 
-15. **Should fix before V1.** **Many backend errors reach the window raw**, as `Unable to … : <rusqlite/io error>`. Some include full paths, such as `Destination already exists: /Volumes/…`, and some include location ids, such as `Destination location … has no drive identity.` That's Phase 6.
+15. *Fixed in Phase 6.* **Should fix before V1.** **Many backend errors reach the window raw**, as `Unable to … : <rusqlite/io error>`. Some include full paths, such as `Destination already exists: /Volumes/…`, and some include location ids, such as `Destination location … has no drive identity.` That's Phase 6.
 16. *Fixed in Phase 5.* **Should fix before V1.** Accessibility hasn't been audited. The folder picker is `role="dialog"` without modal focus management, and transfer progress uses `aria-live`. That's Phase 5.
 
 ## Phase 2: Safety and recovery matrix (done 2026-10-01)
@@ -144,7 +144,7 @@ Findings P3-1 to P3-11 are listed in RELEASE-TESTING.md. They are:
   - the contradictory "Space after transfer"
   - the minimum macOS version
 - **Phase 5:** VoiceOver can't reach the row buttons in Browse. *(Fixed in Phase 5.)*
-- **Phase 6:** raw OS errors, "folder" for a drive, "1 files" and "1 results".
+- **Phase 6:** raw OS errors, "folder" for a drive, "1 files" and "1 results". *(Fixed in Phase 6, along with P3-5, stderr-only logging.)*
 
 ## Phase 4: Database and migrations (done 2026-10-01)
 
@@ -187,6 +187,27 @@ The findings, the fixes, how they were verified and a VoiceOver checklist are in
 - [ ] **Should fix before V1.** Run the VoiceOver checklist in ACCESSIBILITY.md in the app itself (WebKit).
 - [ ] **Safe to defer.** Table semantics for the Browse file list, and announcing view changes.
 
+## Phase 6: Error messages (done 2026-10-01)
+
+Every message, by category, and how internal failures become those words, is in [ERROR-MESSAGES.md](ERROR-MESSAGES.md).
+
+What the audit found:
+
+- **About 150 internal errors reached the window raw.** They were "Unable to …" plus SQLite or macOS text. Examples are "Unable to copy file: Input/output error (os error 5)" and "database is locked".
+- **Some messages showed internal ids and full paths.** They named location ids ("Destination drive:… is no longer available", "… has no drive identity"), planned-move numbers, and full catalogue paths in Plan's issues. "Destination already exists: /Volumes/…" showed a full path.
+- **Many user messages had no next step.** Copy failures didn't say which drive failed. A drive was called a "folder". Counts read "1 files" and "1 results".
+- **Diagnostics went only to stderr**, which is lost when the app is opened from Finder (P3-5).
+
+What changed:
+
+- [x] **One translation point.** Every command's error goes through `present_error`. Internal detail is logged. The window gets plain words, chosen by catalogue state, by the macOS error together with whether the source or the destination failed, and by what the user was doing.
+- [x] **Plain copy failures.** The copy loop tells reading the source from writing the copy, so I/O, permission and out-of-space failures name the right drive. A real full disk image now gives "The destination ran out of space during the copy…".
+- [x] **Rewritten user messages.** About 40 now say what to do next. Plan issues name the file rather than its path, and no message shows an internal id. Verification failure is described as the serious failure it is.
+- [x] **Plain history.** Transfer history shows the same wording, including for records written before this change. The interrupted-copy record reads "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+- [x] **Diagnostics log** at `~/Library/Logs/com.mediamapper.app/media-mapper.log`, rolling over at 1 MB. P3-5 is fixed.
+- [x] **Window wording.** A lost destination is named and isn't called a folder. Counts are singular for one.
+- [x] **Tests.** 5 new, and the opt-in out-of-space test now checks its message. Rust tests went from 111 to 116, plus 1 opt-in, and all pass. 14 existing tests asserted the old wording and were updated to the new constants, each still checking which failure occurred.
+
 ## Later phases
 
 - [x] Phase 1: baseline
@@ -194,7 +215,7 @@ The findings, the fixes, how they were verified and a VoiceOver checklist are in
 - [x] Phase 3: release build validation, and `RELEASE-TESTING.md` (except the Finder-launch permission checks)
 - [x] Phase 4: database and migration hardening, and `DATABASE.md`
 - [x] Phase 5: accessibility and keyboard QA, and `ACCESSIBILITY.md` (except the VoiceOver run by hand)
-- [ ] Phase 6: error message audit
+- [x] Phase 6: error message audit, and `ERROR-MESSAGES.md`
 - [ ] Phase 7: duplicate awareness. Needs the design approved first.
 - [ ] Phase 8: shipping audit
 - [ ] Phase 9: `RELEASE-READINESS.md`

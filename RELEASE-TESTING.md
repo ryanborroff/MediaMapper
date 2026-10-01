@@ -167,7 +167,7 @@ Run with disk images and a separate home folder, driving the bundled app through
 | P3-2 | The bundle signature is invalid (linker ad-hoc only). Fine on the building Mac. On any other Mac it's reported as damaged. To fix in Phase 8 with Developer ID signing and notarisation. | Blocker for distribution (Phase 8) |
 | P3-3 | arm64-only build: Intel Macs can't run it. Universal or arm64-only is a decision for Phase 8. | Should fix before V1 (decision) |
 | P3-4 | No `NSRemovableVolumesUsageDescription` or Documents, Desktop and Downloads usage strings. Development never shows these prompts, so they are untested: see section 5. | Should fix before V1 (Phase 8) |
-| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Should fix before V1 |
+| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.mediamapper.app/media-mapper.log` |
 | P3-6 | Plan's "Space after transfer" uses the free space stored at the last scan, while readiness uses current free space. The two can contradict each other on one screen, and the planned-data figure is the truthful one to show. | Should fix before V1 |
 | P3-7 | Plan readiness isn't rechecked when free space changes on a drive that stays connected. It refreshes on connect, disconnect and user actions. Execution always rechecks, so this is never unsafe. | Safe to defer |
 | P3-8 | `LSMinimumSystemVersion` is 10.13, lower than Tauri 2 supports (10.15). | Should fix before V1 (Phase 8) |
