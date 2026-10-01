@@ -1237,7 +1237,7 @@ function App() {
               </label>
 
               <label>
-                <span>Folder</span>
+                <span>Subfolder <span className="field-optional">(optional)</span></span>
                 {(() => {
                   const destination = locations.find(
                     (location) => location.id === planDestinationLocationId,
@@ -1256,7 +1256,7 @@ function App() {
                         void openDestinationFolderPicker(planDestinationFolder);
                       }}
                     >
-                      <span className="folder-picker-path" title={planDestinationFolder || "Top level"}>
+                      <span className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
                         {planDestinationFolder || "Top level"}
                       </span>
                       <span className="folder-picker-choose">Choose…</span>
@@ -1264,7 +1264,7 @@ function App() {
                   ) : (
                     <div className="folder-picker-readonly">
                       {destination?.kind === "local_folder"
-                        ? "Selected folder"
+                        ? `Copy directly to ${destination.userLabel ?? destination.displayName}`
                         : "Choose a location first"}
                     </div>
                   );
