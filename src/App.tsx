@@ -751,15 +751,27 @@ function App() {
     // otherwise retry quietly. A later drive-state change cancels the retries.
     let cancelled = false;
     let timeout: number | undefined;
-    let attempts = 0;
-
     const refreshAfterReconnect = async () => {
-      attempts += 1;
       try {
         const snapshot = await fetchPlannedMoves();
         if (cancelled) return;
 
-        if (snapshot.validation.ready || attempts >= 5) {
+        if (snapshot.validation.ready) {
+          applyPlannedMoves(snapshot);
+          return;
+        }
+
+        // Do not publish a transient "source drive is not connected" result
+        // while a drive we have just seen reconnect is still becoming usable.
+        // The existing Waiting state is more accurate until validation can
+        // positively resolve the planned source on the mounted volume.
+        const reconnectStillSettling = snapshot.validation.issues.some(
+          (issue) =>
+            issue.code === "source_drive_missing" ||
+            issue.message.toLowerCase().includes("source drive") &&
+              issue.message.toLowerCase().includes("not connected"),
+        );
+        if (!reconnectStillSettling) {
           applyPlannedMoves(snapshot);
           return;
         }
