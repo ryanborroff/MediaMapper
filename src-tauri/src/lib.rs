@@ -3811,21 +3811,22 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
         let destination = destination_totals
             .entry(planned.destination_location_id.clone())
             .or_insert_with(|| {
+                let available_bytes = match destination_kind.as_str() {
+                    "local_folder" => planned
+                        .destination_local_path
+                        .as_deref()
+                        .and_then(|path| free_bytes_at(Path::new(path)).ok())
+                        .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
+                        .map(|free| free.min(i64::MAX as u64) as i64),
+                    _ => planned.destination_available_bytes,
+                };
                 (
                     destination_name,
                     destination_kind,
                     0,
                     0,
                     0,
-                    match destination_kind.as_str() {
-                        "local_folder" => planned
-                            .destination_local_path
-                            .as_deref()
-                            .and_then(|path| free_bytes_at(Path::new(path)).ok())
-                            .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
-                            .map(|free| free.min(i64::MAX as u64) as i64),
-                        _ => planned.destination_available_bytes,
-                    },
+                    available_bytes,
                 )
             });
         destination.2 += 1;
