@@ -97,7 +97,7 @@ Each gap is classed as **Blocker**, **Should fix before V1** or **Safe to defer*
 ### Error copy and accessibility
 
 15. **Should fix before V1.** **Many backend errors reach the window raw**, as `Unable to … : <rusqlite/io error>`. Some include full paths, such as `Destination already exists: /Volumes/…`, and some include location ids, such as `Destination location … has no drive identity.` That's Phase 6.
-16. **Should fix before V1.** Accessibility hasn't been audited. The folder picker is `role="dialog"` without modal focus management, and transfer progress uses `aria-live`. That's Phase 5.
+16. *Fixed in Phase 5.* **Should fix before V1.** Accessibility hasn't been audited. The folder picker is `role="dialog"` without modal focus management, and transfer progress uses `aria-live`. That's Phase 5.
 
 ## Phase 2: Safety and recovery matrix (done 2026-10-01)
 
@@ -143,7 +143,7 @@ Findings P3-1 to P3-11 are listed in RELEASE-TESTING.md. They are:
   - stderr-only logging
   - the contradictory "Space after transfer"
   - the minimum macOS version
-- **Phase 5:** VoiceOver can't reach the row buttons in Browse.
+- **Phase 5:** VoiceOver can't reach the row buttons in Browse. *(Fixed in Phase 5.)*
 - **Phase 6:** raw OS errors, "folder" for a drive, "1 files" and "1 results".
 
 ## Phase 4: Database and migrations (done 2026-10-01)
@@ -173,13 +173,27 @@ Still open:
 - [ ] Gap 12 (the identifier, and so where the catalogue lives) is still a **Blocker** that needs a decision. It belongs with Phase 8. The fix will need a step that finds the catalogue in the old folder.
 - [ ] **Safe to defer.** The catalogue never gives back free space. The real copy was 500 MB with 99.7% free pages.
 
+## Phase 5: Accessibility and keyboard (done 2026-10-01)
+
+The findings, the fixes, how they were verified and a VoiceOver checklist are in [ACCESSIBILITY.md](ACCESSIBILITY.md). The design is unchanged. The only visible difference is the standard focus ring on search fields.
+
+- [x] **Browse rows.** VoiceOver can reach the buttons in Browse rows. The rows were `role="button"` containers, which hid **Open**, **Add to plan** and **Remove**. Each row's name is now a real button.
+- [x] **Focus.** Focus is kept or returned whenever a control replaces itself or closes. That covers the plan panel, folder picker, copy confirmation, copy progress and result, scanning and drive labels. **Continue** doesn't move focus to **Copy and verify**, so a double Return can't start a copy.
+- [x] **Escape** closes the plan panel, the folder picker (on its own) and the copy confirmation.
+- [x] **Announcements.** Live regions no longer read progress figures several times a second. One status announces each copy stage, scan results and outcomes, and a cancel is announced as cancelled. Errors are alerts.
+- [x] **Naming.** Repeated buttons are described by their file or drive, the Subfolder button reads the chosen folder, and the label field is named.
+- [x] **Contrast and colour.** "From" and "To" were 2.85:1 and are now 5.3:1. All other text passes AA in both appearances. Insufficient space is said in words, not only in red.
+- [x] Checked with real key presses and the accessibility tree in a browser, using stand-in data.
+- [ ] **Should fix before V1.** Run the VoiceOver checklist in ACCESSIBILITY.md in the app itself (WebKit).
+- [ ] **Safe to defer.** Table semantics for the Browse file list, and announcing view changes.
+
 ## Later phases
 
 - [x] Phase 1: baseline
 - [x] Phase 2: safety and recovery matrix, except the manual runs
 - [x] Phase 3: release build validation, and `RELEASE-TESTING.md` (except the Finder-launch permission checks)
 - [x] Phase 4: database and migration hardening, and `DATABASE.md`
-- [ ] Phase 5: accessibility and keyboard QA
+- [x] Phase 5: accessibility and keyboard QA, and `ACCESSIBILITY.md` (except the VoiceOver run by hand)
 - [ ] Phase 6: error message audit
 - [ ] Phase 7: duplicate awareness. Needs the design approved first.
 - [ ] Phase 8: shipping audit
