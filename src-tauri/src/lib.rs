@@ -1003,6 +1003,10 @@ struct TransferProgress {
 // Set by Cancel copy and checked as each chunk is copied or verified.
 static TRANSFER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 const TRANSFER_CANCELLED: &str = "Copy cancelled.";
+// A copy that was verified and put in place, but whose completion could not
+// be saved. Media Mapper confirms it against the source when it next opens,
+// or when the copy is tried again.
+const COPIED_NOT_RECORDED: &str = "The file was copied and verified, but Media Mapper couldn't save that it finished. It will check the copy again the next time it opens.";
 
 #[tauri::command]
 fn cancel_transfer() {
@@ -1115,27 +1119,37 @@ fn execute_transfer_paths_reporting(
             // so a finished copy never keeps an active plan item. The transfer
             // record contains its own source/destination snapshot, so removing
             // the plan does not remove execution history.
-            let completion = connection
-                .unchecked_transaction()
-                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
-            update_transfer_status(
-                &completion,
-                transfer.id,
-                "completed",
-                Some(copied_bytes),
-                None,
-            )?;
-            completion
-                .execute(
-                    "DELETE FROM planned_moves WHERE id = ?1",
-                    params![planned_move_id],
-                )
-                .map_err(|error| {
-                    format!("Transfer completed, but the plan could not be cleared: {error}")
-                })?;
-            completion
-                .commit()
-                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
+            let record_completion = || -> Result<(), String> {
+                let completion = connection
+                    .unchecked_transaction()
+                    .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
+                update_transfer_status(
+                    &completion,
+                    transfer.id,
+                    "completed",
+                    Some(copied_bytes),
+                    None,
+                )?;
+                completion
+                    .execute(
+                        "DELETE FROM planned_moves WHERE id = ?1",
+                        params![planned_move_id],
+                    )
+                    .map_err(|error| {
+                        format!("Transfer completed, but the plan could not be cleared: {error}")
+                    })?;
+                completion
+                    .commit()
+                    .map_err(|error| format!("Unable to record completed transfer: {error}"))
+            };
+            // The copy is already verified and in place. The record stays
+            // `verifying`, so it is never shown as completed until recovery
+            // compares it with the source again, but the error must not
+            // suggest that nothing was copied.
+            if let Err(error) = record_completion() {
+                eprintln!("Media Mapper transfer {}: {error}", transfer.id);
+                return Err(COPIED_NOT_RECORDED.to_string());
+            }
         }
         Err(error) => {
             // The transfer snapshot survives the failure and records why it
@@ -9568,6 +9582,47 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert!(!fixture.destination.exists());
         assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
         let _ = &fixture.database;
+    }
+
+    #[test]
+    fn copy_finalised_but_not_recorded_is_reported_truthfully() {
+        let fixture = transfer_fixture("matrix-bookkeeping-fails");
+        // The database refuses to record the completion, as it would if it
+        // stayed locked past the busy timeout or the disk filled.
+        fixture
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_completion
+                 BEFORE UPDATE OF status ON transfers
+                 WHEN NEW.status = 'completed'
+                 BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+            )
+            .unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+
+        // The copy is in place and verified, so the error must not suggest
+        // nothing was copied, and must never claim it completed.
+        assert_eq!(error, COPIED_NOT_RECORDED);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "verifying");
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+
+        // Once the database recovers, the next retry confirms the copy
+        // against the source and completes it without copying again.
+        fixture
+            .connection
+            .execute_batch("DROP TRIGGER refuse_completion;")
+            .unwrap();
+        let retry = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        assert_eq!(retry.id, history[0].id);
+        assert_copied_and_verified(&fixture, &retry);
+        assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
     }
 
     #[test]

@@ -347,6 +347,11 @@ const DESTINATION_UNAVAILABLE = "The destination became unavailable during the c
 // message. The window shows it as cancelled rather than as a failure.
 const TRANSFER_CANCELLED = "Copy cancelled.";
 
+// The backend's error when a copy was verified and put in place but its
+// completion could not be saved. The file was copied, so the window must not
+// say that nothing was.
+const COPIED_NOT_RECORDED = "The file was copied and verified, but Media Mapper couldn't save that it finished.";
+
 function transferErrorMessage(message: string, destinationName: string | undefined) {
   if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
   return destinationName
@@ -563,12 +568,16 @@ function App() {
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
       const cancelled = String(cause).includes(TRANSFER_CANCELLED);
+      const notRecorded = String(cause).includes(COPIED_NOT_RECORDED);
       const reason = transferErrorMessage(String(cause), currentMove?.destinationLocationName);
+      const copied = completed + 1;
       setExecutionResult({
         stopped: true,
         cancelled,
         message: cancelled
           ? `${cancelledMessage()}${skippedNote}`
+          : notRecorded
+            ? `${copied.toLocaleString()} ${copied === 1 ? "file was" : "files were"} copied and verified, but Media Mapper couldn't save that the last one finished. It will check that copy again the next time it opens. The remaining files stay planned.${skippedNote}`
           : completed > 0
             ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${reason}${skippedNote}`
             : `Nothing was copied. ${reason}${skippedNote}`,
