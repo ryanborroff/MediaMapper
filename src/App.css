@@ -1628,6 +1628,21 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--error-text);
 }
 
+.plan-preview-button {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.plan-preview-button:hover {
+  color: var(--text);
+}
+
 .connect-instruction {
   margin-bottom: 18px;
   padding: 22px;
