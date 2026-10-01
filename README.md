@@ -28,4 +28,4 @@ CI runs these, plus `cargo fmt --check`, on every pull request and push to `main
 
 Production builds (`npm run tauri build`) are checked with the smoke test in [RELEASE-TESTING.md](RELEASE-TESTING.md). Safety and recovery coverage is mapped in [SAFETY-MATRIX.md](SAFETY-MATRIX.md).
 
-The catalogue is a SQLite database at `~/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`.
+The catalogue is a SQLite database at `~/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`. How its schema is versioned and upgraded is in [DATABASE.md](DATABASE.md).

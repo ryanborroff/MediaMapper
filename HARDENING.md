@@ -83,10 +83,10 @@ Each gap is classed as **Blocker**, **Should fix before V1** or **Safe to defer*
 
 ### Database
 
-8. **Should fix before V1.** **There's no explicit schema version.** Migration infers state from `PRAGMA table_info` and checks every step, so each step is idempotent. Steps aren't atomic as a whole: only the parent-path backfill and the planned-moves rebuild run in transactions. An interrupted migration is re-run safely on the next open, but this needs to be proven by tests.
-9. **Should fix before V1.** **Migrations are serialised only within a process.** A second app instance (`open -n`) could race an `ALTER TABLE`. The loser would fail its open and retry, but this hasn't been tested.
-10. **Should fix before V1.** **No fixtures cover historical schemas end to end.** Survival of drive labels, local-folder locations and transfer history isn't covered.
-11. **Should fix before V1.** **No backup is taken before a destructive migration step.** That's the table rebuild for planned moves.
+8. *Fixed in Phase 4.* **Should fix before V1.** **There's no explicit schema version.** Migration infers state from `PRAGMA table_info` and checks every step, so each step is idempotent. Steps aren't atomic as a whole: only the parent-path backfill and the planned-moves rebuild run in transactions. An interrupted migration is re-run safely on the next open, but this needs to be proven by tests.
+9. *Fixed in Phase 4.* **Should fix before V1.** **Migrations are serialised only within a process.** A second app instance (`open -n`) could race an `ALTER TABLE`. The loser would fail its open and retry, but this hasn't been tested.
+10. *Fixed in Phase 4.* **Should fix before V1.** **No fixtures cover historical schemas end to end.** Survival of drive labels, local-folder locations and transfer history isn't covered.
+11. *Fixed in Phase 4.* **Should fix before V1.** **No backup is taken before a destructive migration step.** That's the table rebuild for planned moves.
 
 ### Release and shipping
 
@@ -146,12 +146,39 @@ Findings P3-1 to P3-11 are listed in RELEASE-TESTING.md. They are:
 - **Phase 5:** VoiceOver can't reach the row buttons in Browse.
 - **Phase 6:** raw OS errors, "folder" for a drive, "1 files" and "1 results".
 
+## Phase 4: Database and migrations (done 2026-10-01)
+
+The strategy, the version history and the tests are in [DATABASE.md](DATABASE.md).
+
+What the audit found:
+
+- **The version was inferred from the schema.** It was never stored.
+- **Upgrades weren't atomic** (gap 8). Each step committed on its own. If the app was interrupted between adding the parent-folder column and filling it in, the next open skipped the fill. Every entry then sat at the top of its drive, permanently. The summary totals had the same flaw. Only the developer's catalogue went through those steps, but the pattern would have repeated with every future migration.
+- **Two app instances could race an upgrade** (gap 9). Upgrades were serialised only within one process.
+- **No fixtures for historical schemas** (gap 10), and **no backup** (gap 11).
+- **The transfers table has never changed.** History written by any build reads correctly.
+
+What changed (`ed3f730`):
+
+- [x] The schema has a version in `PRAGMA user_version`, now 1. A current catalogue opens without writing, as before.
+- [x] An upgrade runs in one `BEGIN IMMEDIATE` transaction. A failure or crash keeps nothing. A second instance waits and then finds the catalogue current. Gaps 8 and 9 are fixed.
+- [x] A catalogue from a newer version is refused and left untouched.
+- [x] Before the first upgrade to each version, an existing catalogue is copied to `catalogue-before-schema-<n>.sqlite3`. The copy never replaces a file, and the upgrade doesn't run without it. Gap 11 is fixed.
+- [x] Fixtures for all eight on-disk shapes, from `6e7d838` to `66426ad`, are each upgraded and checked field by field. Gap 10 is fixed.
+- [x] 6 new tests. Rust tests went from 105 to 111, plus 1 opt-in test, and all pass. The atomicity and two-instance tests failed against the old, non-transactional upgrade.
+- [x] A copy of the developer's real catalogue upgraded cleanly, taking 0.03 s. Every count was kept: 1 drive, 1,166 entries, 4 locations, 1 label, 2 planned moves and 28 transfers. Scan times were kept, and the integrity check passed. The real catalogue was only read, to take that copy.
+
+Still open:
+
+- [ ] Gap 12 (the identifier, and so where the catalogue lives) is still a **Blocker** that needs a decision. It belongs with Phase 8. The fix will need a step that finds the catalogue in the old folder.
+- [ ] **Safe to defer.** The catalogue never gives back free space. The real copy was 500 MB with 99.7% free pages.
+
 ## Later phases
 
 - [x] Phase 1: baseline
 - [x] Phase 2: safety and recovery matrix, except the manual runs
 - [x] Phase 3: release build validation, and `RELEASE-TESTING.md` (except the Finder-launch permission checks)
-- [ ] Phase 4: database and migration hardening, including fixtures for historical schemas and a written strategy
+- [x] Phase 4: database and migration hardening, and `DATABASE.md`
 - [ ] Phase 5: accessibility and keyboard QA
 - [ ] Phase 6: error message audit
 - [ ] Phase 7: duplicate awareness. Needs the design approved first.
