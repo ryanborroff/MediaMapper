@@ -8059,12 +8059,26 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         source: PathBuf,
         destination: PathBuf,
         contents: Vec<u8>,
-        _source_volume: TestVolume,
+        source_volume: TestVolume,
         destination_volume: TestVolume,
         database: TestDatabase,
     }
 
     fn transfer_fixture(name: &str) -> TransferFixture {
+        let contents: Vec<u8> = (0..256 * 1024 + 7)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        transfer_fixture_with(name, "film.mov", "Archive/film.mov", contents)
+    }
+
+    // As transfer_fixture, with the source's path, its planned destination
+    // and its contents chosen by the test.
+    fn transfer_fixture_with(
+        name: &str,
+        source_relative_path: &str,
+        destination_relative_path: &str,
+        contents: Vec<u8>,
+    ) -> TransferFixture {
         let database = TestDatabase::new(name);
         let unique = format!("{name}-{}-{}", std::process::id(), now_unix());
         let source_volume =
@@ -8076,31 +8090,22 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         fs::create_dir_all(&source_volume.0).unwrap();
         fs::create_dir_all(&destination_volume.0).unwrap();
 
-        let source = source_volume.0.join("film.mov");
-        let contents: Vec<u8> = (0..256 * 1024 + 7)
-            .map(|index| (index % 251) as u8)
-            .collect();
-        fs::write(&source, &contents).unwrap();
-        let modified_at = system_time_unix(fs::metadata(&source).unwrap().modified());
-
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-A", "Source");
         insert_drive(&connection, "UUID-B", "Backup");
         sync_drive_locations(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO files (
-                    drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
-                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, ?1, ?2)",
-                params![contents.len() as i64, modified_at],
-            )
-            .unwrap();
+        let source = catalogue_test_file(
+            &connection,
+            &source_volume.0,
+            source_relative_path,
+            &contents,
+        );
         let move_id = plan_move(
             &mut connection,
             "UUID-A",
-            "film.mov",
+            source_relative_path,
             "drive:UUID-B",
-            "Archive/film.mov",
+            destination_relative_path,
         )
         .unwrap();
 
@@ -8108,7 +8113,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             test_drive("UUID-A", "Source", &source_volume.0, 1_000_000_000),
             test_drive("UUID-B", "Backup", &destination_volume.0, 1_000_000_000),
         ];
-        let destination = destination_volume.0.join("Archive/film.mov");
+        let destination = destination_volume.0.join(destination_relative_path);
 
         TransferFixture {
             connection,
@@ -8117,10 +8122,64 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             source,
             destination,
             contents,
-            _source_volume: source_volume,
+            source_volume: source_volume,
             destination_volume,
             database,
         }
+    }
+
+    // Writes a file on the test source drive `UUID-A` and catalogues it, with
+    // any folders above it, as a scan would. Returns its path.
+    fn catalogue_test_file(
+        connection: &Connection,
+        volume: &Path,
+        relative_path: &str,
+        contents: &[u8],
+    ) -> PathBuf {
+        let path = volume.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        let modified_at = system_time_unix(fs::metadata(&path).unwrap().modified());
+
+        let mut folder = Path::new(relative_path).parent();
+        while let Some(current) = folder.filter(|folder| !folder.as_os_str().is_empty()) {
+            let parent = current
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned());
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO files (
+                        drive_id, relative_path, name, parent_path, is_directory
+                     ) VALUES ('UUID-A', ?1, ?2, ?3, 1)",
+                    params![
+                        current.to_string_lossy(),
+                        current.file_name().unwrap().to_string_lossy(),
+                        parent.unwrap_or_default()
+                    ],
+                )
+                .unwrap();
+            folder = current.parent();
+        }
+
+        let relative = Path::new(relative_path);
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
+                 ) VALUES ('UUID-A', ?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    relative_path,
+                    relative.file_name().unwrap().to_string_lossy(),
+                    relative
+                        .parent()
+                        .map(|parent| parent.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    contents.len() as i64,
+                    modified_at
+                ],
+            )
+            .unwrap();
+        path
     }
 
     // Leaves the database and disk as a process killed mid-transfer would: a
@@ -8903,5 +8962,675 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, "failed");
         assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    // ---- Safety and recovery matrix (SAFETY-MATRIX.md) ----
+    //
+    // Every case checks the same promises: the source is unchanged, nothing
+    // is at the destination unless the transfer completed and matches the
+    // source, no temporary file of ours is left behind, and the plan item
+    // remains unless the move completed.
+
+    // The transfer temporary files left in a folder.
+    fn partial_files(folder: &Path) -> Vec<String> {
+        match fs::read_dir(folder) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".mediamapper-transfer-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn assert_nothing_copied(fixture: &TransferFixture) {
+        assert!(
+            fs::symlink_metadata(&fixture.destination).is_err(),
+            "nothing may be at the destination"
+        );
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    fn assert_copied_and_verified(fixture: &TransferFixture, transfer: &TransferRecord) {
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(transfer.copied_bytes, fixture.contents.len() as i64);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[test]
+    fn zero_byte_file_is_copied_and_verified() {
+        let fixture =
+            transfer_fixture_with("matrix-zero-byte", "empty.txt", "Archive/empty.txt", vec![]);
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn names_with_spaces_and_unicode_are_copied_exactly() {
+        // Composed (NFC) and decomposed (NFD) accents, spaces and non-Latin
+        // script, in both folder and file names.
+        let cases = [
+            ("Été 2024/Café clip.mov", "Archive/Été 2024/Café clip.mov"),
+            (
+                "E\u{301}te\u{301}/cafe\u{301}.mov",
+                "Archive/E\u{301}te\u{301}/cafe\u{301}.mov",
+            ),
+            ("写真/家族 旅行.jpg", "Archive/写真/家族 旅行.jpg"),
+        ];
+        for (index, (source, destination)) in cases.iter().enumerate() {
+            let fixture = transfer_fixture_with(
+                &format!("matrix-unicode-{index}"),
+                source,
+                destination,
+                b"named carefully".to_vec(),
+            );
+
+            let transfer =
+                execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                    .unwrap();
+
+            assert_copied_and_verified(&fixture, &transfer);
+            assert_eq!(transfer.destination_relative_path, *destination);
+        }
+    }
+
+    #[test]
+    fn deeply_nested_new_folders_are_created_for_the_copy() {
+        let fixture = transfer_fixture_with(
+            "matrix-nested",
+            "film.mov",
+            "Archive/2024/Summer/Day 1/Camera A/film.mov",
+            b"nested".to_vec(),
+        );
+        assert!(!fixture.destination_volume.0.join("Archive").exists());
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn large_file_is_copied_and_verified_across_many_chunks() {
+        // Several 1 MB chunks plus a partial one.
+        let contents: Vec<u8> = (0..(7 * 1024 * 1024 + 123) as u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let fixture =
+            transfer_fixture_with("matrix-large", "large.mov", "Archive/large.mov", contents);
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    // Adds a second planned file from the fixture's source drive to its
+    // destination drive. Returns the move id, source and destination.
+    fn plan_second_file(
+        fixture: &mut TransferFixture,
+        name: &str,
+        contents: &[u8],
+    ) -> (i64, PathBuf, PathBuf) {
+        let source = catalogue_test_file(
+            &fixture.connection,
+            &fixture.source_volume.0,
+            name,
+            contents,
+        );
+        let destination_relative = format!("Archive/{name}");
+        let move_id = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            name,
+            "drive:UUID-B",
+            &destination_relative,
+        )
+        .unwrap();
+        (
+            move_id,
+            source,
+            fixture.destination_volume.0.join(destination_relative),
+        )
+    }
+
+    #[test]
+    fn several_planned_files_copy_one_after_another() {
+        let mut fixture = transfer_fixture("matrix-multi");
+        let (second_id, second_source, second_destination) =
+            plan_second_file(&mut fixture, "second.mov", b"second file");
+
+        let first = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        let second =
+            execute_planned_transfer(&fixture.connection, second_id, &fixture.drives).unwrap();
+
+        assert_copied_and_verified(&fixture, &first);
+        assert_eq!(second.status, "completed");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second file");
+        assert_eq!(fs::read(&second_source).unwrap(), b"second file");
+        assert!(!planned_move_exists(&fixture.connection, second_id));
+        assert_eq!(
+            folder_names(fixture.destination.parent().unwrap()),
+            vec!["film.mov", "second.mov"]
+        );
+    }
+
+    #[test]
+    fn destination_space_must_cover_the_file_exactly() {
+        let mut fixture = transfer_fixture("matrix-capacity");
+        let size = fixture.contents.len() as u64;
+
+        fixture.drives[1].available_bytes = Some(size - 1);
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+        assert!(error.contains("enough free space"), "{error}");
+        assert_nothing_copied(&fixture);
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+
+        fixture.drives[1].available_bytes = Some(size);
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn cancel_before_the_first_chunk_copies_nothing() {
+        let fixture = transfer_fixture("matrix-cancel-first");
+
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.drives,
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_nothing_copied(&fixture);
+        // Any record made says cancelled, never failed or completed.
+        for transfer in list_transfer_records(&fixture.connection).unwrap() {
+            assert!(is_cancelled_record(&transfer), "{transfer:?}");
+        }
+    }
+
+    fn is_cancelled_record(transfer: &TransferRecord) -> bool {
+        transfer.status == "failed" && transfer.error_message.as_deref() == Some(TRANSFER_CANCELLED)
+    }
+
+    #[test]
+    fn cancel_during_verification_leaves_no_copy_and_keeps_the_plan() {
+        let fixture = progress_fixture("matrix-cancel-verifying");
+        let verifying = std::cell::Cell::new(false);
+
+        let error = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| {
+                if progress.stage == TransferStage::Verifying {
+                    verifying.set(true);
+                }
+            },
+            &|| verifying.get(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert!(verifying.get(), "the cancel arrived during verification");
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(is_cancelled_record(&history[0]));
+        let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn cancel_after_some_files_keeps_completed_copies_and_remaining_plans() {
+        let mut fixture = transfer_fixture("matrix-cancel-later");
+        let (second_id, second_source, second_destination) =
+            plan_second_file(&mut fixture, "second.mov", b"second file");
+
+        let first = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            second_id,
+            &fixture.drives,
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_copied_and_verified(&fixture, &first);
+        assert!(!second_destination.exists());
+        assert_eq!(fs::read(&second_source).unwrap(), b"second file");
+        assert!(planned_move_exists(&fixture.connection, second_id));
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|transfer| transfer.status == "completed")
+                .count(),
+            1
+        );
+        assert!(history
+            .iter()
+            .filter(|transfer| transfer.status != "completed")
+            .all(is_cancelled_record));
+    }
+
+    // Runs the progress fixture's transfer, calling `change` with the source
+    // at the first progress report of `stage`.
+    fn transfer_changing_source(
+        fixture: &ProgressFixture,
+        stage: TransferStage,
+        change: &dyn Fn(&Path),
+    ) -> String {
+        let changed = std::cell::Cell::new(false);
+        execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| {
+                if progress.stage == stage && !changed.get() {
+                    changed.set(true);
+                    change(&fixture.source);
+                }
+            },
+            &|| false,
+        )
+        .unwrap_err()
+    }
+
+    fn assert_failed_without_copy(fixture: &ProgressFixture) {
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+        let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn source_changed_during_the_copy_fails_verification() {
+        let fixture = progress_fixture("matrix-source-changed-copying");
+        let changed: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+
+        let error = transfer_changing_source(&fixture, TransferStage::Copying, &|source| {
+            fs::write(source, &changed).unwrap()
+        });
+
+        assert!(
+            error.contains("failed byte-for-byte verification"),
+            "{error}"
+        );
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[test]
+    fn source_changed_during_verification_fails_verification() {
+        let fixture = progress_fixture("matrix-source-changed-verifying");
+        let changed: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+
+        let error = transfer_changing_source(&fixture, TransferStage::Verifying, &|source| {
+            fs::write(source, &changed).unwrap()
+        });
+
+        assert!(
+            error.contains("failed byte-for-byte verification"),
+            "{error}"
+        );
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[test]
+    fn source_deleted_during_the_copy_is_never_completed() {
+        let fixture = progress_fixture("matrix-source-deleted");
+
+        // The open file can still be read to the end, but the copy can no
+        // longer be confirmed against the source.
+        transfer_changing_source(&fixture, TransferStage::Copying, &|source| {
+            fs::remove_file(source).unwrap()
+        });
+
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_destination_folder_fails_without_leaving_anything() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = transfer_fixture("matrix-read-only");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives);
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert_nothing_copied(&fixture);
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_or_link_at_the_temporary_path_is_never_touched() {
+        let fixture = transfer_fixture("matrix-temporary-occupied");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+
+        // A folder holding someone's file.
+        let folder = transfer_temporary_path(&fixture.destination, 1, 1).unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("keep.txt"), b"keep").unwrap();
+        let error =
+            copy_file_verified_with_stage(&fixture.source, &fixture.destination, &folder, |_| {
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert_eq!(fs::read(folder.join("keep.txt")).unwrap(), b"keep");
+
+        // A link to a file elsewhere: neither the link nor its target change.
+        let target = fixture.destination_volume.0.join("target.txt");
+        fs::write(&target, b"target").unwrap();
+        let link = transfer_temporary_path(&fixture.destination, 2, 2).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error =
+            copy_file_verified_with_stage(&fixture.source, &fixture.destination, &link, |_| Ok(()))
+                .unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+
+        assert!(!fixture.destination.exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_at_the_destination_is_never_replaced() {
+        let fixture = transfer_fixture("matrix-dangling-destination");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+        let missing = fixture.destination_volume.0.join("missing.mov");
+        std::os::unix::fs::symlink(&missing, &fixture.destination).unwrap();
+
+        // Final validation refuses it before any record is made.
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+
+        // So does the copy itself, if it is ever reached.
+        let error = copy_file_verified(&fixture.source, &fixture.destination).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+
+        assert_eq!(fs::read_link(&fixture.destination).unwrap(), missing);
+        assert!(!missing.exists());
+        assert!(partial_files(&archive).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[test]
+    fn interrupted_pending_record_is_recovered_and_retried() {
+        let fixture = transfer_fixture("matrix-recover-pending");
+        // Killed after the record was written, before the copy began.
+        let transfer = create_transfer_record(&fixture.connection, fixture.move_id).unwrap();
+
+        let recovery = recover_interrupted_transfers(&fixture.connection, None, None).unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id),
+            (
+                "failed".to_string(),
+                Some(INTERRUPTED_TRANSFER_MESSAGE.to_string())
+            )
+        );
+        assert_nothing_copied(&fixture);
+
+        let retry = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        assert_copied_and_verified(&fixture, &retry);
+    }
+
+    // Each state a crash or force-quit can leave a transfer in, and the
+    // status relaunch must then give it.
+    #[derive(Clone, Copy, Debug)]
+    enum Interruption {
+        Pending,
+        Copying,
+        // Every byte copied, verification not finished.
+        Verifying,
+        // Verified and renamed into place, but `completed` not recorded.
+        Finalised,
+        // As Finalised, then something else changed the destination.
+        FinalisedThenReplaced,
+    }
+
+    #[test]
+    fn every_interrupted_state_is_recovered_truthfully_after_relaunch() {
+        let cases = [
+            (Interruption::Pending, "failed"),
+            (Interruption::Copying, "failed"),
+            (Interruption::Verifying, "failed"),
+            (Interruption::Finalised, "completed"),
+            (Interruption::FinalisedThenReplaced, "failed"),
+        ];
+
+        for (case, expected_status) in cases {
+            let fixture = transfer_fixture(&format!("matrix-relaunch-{case:?}"));
+            let replaced: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+            let transfer = match case {
+                Interruption::Pending => {
+                    create_transfer_record(&fixture.connection, fixture.move_id).unwrap()
+                }
+                Interruption::Copying => {
+                    simulate_interrupted_transfer(&fixture, "copying", 1_000).0
+                }
+                Interruption::Verifying => {
+                    simulate_interrupted_transfer(&fixture, "verifying", fixture.contents.len()).0
+                }
+                Interruption::Finalised => simulate_crash_after_rename(&fixture),
+                Interruption::FinalisedThenReplaced => {
+                    let transfer = simulate_crash_after_rename(&fixture);
+                    fs::remove_file(&fixture.destination).unwrap();
+                    fs::write(&fixture.destination, &replaced).unwrap();
+                    transfer
+                }
+            };
+            let temporary =
+                transfer_temporary_path(&fixture.destination, transfer.id, transfer.created_at)
+                    .unwrap();
+
+            // Relaunch: records without drives, then with them.
+            {
+                let _lock = try_lock_transfers(&fixture.connection).unwrap().unwrap();
+                recover_interrupted_transfers(&fixture.connection, None, None).unwrap();
+                recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                    .unwrap();
+            }
+
+            let (status, _) = transfer_status(&fixture.connection, transfer.id);
+            assert_eq!(status, expected_status, "{case:?}");
+            assert!(!temporary.exists(), "{case:?}: partial removed");
+            assert_eq!(
+                fs::read(&fixture.source).unwrap(),
+                fixture.contents,
+                "{case:?}"
+            );
+
+            match case {
+                Interruption::Finalised => {
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+                    assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+                    // Nothing is left to retry, and nothing is copied again.
+                    let error = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("no longer exists"), "{error}");
+                    assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
+                }
+                Interruption::FinalisedThenReplaced => {
+                    // Never trusted, never removed, never overwritten.
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
+                    assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+                    let error = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("already exists"), "{error}");
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
+                }
+                _ => {
+                    assert!(!fixture.destination.exists(), "{case:?}");
+                    assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+                    let retry = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap();
+                    assert_copied_and_verified(&fixture, &retry);
+                }
+            }
+
+            let completed = list_transfer_records(&fixture.connection)
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.status == "completed")
+                .count();
+            assert!(completed <= 1, "{case:?}: completed at most once");
+            for record in list_transfer_records(&fixture.connection).unwrap() {
+                assert!(
+                    record.status == "completed" || record.status == "failed",
+                    "{case:?}: {record:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_is_refused_while_a_transfer_is_running() {
+        let fixture = transfer_fixture("matrix-scan-during-transfer");
+        let other = open_database(&fixture.database.0).unwrap();
+        let held = try_lock_transfers(&other).unwrap().expect("lock is free");
+
+        let scan = scan_drive_job(
+            fixture.database.0.clone(),
+            fixture.drives[0].clone(),
+            |_, _, _| {},
+        );
+        let error = scan().unwrap_err();
+
+        assert!(error.contains("A transfer is running"), "{error}");
+        drop(held);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    // Detaches a disk image when the test ends, even if it fails.
+    struct AttachedImage(PathBuf);
+
+    impl Drop for AttachedImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.0)
+                .output();
+        }
+    }
+
+    // Fills a real, tiny volume. Opt in with `cargo test -- --ignored`: it
+    // creates and mounts a disk image with hdiutil.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn copy_that_runs_out_of_space_fails_and_cleans_up() {
+        let fixture = progress_fixture("matrix-out-of-space");
+        let image = fixture.volume.0.join("full.dmg");
+        let mount = fixture.volume.0.join("Full");
+        let created = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["create", "-size", "3m", "-fs", "HFS+", "-volname", "MMFull"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        fs::create_dir_all(&mount).unwrap();
+        let attached = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "{attached:?}");
+        let _detach = AttachedImage(mount.clone());
+
+        // The 5 MB source cannot fit on a 3 MB volume.
+        let destination = mount.join("Archive/clip.mov");
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &destination,
+        )
+        .unwrap_err();
+
+        assert!(!error.is_empty());
+        assert!(!destination.exists());
+        assert!(partial_files(destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history[0].status, "failed");
+        let _ = &fixture.database;
     }
 }
