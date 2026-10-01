@@ -2138,6 +2138,13 @@ function App() {
             <>
               {visibleEntries.map((entry) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
+                const plannedFolderPrefix = `${entry.relativePath}/`;
+                const containsPlannedChanges =
+                  entry.isDirectory &&
+                  plannedFolderEntries.some(
+                    (planned) =>
+                      planned.destinationRelativePath.startsWith(plannedFolderPrefix),
+                  );
 
                 const openRow = () => {
                   if (entry.isDirectory) {
@@ -2241,6 +2248,9 @@ function App() {
                           >
                             {entry.name}
                           </button>
+                        )}
+                        {containsPlannedChanges && (
+                          <span className="planned-folder-note">Contains planned changes</span>
                         )}
                         {entry.unreadable && (
                           <span className="unreadable-note">Couldn't be read during the last scan</span>
