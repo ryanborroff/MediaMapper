@@ -8,7 +8,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -864,6 +864,12 @@ fn execute_planned_transfer_reporting(
     report: &dyn Fn(&TransferProgress),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
+    // A cancel that arrived before this file started stops it before any
+    // record, folder or temporary file is made.
+    if is_cancelled() {
+        return Err(TRANSFER_CANCELLED.to_string());
+    }
+
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
             "Another transfer or a drive scan is running. Wait for it to finish, then try again."
@@ -1000,17 +1006,29 @@ struct TransferProgress {
     total_bytes: u64,
 }
 
-// Set by Cancel copy and checked as each chunk is copied or verified.
-static TRANSFER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+// The window copies a run of files one command at a time, naming the run
+// with a nonzero id. Cancel copy records that run's id here, and each chunk
+// copied or verified checks it. Keying the cancel to the run means it is
+// never cleared as the run's next file starts, and never carries over to a
+// later run.
+static CANCELLED_TRANSFER_RUN: AtomicU64 = AtomicU64::new(0);
 const TRANSFER_CANCELLED: &str = "Copy cancelled.";
+
+fn request_transfer_cancel(run_id: u64) {
+    CANCELLED_TRANSFER_RUN.store(run_id, Ordering::SeqCst);
+}
+
+fn transfer_run_cancelled(run_id: u64) -> bool {
+    run_id != 0 && CANCELLED_TRANSFER_RUN.load(Ordering::SeqCst) == run_id
+}
 // A copy that was verified and put in place, but whose completion could not
 // be saved. Media Mapper confirms it against the source when it next opens,
 // or when the copy is tried again.
 const COPIED_NOT_RECORDED: &str = "The file was copied and verified, but Media Mapper couldn't save that it finished. It will check the copy again the next time it opens.";
 
 #[tauri::command]
-fn cancel_transfer() {
-    TRANSFER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+fn cancel_transfer(run_id: u64) {
+    request_transfer_cancel(run_id);
 }
 
 // How long transfer bookkeeping waits for the database. Once a copy has been
@@ -4484,10 +4502,8 @@ async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, St
 async fn execute_planned_move(
     app: tauri::AppHandle,
     planned_move_id: i64,
+    run_id: u64,
 ) -> Result<TransferRecord, String> {
-    // A cancel requested before this copy began belongs to an earlier one.
-    TRANSFER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-
     run_blocking(move || {
         // Discover the physical drives immediately before execution. This is
         // deliberately inside the blocking worker because diskutil and file
@@ -4502,7 +4518,7 @@ async fn execute_planned_move(
             &|progress| {
                 let _ = app.emit("transfer-progress", progress);
             },
-            &|| TRANSFER_CANCEL_REQUESTED.load(Ordering::SeqCst),
+            &|| transfer_run_cancelled(run_id),
         )
     })
     .await
@@ -9623,6 +9639,43 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(retry.id, history[0].id);
         assert_copied_and_verified(&fixture, &retry);
         assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
+    }
+
+    // A cancel that arrives as the next file's copy is starting belongs to
+    // the same run, so that file must not be copied.
+    #[test]
+    fn cancel_requested_before_a_file_starts_copies_and_records_nothing() {
+        let fixture = transfer_fixture("matrix-cancel-between");
+
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.drives,
+            &|_| panic!("no progress may be reported"),
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_nothing_copied(&fixture);
+        assert!(!fixture.destination.parent().unwrap().exists());
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_cancel_applies_to_its_whole_run_and_only_to_it() {
+        request_transfer_cancel(41);
+
+        // Still cancelled for every later file of run 41; nothing resets it
+        // as a file starts.
+        assert!(transfer_run_cancelled(41));
+        assert!(transfer_run_cancelled(41));
+        // A new run is not affected by an earlier run's cancel.
+        assert!(!transfer_run_cancelled(42));
+        // Run id 0 is never treated as cancelled.
+        assert!(!transfer_run_cancelled(0));
     }
 
     #[test]

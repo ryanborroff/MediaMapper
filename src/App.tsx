@@ -431,6 +431,10 @@ function App() {
   const [fileProgress, setFileProgress] = useState<TransferProgress | null>(null);
   // Set by Cancel copy: stops the file in progress and any not yet started.
   const cancelRequested = useRef(false);
+  // The id of the copy run in progress, or 0. Ids come from the clock, so a
+  // reloaded window never reuses the id of a run the backend saw cancelled.
+  const lastTransferRunId = useRef(0);
+  const currentTransferRunId = useRef(0);
   const [cancellingCopy, setCancellingCopy] = useState(false);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [showAllTransfers, setShowAllTransfers] = useState(false);
@@ -527,6 +531,11 @@ function App() {
 
     executionRunning.current = true;
     cancelRequested.current = false;
+    // Names this run, so a cancel stops every remaining file of it and never
+    // affects a later run.
+    const runId = Math.max(Date.now(), lastTransferRunId.current + 1);
+    lastTransferRunId.current = runId;
+    currentTransferRunId.current = runId;
     setCancellingCopy(false);
     setExecutingPlan(true);
     setExecutionResult(null);
@@ -548,6 +557,7 @@ function App() {
         setFileProgress(null);
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
+          runId,
         });
 
         completed += 1;
@@ -586,6 +596,7 @@ function App() {
     } finally {
       executionRunning.current = false;
       cancelRequested.current = false;
+      currentTransferRunId.current = 0;
       setCancellingCopy(false);
       setFileProgress(null);
       setExecutingPlan(false);
@@ -603,7 +614,7 @@ function App() {
     cancelRequested.current = true;
     setCancellingCopy(true);
     try {
-      await invoke("cancel_transfer");
+      await invoke("cancel_transfer", { runId: currentTransferRunId.current });
     } catch (cause) {
       setError(String(cause));
     }
