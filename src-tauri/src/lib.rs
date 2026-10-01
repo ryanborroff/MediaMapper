@@ -1627,7 +1627,9 @@ fn copy_file_verified_with_progress<F>(
 where
     F: FnMut(u64) -> Result<(), String>,
 {
-    if destination.exists() {
+    // Anything at the destination counts, including a link to nothing,
+    // which `exists()` would report as absent.
+    if fs::symlink_metadata(destination).is_ok() {
         return Err(format!(
             "Destination already exists: {}",
             destination.display()
@@ -9499,8 +9501,16 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             .unwrap()
             .is_empty());
 
-        // So does the copy itself, if it is ever reached.
-        let error = copy_file_verified(&fixture.source, &fixture.destination).unwrap_err();
+        // So does the copy itself, if it is ever reached, before copying.
+        let temporary = transfer_temporary_path(&fixture.destination, 1, 1).unwrap();
+        let error = copy_file_verified_with_progress(
+            &fixture.source,
+            &fixture.destination,
+            &temporary,
+            |_| Ok(()),
+            &mut |_, _| panic!("nothing may be copied"),
+        )
+        .unwrap_err();
         assert!(error.contains("already exists"), "{error}");
 
         assert_eq!(fs::read_link(&fixture.destination).unwrap(), missing);
