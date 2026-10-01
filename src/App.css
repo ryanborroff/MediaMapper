@@ -1583,6 +1583,51 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--text);
 }
 
+.plan-capacity {
+  margin-bottom: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.plan-capacity-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 32px;
+  align-items: center;
+  padding: 14px 18px;
+}
+
+.plan-capacity-row + .plan-capacity-row {
+  border-top: 1px solid var(--border);
+}
+
+.plan-capacity-row > div {
+  display: grid;
+  gap: 4px;
+}
+
+.plan-capacity-row > div:not(:first-child) {
+  text-align: right;
+}
+
+.plan-capacity-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.plan-capacity-row strong {
+  font-size: 13px;
+}
+
+.plan-capacity-insufficient {
+  color: var(--error-text);
+}
+
 .connect-instruction {
   margin-bottom: 18px;
   padding: 22px;
