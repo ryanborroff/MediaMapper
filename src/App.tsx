@@ -766,10 +766,7 @@ function App() {
         // The existing Waiting state is more accurate until validation can
         // positively resolve the planned source on the mounted volume.
         const reconnectStillSettling = snapshot.validation.issues.some(
-          (issue) =>
-            issue.code === "source_drive_missing" ||
-            issue.message.toLowerCase().includes("source drive") &&
-              issue.message.toLowerCase().includes("not connected"),
+          (issue) => issue.code === "source_drive_offline",
         );
         if (!reconnectStillSettling) {
           applyPlannedMoves(snapshot);
