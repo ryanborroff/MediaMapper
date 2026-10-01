@@ -2141,9 +2141,10 @@ function App() {
                 const plannedFolderPrefix = `${entry.relativePath}/`;
                 const containsPlannedChanges =
                   entry.isDirectory &&
-                  plannedFolderEntries.some(
-                    (planned) =>
-                      planned.destinationRelativePath.startsWith(plannedFolderPrefix),
+                  plannedMoves.some(
+                    (move) =>
+                      move.destinationLocationId === `drive:${liveDrive.persistentIdentifier}` &&
+                      move.destinationRelativePath.startsWith(plannedFolderPrefix),
                   );
 
                 const openRow = () => {
