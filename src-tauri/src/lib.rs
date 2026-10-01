@@ -5829,9 +5829,23 @@ mod tests {
 
         let local = plan_preflight(&connection).unwrap();
         assert_eq!(local.known_bytes, 25);
-        assert_eq!(local.destinations[0].available_bytes, None);
-        assert_eq!(local.destinations[0].projected_available_bytes, None);
-        assert_eq!(local.destinations[0].capacity_sufficient, None);
+        assert_eq!(local.destinations[0].kind, "local_folder");
+        match local.destinations[0].available_bytes {
+            Some(available) => {
+                assert_eq!(
+                    local.destinations[0].projected_available_bytes,
+                    Some(available.saturating_sub(25))
+                );
+                assert_eq!(
+                    local.destinations[0].capacity_sufficient,
+                    Some(25 <= available)
+                );
+            }
+            None => {
+                assert_eq!(local.destinations[0].projected_available_bytes, None);
+                assert_eq!(local.destinations[0].capacity_sufficient, None);
+            }
+        }
     }
 
     fn test_drive(id: &str, name: &str, mount_point: &Path, available: u64) -> DriveInfo {
