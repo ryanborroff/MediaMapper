@@ -2315,9 +2315,8 @@ function App() {
                     <span className="file-name">
 
                       <span className="file-name-text">
-                        <span className="file-name-primary">
-                          <span className="planned-tag">Planned</span>{planned.name}
-                        </span>
+                        <span className="file-name-primary planned-file-name">{planned.name}</span>
+                        <span className="planned-state-label">Planned</span>
                         {planned.isNewFolder
                           ? <span className="planned-path">New folder in the plan</span>
                           : plannedFromPath(planned)}
