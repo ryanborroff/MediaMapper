@@ -50,9 +50,8 @@ type ScanResult = ScanProgress & {
 };
 
 function unreadableSummary(result: ScanResult) {
-  const count = result.unreadableFolderCount;
   const example = result.unreadableExamples[0];
-  const folders = count === 1 ? "1 folder" : `${count.toLocaleString()} folders`;
+  const folders = count(result.unreadableFolderCount, "folder");
   const including = example === undefined
     ? ""
     : `, including ${example === "" ? "the top folder of the drive" : example}`;
@@ -204,6 +203,16 @@ type TransferRecord = {
   completedAt: number | null;
 };
 
+// "1 file", "2 files": a count with its noun, singular for one.
+function count(value: number, noun: string) {
+  return `${value.toLocaleString()} ${value === 1 ? noun : `${noun}s`}`;
+}
+
+// Search shows at most 200 results; "200+" means there may be more.
+function resultCount(shown: number, returned: number) {
+  return returned === 200 ? `${shown.toLocaleString()}+ results` : count(shown, "result");
+}
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -340,7 +349,8 @@ function fileName(relativePath: string) {
 }
 
 // The backend's own wording when a destination disappears mid-copy. The
-// window names the destination instead, without showing its path.
+// window names the destination instead, without showing its path. A
+// destination can be a drive or a folder, so it isn't called either.
 const DESTINATION_UNAVAILABLE = "The destination became unavailable during the copy.";
 
 // The backend records a copy the user stopped as failed with exactly this
@@ -355,8 +365,8 @@ const COPIED_NOT_RECORDED = "The file was copied and verified, but Media Mapper 
 function transferErrorMessage(message: string, destinationName: string | undefined) {
   if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
   return destinationName
-    ? `The destination folder “${destinationName}” is no longer available.`
-    : "The destination folder is no longer available.";
+    ? `“${destinationName}” became unavailable during the copy. Reconnect it, then copy again.`
+    : "The destination became unavailable during the copy. Reconnect it, then copy again.";
 }
 
 function isCancelledTransfer(transfer: TransferRecord) {
@@ -1084,7 +1094,7 @@ function App() {
   const openLibraryResult = async (result: LibrarySearchResult) => {
     const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
     setLibraryQuery("");
@@ -1096,7 +1106,7 @@ function App() {
     const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
 
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
 
@@ -1113,7 +1123,7 @@ function App() {
     const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
 
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
 
@@ -1531,7 +1541,7 @@ function App() {
 
   const scan = async (drive: DriveInfo) => {
     if (!drive.persistentIdentifier) {
-      setError("This drive does not provide a stable volume identifier, so it cannot be catalogued safely.");
+      setError("This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.");
       return;
     }
     setScanningId(drive.persistentIdentifier);
@@ -1546,7 +1556,7 @@ function App() {
     try {
       const result = await invoke<ScanResult>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
-      setAnnouncement(`Scan of ${name} complete. ${result.fileCount.toLocaleString()} files, ${result.directoryCount.toLocaleString()} folders.${result.unreadableFolderCount > 0 ? ` ${unreadableSummary(result)}` : ""}`);
+      setAnnouncement(`Scan of ${name} complete. ${count(result.fileCount, "file")}, ${count(result.directoryCount, "folder")}.${result.unreadableFolderCount > 0 ? ` ${unreadableSummary(result)}` : ""}`);
       // A scan can add a drive's location or rename it, and changes the names
       // and sizes planned moves show, so reload those alongside the drives.
       await Promise.all([refresh(), loadLocations(), loadPlannedMoves()]);
@@ -1634,7 +1644,7 @@ function App() {
                 <div className="transfer-file-progress" aria-hidden="true">
                   <span style={{ width: `${moves.length ? (completed / moves.length) * 100 : 0}%` }} />
                 </div>
-                <p>{Math.min(completed + 1, moves.length)} of {moves.length} files · Each file is verified before the next begins.</p>
+                <p>File {Math.min(completed + 1, moves.length).toLocaleString()} of {moves.length.toLocaleString()} · Each file is verified before the next begins.</p>
               </section>
             );
           })()}
@@ -2090,7 +2100,7 @@ function App() {
           {libraryQuery.trim() ? (
             <section className="browse-results">
               <div className="browse-results-heading" role="status">
-                <span>{librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} results`}</span>
+                <span>{librarySearching ? "Searching…" : resultCount(visibleLibraryResults.length, libraryResults.length)}</span>
               </div>
               {librarySearching ? <div className="browser-message">Searching catalogues…</div>
               : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
@@ -2182,7 +2192,7 @@ function App() {
                             event.stopPropagation();
                             const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
                             if (!drive) {
-                              setError("That drive catalogue is no longer available.");
+                              setError("That drive is no longer in the catalogue.");
                               return;
                             }
                             beginPlanMove(drive, result);
@@ -2205,7 +2215,7 @@ function App() {
                       <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
                       <FolderChevron />
                     </span>
-                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
+                    <span>{count(drive.fileCount, "file")} · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
                   </button>
                 ))}
               </div>
@@ -2317,7 +2327,7 @@ function App() {
           </section>
           {searchQuery.trim() && (
             <div className="browse-results-heading" role="status">
-              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} results`}
+              {searching ? "Searching…" : resultCount(visibleSearchResults.length, searchResults.length)}
             </div>
           )}
 
@@ -2750,7 +2760,7 @@ function App() {
                 <div className="drive-meta">
                   <span>
                     {catalogue
-                      ? `${catalogue.fileCount.toLocaleString()} files · ${catalogue.directoryCount.toLocaleString()} folders · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
+                      ? `${count(catalogue.fileCount, "file")} · ${count(catalogue.directoryCount, "folder")} · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
                       : "Not catalogued yet"}
                   </span>
                   <span title={catalogue?.lastScannedAt ? formatDate(catalogue.lastScannedAt) : undefined}>{formatScanAge(catalogue?.lastScannedAt ?? null)}</span>
@@ -2764,7 +2774,7 @@ function App() {
                       <div className="scan-progress-row">
                         <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : "Scanning catalogue…"}</strong>
                         <div className="scan-progress-actions">
-                          <span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span>
+                          <span>{count((scanProgress.fileCount + scanProgress.directoryCount), "item")}</span>
                           <button
                             className="cancel-scan-button"
                             data-focus={`cancel-scan-${drive.persistentIdentifier}`}
@@ -2775,12 +2785,12 @@ function App() {
                           </button>
                         </div>
                       </div>
-                      <div className="scan-progress-stats"><span>{scanProgress.fileCount.toLocaleString()} files</span><span>{scanProgress.directoryCount.toLocaleString()} folders</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
+                      <div className="scan-progress-stats"><span>{count(scanProgress.fileCount, "file")}</span><span>{count(scanProgress.directoryCount, "folder")}</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
                       <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
                     </div>
                   ) : scanComplete?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-complete">
-                      Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}
+                      Scan complete · {count(scanComplete.fileCount, "file")} · {count(scanComplete.directoryCount, "folder")} · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}
                       {scanComplete.unreadableFolderCount > 0 && (
                         <div className="unreadable-note">{unreadableSummary(scanComplete)}</div>
                       )}
@@ -2858,7 +2868,7 @@ function App() {
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
                 <div className="drive-meta">
-                  <span>{drive.fileCount.toLocaleString()} files · {drive.directoryCount.toLocaleString()} folders · {formatBytes(drive.cataloguedBytes)} catalogued</span>
+                  <span>{count(drive.fileCount, "file")} · {count(drive.directoryCount, "folder")} · {formatBytes(drive.cataloguedBytes)} catalogued</span>
                   <span title={drive.lastScannedAt ? formatDate(drive.lastScannedAt) : undefined}>{formatScanAge(drive.lastScannedAt)}</span>
                   {drive.unreadableFolderCount > 0 && (
                     <span className="unreadable-note">Couldn't read {drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
