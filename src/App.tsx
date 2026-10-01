@@ -474,20 +474,34 @@ function App() {
     }
   }, []);
 
-  const loadPlannedMoves = useCallback(async () => {
-    try {
-      const [moves, preflight, validation] = await Promise.all([
-        invoke<PlannedMove[]>("list_planned_moves"),
-        invoke<PlanPreflight>("get_plan_preflight"),
-        invoke<PlanLiveValidation>("validate_plan"),
-      ]);
-      setPlannedMoves(moves);
-      setPlanPreflight(preflight);
-      setPlanValidation(validation);
-    } catch (cause) {
-      setError(String(cause));
-    }
+  const fetchPlannedMoves = useCallback(async () => {
+    const [moves, preflight, validation] = await Promise.all([
+      invoke<PlannedMove[]>("list_planned_moves"),
+      invoke<PlanPreflight>("get_plan_preflight"),
+      invoke<PlanLiveValidation>("validate_plan"),
+    ]);
+    return { moves, preflight, validation };
   }, []);
+
+  const applyPlannedMoves = useCallback((snapshot: {
+    moves: PlannedMove[];
+    preflight: PlanPreflight;
+    validation: PlanLiveValidation;
+  }) => {
+    setPlannedMoves(snapshot.moves);
+    setPlanPreflight(snapshot.preflight);
+    setPlanValidation(snapshot.validation);
+  }, []);
+
+  const loadPlannedMoves = useCallback(async (options?: { silent?: boolean }) => {
+    try {
+      applyPlannedMoves(await fetchPlannedMoves());
+    } catch (cause) {
+      if (!options?.silent) {
+        setError(String(cause));
+      }
+    }
+  }, [applyPlannedMoves, fetchPlannedMoves]);
 
   const copyPlannedFiles = useCallback(async () => {
     if (!planValidation || !planPreflight) return;
@@ -700,6 +714,85 @@ function App() {
     () => new Set(connected.flatMap((drive) => drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
     [connected],
   );
+
+  // Plan preflight and live validation include drive availability. Refresh
+  // those checks when the set of mounted external drives changes so Plan can
+  // move between Waiting and Ready without the user visiting Drives first.
+  const connectedDriveFingerprint = useMemo(
+    () => [...connectedIds].sort().join("\n"),
+    [connectedIds],
+  );
+  const previousConnectedDriveFingerprint = useRef<string | null>(null);
+  useEffect(() => {
+    if (previousConnectedDriveFingerprint.current === null) {
+      previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
+      return;
+    }
+    if (previousConnectedDriveFingerprint.current === connectedDriveFingerprint) {
+      return;
+    }
+
+    const previousConnectedCount = previousConnectedDriveFingerprint.current
+      ? previousConnectedDriveFingerprint.current.split("\n").length
+      : 0;
+    const currentConnectedCount = connectedDriveFingerprint
+      ? connectedDriveFingerprint.split("\n").length
+      : 0;
+    previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
+
+    if (currentConnectedCount <= previousConnectedCount) {
+      void loadPlannedMoves({ silent: true });
+      return;
+    }
+
+    // macOS can report a newly mounted removable volume before the filesystem
+    // is fully ready. Keep the existing Waiting state while reconnect settles.
+    // Only publish a reconnect snapshot once validation says the plan is ready;
+    // otherwise retry quietly. A later drive-state change cancels the retries.
+    let cancelled = false;
+    let timeout: number | undefined;
+    const refreshAfterReconnect = async () => {
+      try {
+        const snapshot = await fetchPlannedMoves();
+        if (cancelled) return;
+
+        if (snapshot.validation.ready) {
+          applyPlannedMoves(snapshot);
+          return;
+        }
+
+        // Do not publish a transient "source drive is not connected" result
+        // while a drive we have just seen reconnect is still becoming usable.
+        // The existing Waiting state is more accurate until validation can
+        // positively resolve the planned source on the mounted volume.
+        const reconnectStillSettling = snapshot.validation.issues.some(
+          (issue) => issue.code === "source_drive_offline",
+        );
+        if (!reconnectStillSettling) {
+          applyPlannedMoves(snapshot);
+          return;
+        }
+      } catch {
+        if (cancelled) return;
+      }
+
+      timeout = window.setTimeout(() => void refreshAfterReconnect(), 1000);
+    };
+
+    timeout = window.setTimeout(() => void refreshAfterReconnect(), 1000);
+
+    return () => {
+      cancelled = true;
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+      }
+    };
+  }, [
+    applyPlannedMoves,
+    connectedDriveFingerprint,
+    fetchPlannedMoves,
+    loadPlannedMoves,
+  ]);
 
   const locationForDrive = (persistentIdentifier: string | null) =>
     persistentIdentifier
@@ -1487,10 +1580,21 @@ function App() {
     const knownBytes = planPreflight?.knownBytes ?? fileMoves.reduce((sum, move) => sum + (move.sourceSizeBytes ?? 0), 0);
     const sourceIds = Array.from(new Set(plannedMoves.map((move) => move.sourceDriveId)));
     const destinationIds = Array.from(new Set(plannedMoves.map((move) => move.destinationLocationId)));
+    const planIssues = [
+      ...(planValidation?.issues ?? []),
+      ...(planPreflight?.issues ?? []),
+    ];
+    const offlineSourceNames = planIssues
+      .filter((issue) => issue.code === "source_drive_offline" && issue.moveId !== null)
+      .flatMap((issue) => {
+        const move = plannedMoves.find((item) => item.id === issue.moveId);
+        return move ? [sourceDriveName(move.sourceDriveId)] : [];
+      });
     const missingNames = Array.from(new Set([
       ...sourceIds
         .filter((id) => !connectedIds.has(id))
         .map((id) => sourceDriveName(id)),
+      ...offlineSourceNames,
       ...destinationIds.flatMap((id) => {
         const location = locations.find((item) => item.id === id);
         if (!location || location.kind === "local_folder") return [];
@@ -1499,10 +1603,6 @@ function App() {
           : [];
       }),
     ]));
-    const planIssues = [
-      ...(planValidation?.issues ?? []),
-      ...(planPreflight?.issues ?? []),
-    ];
     const planReady = isPlanReady(plannedMoves, planValidation, planPreflight);
     const canCopy = planReady && fileMoves.length > 0 && !executingPlan;
 
