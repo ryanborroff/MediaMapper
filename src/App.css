@@ -1058,9 +1058,10 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   border: 0;
   padding: 0;
   background: transparent;
-  color: var(--text-muted);
+  color: var(--text-body);
   font: inherit;
   font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
 }
 
@@ -1938,7 +1939,6 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   width: auto;
   padding-left: 22px;
   padding-right: 0;
-  border-left: 1px solid var(--divider);
 }
 
 .transfer-history-new-row {
@@ -1963,7 +1963,7 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .transfer-history-new-row .transfer-status {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 400;
 }
 
 .transfer-history-new-row.completed .transfer-status {
