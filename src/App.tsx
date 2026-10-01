@@ -1665,7 +1665,7 @@ function App() {
 
               <section className="plan-review">
                 <div>
-                  <span>Originals remain untouched.</span>
+                  <span>{showCopyConfirmation ? "Each file is copied and verified. Originals remain untouched." : "Originals remain untouched."}</span>
                   {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
                 </div>
                 {!showCopyConfirmation ? (
@@ -1680,9 +1680,7 @@ function App() {
                 )}
               </section>
 
-              {showCopyConfirmation && (
-                <p className="plan-confirmation-note">Final checks run again immediately before each copy. MediaMapper copies directly between locations and verifies the result byte for byte.</p>
-              )}
+
             </>
           )}
         </div>
