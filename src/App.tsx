@@ -1724,6 +1724,31 @@ function App() {
                 </div>
               </section>
 
+              {planPreflight && planPreflight.destinations.length > 0 && (
+                <section className="plan-capacity" aria-label="Destination capacity">
+                  {planPreflight.destinations.map((destination) => (
+                    <div className="plan-capacity-row" key={destination.locationId}>
+                      <div>
+                        <span className="plan-capacity-label">Destination</span>
+                        <strong>{destination.displayName}</strong>
+                      </div>
+                      <div>
+                        <span className="plan-capacity-label">Planned</span>
+                        <strong>{formatBytes(destination.knownBytes)}</strong>
+                      </div>
+                      <div>
+                        <span className="plan-capacity-label">Space after transfer</span>
+                        <strong className={destination.capacitySufficient === false ? "plan-capacity-insufficient" : undefined}>
+                          {destination.projectedAvailableBytes === null
+                            ? "Not available"
+                            : formatBytes(destination.projectedAvailableBytes)}
+                        </strong>
+                      </div>
+                    </div>
+                  ))}
+                </section>
+              )}
+
               {missingNames.length > 0 && (
                 <section className="connect-instruction">
                   <span className="connect-instruction-label">NEXT STEP</span>
