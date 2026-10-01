@@ -1368,7 +1368,6 @@ function App() {
         <div className="app-content transfers-home">
           <header className="app-header">
             <div>
-              <p className="eyebrow">TRANSFERS</p>
               <h1>Transfers</h1>
             </div>
           </header>
