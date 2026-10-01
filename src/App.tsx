@@ -701,6 +701,27 @@ function App() {
     [connected],
   );
 
+  // Plan preflight and live validation include drive availability. Refresh
+  // those checks when the set of mounted external drives changes so Plan can
+  // move between Waiting and Ready without the user visiting Drives first.
+  const connectedDriveFingerprint = useMemo(
+    () => [...connectedIds].sort().join("\n"),
+    [connectedIds],
+  );
+  const previousConnectedDriveFingerprint = useRef<string | null>(null);
+  useEffect(() => {
+    if (previousConnectedDriveFingerprint.current === null) {
+      previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
+      return;
+    }
+    if (previousConnectedDriveFingerprint.current === connectedDriveFingerprint) {
+      return;
+    }
+
+    previousConnectedDriveFingerprint.current = connectedDriveFingerprint;
+    void loadPlannedMoves();
+  }, [connectedDriveFingerprint, loadPlannedMoves]);
+
   const locationForDrive = (persistentIdentifier: string | null) =>
     persistentIdentifier
       ? locations.find(
