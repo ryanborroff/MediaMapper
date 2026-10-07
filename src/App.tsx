@@ -2029,7 +2029,7 @@ function App() {
             executionResult && !executionProgress && !executionResult.stopped ? null : (
             <section className="plan-empty">
               <h2>Nothing planned yet</h2>
-              <p>Browse your catalogued files and choose Plan move to add files here.</p>
+              <p>Browse your catalogued files and choose Add to plan to add files here.</p>
               <button className="browse-button" type="button" onClick={() => setActiveView("browse")}>Browse files</button>
             </section>
             )
