@@ -208,6 +208,18 @@ What changed:
 - [x] **Window wording.** A lost destination is named and isn't called a folder. Counts are singular for one.
 - [x] **Tests.** 5 new, and the opt-in out-of-space test now checks its message. Rust tests went from 111 to 116, plus 1 opt-in, and all pass. 14 existing tests asserted the old wording and were updated to the new constants, each still checking which failure occurred.
 
+## Phase 7: Duplicate awareness (done 2026-10-02)
+
+Built as decided in [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md): information only, under Browse, started by hand, and never offering to remove a copy.
+
+- [x] **Probable view** (`4d3363c`): a Duplicates row on the Browse landing and its own view. Names now match across Unicode forms as well as case, and hidden files are left out. `list_duplicates` replaces `probable_duplicates`, which only the hidden legacy dashboard called.
+- [x] **Schema version 2** (`1c41d07`): `content_checks` and a size index. A version 1 catalogue joins the historical fixtures and upgrades keeping its data.
+- [x] **Content check** (`495e74c`): files of 1 MB or more that share a size are sampled, and read in full only where samples match. The check is read-only, holds the transfer lock, and keeps finished results on cancel.
+- [x] **Identical in the view** (`7f410e7`, `8283de3`): identical groups first, with their extra space, then probable ones. **Check contents** says what it may read before starting. It has progress and Cancel, and announces its start and result.
+- [x] **Transfer lock fix** (`d1f0bf2`), found while testing. A process started just as the transfer lock was released briefly kept it held. About 1 in 125 immediate re-locks failed while processes were being started. The app starts `diskutil` every two seconds, so the next file in a copy run could stop with "Another transfer or a drive scan is running". A busy lock is now retried for up to 0.5 s. See SAFETY-MATRIX K6.
+- [x] **Tests:** 23 new. Rust tests went from 116 to 139, plus 1 opt-in, all passing, and 15 repeated full runs passed.
+- [x] **Release build, end to end** on disk images with a separate home folder. Three copies were found identical, including one renamed. A same-size file with a different middle was read in full and correctly left out. A small file stayed probable. Every file's hash and date were unchanged afterwards.
+
 ## Later phases
 
 - [x] Phase 1: baseline
@@ -216,6 +228,6 @@ What changed:
 - [x] Phase 4: database and migration hardening, and `DATABASE.md`
 - [x] Phase 5: accessibility and keyboard QA, and `ACCESSIBILITY.md` (except the VoiceOver run by hand)
 - [x] Phase 6: error message audit, and `ERROR-MESSAGES.md`
-- [~] Phase 7: duplicate awareness. The proposal, [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md), is waiting for approval. Nothing is built yet.
+- [x] Phase 7: duplicate awareness, built from [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md)
 - [ ] Phase 8: shipping audit
 - [ ] Phase 9: `RELEASE-READINESS.md`

@@ -177,14 +177,42 @@ struct DuplicateFile {
     modified_at: Option<i64>,
 }
 
+// Why Media Mapper thinks the files in a group are the same file.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DuplicateKind {
+    // Same size and the same SHA-256 of the whole contents, as found by a
+    // content check that still matches the catalogue.
+    Identical,
+    // Same size and same name, ignoring case and Unicode form. Contents
+    // were not compared.
+    Probable,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateGroup {
+    kind: DuplicateKind,
     name: String,
     size_bytes: i64,
     copies: i64,
-    potential_wasted_bytes: i64,
+    // For identical groups: when the oldest of their checks was made.
+    checked_at: Option<i64>,
     files: Vec<DuplicateFile>,
+}
+
+// Everything the Duplicates view shows. Groups are listed up to
+// DUPLICATE_GROUP_LIMIT; the counts cover every group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateOverview {
+    // Identical groups first, then probable ones.
+    groups: Vec<DuplicateGroup>,
+    identical_group_count: i64,
+    // Space taken by the extra copies in identical groups: each group's
+    // size times one less than its number of copies.
+    identical_extra_bytes: i64,
+    probable_group_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -464,12 +492,28 @@ fn try_lock_transfers(connection: &Connection) -> Result<Option<TransferLock>, S
         .open(&path)
         .map_err(|error| format!("Unable to open the transfer lock: {error}"))?;
 
-    match file.try_lock() {
-        Ok(()) => Ok(Some(TransferLock { _file: file })),
-        Err(fs::TryLockError::WouldBlock) => Ok(None),
-        Err(fs::TryLockError::Error(error)) => Err(format!("Unable to lock transfers: {error}")),
+    // A process started at the moment the lock is released briefly
+    // inherits the lock file and holds the lock until it starts running its
+    // program. The app starts diskutil every two seconds, so a lock that is
+    // busy is retried for a moment before it counts as taken. A real
+    // transfer or scan holds it far longer and is still refused.
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(TransferLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < TRANSFER_LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(format!("Unable to lock transfers: {error}"))
+            }
+        }
     }
 }
+
+// How long a busy transfer lock is retried before it counts as held.
+const TRANSFER_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 const INTERRUPTED_TRANSFER_MESSAGE: &str = "Interrupted before verification completed.";
 const MISMATCHED_DESTINATION_MESSAGE: &str =
@@ -1891,6 +1935,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
         .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
     register_search_function(&connection)
+        .and_then(|()| register_name_key_function(&connection))
         .map_err(|error| format!("Unable to configure catalogue search: {error}"))?;
     // Foreign keys are a per-connection setting, so every connection sets it.
     connection
@@ -1919,7 +1964,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 // To change the schema: add a step at the end of `migrate_schema` that checks
 // before it writes, bump this number, and add a fixture test for a catalogue
 // at the previous version. See DATABASE.md.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Media Mapper, so this version can't use it. Open it with the newer version of Media Mapper.";
 
@@ -2437,6 +2482,34 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
             ",
         )
         .map_err(|error| format!("Unable to initialise transfer schema: {error}"))?;
+
+    // Version 2. The result of reading a file to compare its contents with
+    // other files of the same size. A check only counts while the catalogue
+    // entry still has the same size and date, so a rescan that finds the file
+    // changed makes it stale without touching this table.
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS content_checks (
+                drive_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                modified_at INTEGER,
+                -- SHA-256 of the size and the first and last 64 KB.
+                sample_hash BLOB NOT NULL,
+                -- SHA-256 of the whole file, read only when samples match.
+                full_hash BLOB,
+                checked_at INTEGER NOT NULL,
+                PRIMARY KEY (drive_id, relative_path),
+                FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_files_size
+                ON files(size_bytes)
+                WHERE is_directory = 0;
+            ",
+        )
+        .map_err(|error| format!("Unable to initialise content check schema: {error}"))?;
 
     Ok(())
 }
@@ -3435,6 +3508,25 @@ fn register_search_function(connection: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+// Makes duplicate_name_key available to SQL as mm_name_key on this
+// connection.
+fn register_name_key_function(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    connection.create_scalar_function(
+        "mm_name_key",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let text = context
+                .get_raw(0)
+                .as_str_or_null()
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+            Ok(text.map(duplicate_name_key))
+        },
+    )
+}
+
 fn normalised_search_expression(column: &str) -> String {
     format!("mm_search_fold({column})")
 }
@@ -3590,100 +3682,788 @@ async fn search_all_catalogues(
 // the top groups are found once, then matched against the files in a single
 // pass. CROSS JOIN makes SQLite scan files once and look each row up in the
 // small groups table, instead of scanning files once per group.
-fn find_probable_duplicates(connection: &Connection) -> Result<Vec<DuplicateGroup>, String> {
-    let mut statement = connection
-        .prepare(
-            "WITH duplicate_groups AS MATERIALIZED (
-                SELECT lower(name) AS name_key,
-                       size_bytes,
-                       MIN(name) AS display_name,
-                       COUNT(*) AS copies
-                FROM files
-                WHERE is_directory = 0
-                  AND size_bytes IS NOT NULL
-                  AND size_bytes > 0
-                GROUP BY lower(name), size_bytes
-                HAVING COUNT(*) > 1
-                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
-                         size_bytes DESC,
-                         lower(MIN(name))
-                LIMIT 100
-             )
-             SELECT g.name_key,
-                    g.size_bytes,
-                    g.display_name,
-                    g.copies,
-                    f.drive_id,
-                    d.name,
-                    f.relative_path,
-                    f.name,
-                    f.modified_at
-             FROM files f
-             CROSS JOIN duplicate_groups g
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE f.is_directory = 0
-               AND f.size_bytes = g.size_bytes
-               AND lower(f.name) = g.name_key
-             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
-                      g.size_bytes DESC,
-                      lower(g.display_name),
-                      g.name_key,
-                      lower(d.name),
-                      lower(f.relative_path)",
-        )
-        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+// How many duplicate groups the Duplicates view lists.
+const DUPLICATE_GROUP_LIMIT: i64 = 200;
 
+// The key two file names must share to be probable duplicates: the name in
+// Unicode composed form, lowercased. "Café.MOV" typed with a composed é and
+// "café.mov" stored decomposed, as macOS often stores names, share a key.
+// Unlike search_fold, separators are kept, so "a_b" and "a b" differ.
+fn duplicate_name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+    name.nfc().flat_map(char::to_lowercase).collect()
+}
+
+// Files that count towards duplicates: files with a known size above zero,
+// not hidden (no part of the path starts with a dot, as Browse hides them).
+// `table` prefixes the columns, such as "f." for a joined query.
+fn duplicate_candidate_filter(table: &str) -> String {
+    format!(
+        "{table}is_directory = 0
+         AND {table}size_bytes IS NOT NULL
+         AND {table}size_bytes > 0
+         AND {table}relative_path NOT LIKE '.%'
+         AND {table}relative_path NOT LIKE '%/.%'"
+    )
+}
+
+// Common table expressions for duplicate queries.
+//
+// `checked`: candidates of at least CONTENT_CHECK_MIN_BYTES with a content
+// check that still matches their catalogue entry.
+//
+// `settled`: files whose contents are known relative to every other file of
+// their size. Every other such file has been checked, and each one either
+// has a different sample or was read in full along with this file. Settled
+// files are shown as identical or not at all, never as probable. A file
+// that matches some copies in full but shares its size with an unchecked
+// file isn't settled, so it can appear in both lists.
+fn checked_and_settled_expressions() -> String {
+    format!(
+        "checked AS MATERIALIZED (
+            SELECT f.drive_id, f.relative_path, f.size_bytes,
+                   c.sample_hash, c.full_hash, c.checked_at
+            FROM files f
+            JOIN content_checks c
+              ON c.drive_id = f.drive_id
+             AND c.relative_path = f.relative_path
+             AND c.size_bytes = f.size_bytes
+             AND c.modified_at IS f.modified_at
+            WHERE {checked_filter}
+              AND f.size_bytes >= {min}
+         ),
+         settled AS MATERIALIZED (
+            SELECT k.drive_id, k.relative_path
+            FROM checked k
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM files o
+                LEFT JOIN checked x
+                  ON x.drive_id = o.drive_id AND x.relative_path = o.relative_path
+                WHERE {other_filter}
+                  AND o.size_bytes = k.size_bytes
+                  AND (o.drive_id, o.relative_path) IS NOT (k.drive_id, k.relative_path)
+                  AND (
+                        x.drive_id IS NULL
+                        OR (x.sample_hash = k.sample_hash
+                            AND (x.full_hash IS NULL OR k.full_hash IS NULL))
+                  )
+            )
+         )",
+        checked_filter = duplicate_candidate_filter("f."),
+        other_filter = duplicate_candidate_filter("o."),
+        min = CONTENT_CHECK_MIN_BYTES,
+    )
+}
+
+// Adds rows that arrive grouped and in display order to `groups`, one group
+// per run of the same key.
+fn collect_duplicate_rows(
+    statement: &mut rusqlite::Statement<'_>,
+    kind: DuplicateKind,
+    groups: &mut Vec<DuplicateGroup>,
+) -> Result<(), String> {
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![DUPLICATE_GROUP_LIMIT], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
                 DuplicateFile {
-                    drive_id: row.get(4)?,
-                    drive_name: row.get(5)?,
-                    relative_path: row.get(6)?,
-                    name: row.get(7)?,
+                    drive_id: row.get(5)?,
+                    drive_name: row.get(6)?,
+                    relative_path: row.get(7)?,
+                    name: row.get(8)?,
                     size_bytes: row.get(1)?,
-                    modified_at: row.get(8)?,
+                    modified_at: row.get(9)?,
                 },
             ))
         })
-        .map_err(|error| format!("Unable to read probable duplicates: {error}"))?;
+        .map_err(|error| format!("Unable to read duplicates: {error}"))?;
 
-    // Rows arrive grouped and in display order, so each group is a run.
-    let mut results: Vec<DuplicateGroup> = Vec::new();
-    let mut current_key: Option<(String, i64)> = None;
+    let mut current_key: Option<(Vec<u8>, i64)> = None;
     for row in rows {
-        let (name_key, size_bytes, display_name, copies, file) =
-            row.map_err(|error| format!("Unable to read probable duplicate rows: {error}"))?;
-        let key = (name_key, size_bytes);
+        let (key, size_bytes, display_name, copies, checked_at, file) =
+            row.map_err(|error| format!("Unable to read duplicate rows: {error}"))?;
+        let key = (key, size_bytes);
         if current_key.as_ref() != Some(&key) {
-            results.push(DuplicateGroup {
+            groups.push(DuplicateGroup {
+                kind,
                 name: display_name,
                 size_bytes,
                 copies,
-                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+                checked_at,
                 files: Vec::new(),
             });
             current_key = Some(key);
         }
-        if let Some(group) = results.last_mut() {
+        if let Some(group) = groups.last_mut() {
             group.files.push(file);
         }
     }
+    Ok(())
+}
 
-    Ok(results)
+// Groups files from the catalogue and stored content checks alone, so
+// offline drives are included and nothing on any drive is read.
+fn find_duplicates(connection: &Connection) -> Result<DuplicateOverview, String> {
+    let shared = checked_and_settled_expressions();
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+    // Identical: the same size and whole-file hash.
+    let (identical_group_count, identical_extra_bytes): (i64, i64) = connection
+        .query_row(
+            &format!(
+                "WITH {shared}
+                 SELECT COUNT(*), COALESCE(SUM(size_bytes * (copies - 1)), 0)
+                 FROM (
+                    SELECT size_bytes, COUNT(*) AS copies
+                    FROM checked
+                    WHERE full_hash IS NOT NULL
+                    GROUP BY size_bytes, full_hash
+                    HAVING COUNT(*) > 1
+                 )"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("Unable to count identical files: {error}"))?;
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH {shared},
+             identical_groups AS MATERIALIZED (
+                SELECT full_hash, size_bytes, COUNT(*) AS copies,
+                       MIN(checked_at) AS checked_at
+                FROM checked
+                WHERE full_hash IS NOT NULL
+                GROUP BY size_bytes, full_hash
+                HAVING COUNT(*) > 1
+                ORDER BY size_bytes * (COUNT(*) - 1) DESC, size_bytes DESC, full_hash
+                LIMIT ?1
+             ),
+             members AS MATERIALIZED (
+                SELECT g.full_hash, g.size_bytes, g.copies, g.checked_at,
+                       f.drive_id, f.relative_path, f.name, f.modified_at
+                FROM identical_groups g
+                JOIN checked k
+                  ON k.full_hash = g.full_hash AND k.size_bytes = g.size_bytes
+                JOIN files f
+                  ON f.drive_id = k.drive_id AND f.relative_path = k.relative_path
+             )
+             SELECT m.full_hash, m.size_bytes,
+                    -- Named after the name most copies share.
+                    (SELECT name FROM members n
+                     WHERE n.full_hash = m.full_hash AND n.size_bytes = m.size_bytes
+                     GROUP BY name
+                     ORDER BY COUNT(*) DESC, lower(name), name
+                     LIMIT 1),
+                    m.copies, m.checked_at,
+                    m.drive_id, d.name, m.relative_path, m.name, m.modified_at
+             FROM members m
+             JOIN drives d ON d.persistent_identifier = m.drive_id
+             ORDER BY m.size_bytes * (m.copies - 1) DESC,
+                      m.size_bytes DESC,
+                      m.full_hash,
+                      lower(d.name),
+                      lower(m.relative_path)"
+        ))
+        .map_err(|error| format!("Unable to query identical files: {error}"))?;
+    collect_duplicate_rows(&mut statement, DuplicateKind::Identical, &mut groups)?;
+
+    // Probable: the same name and size, among files not already settled.
+    let unsettled = format!(
+        "{} AND NOT EXISTS (
+            SELECT 1 FROM settled s
+            WHERE s.drive_id = files.drive_id AND s.relative_path = files.relative_path
+         )",
+        duplicate_candidate_filter("")
+    );
+    let probable_group_count: i64 = connection
+        .query_row(
+            &format!(
+                "WITH {shared}
+                 SELECT COUNT(*) FROM (
+                    SELECT 1
+                    FROM files
+                    WHERE {unsettled}
+                    GROUP BY mm_name_key(name), size_bytes
+                    HAVING COUNT(*) > 1
+                 )"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to count probable duplicates: {error}"))?;
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH {shared},
+             candidates AS MATERIALIZED (
+                SELECT drive_id, relative_path, name, size_bytes, modified_at,
+                       mm_name_key(name) AS name_key
+                FROM files
+                WHERE {unsettled}
+             ),
+             duplicate_groups AS MATERIALIZED (
+                SELECT name_key,
+                       size_bytes,
+                       MIN(name) AS display_name,
+                       COUNT(*) AS copies
+                FROM candidates
+                GROUP BY name_key, size_bytes
+                HAVING COUNT(*) > 1
+                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
+                         size_bytes DESC,
+                         name_key
+                LIMIT ?1
+             )
+             SELECT CAST(g.name_key AS BLOB),
+                    g.size_bytes,
+                    g.display_name,
+                    g.copies,
+                    NULL,
+                    c.drive_id,
+                    d.name,
+                    c.relative_path,
+                    c.name,
+                    c.modified_at
+             FROM candidates c
+             JOIN duplicate_groups g
+               ON g.name_key = c.name_key
+              AND g.size_bytes = c.size_bytes
+             JOIN drives d ON d.persistent_identifier = c.drive_id
+             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
+                      g.size_bytes DESC,
+                      g.name_key,
+                      lower(d.name),
+                      lower(c.relative_path)"
+        ))
+        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+    collect_duplicate_rows(&mut statement, DuplicateKind::Probable, &mut groups)?;
+
+    Ok(DuplicateOverview {
+        groups,
+        identical_group_count,
+        identical_extra_bytes,
+        probable_group_count,
+    })
 }
 
 #[tauri::command]
-async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
+async fn list_duplicates(app: tauri::AppHandle) -> Result<DuplicateOverview, String> {
     run_command("find duplicates", move || {
         let connection = open_database(&database_path(&app)?)?;
-        find_probable_duplicates(&connection)
+        find_duplicates(&connection)
     })
     .await
+}
+
+// ---- Checking duplicate candidates' contents ----
+//
+// Finds files that are byte-for-byte identical without comparing every file
+// with every other. Only files that share a size with another can match;
+// a hash of each one's size and first and last 64 KB separates almost all
+// unrelated files cheaply; and only files whose samples match another's are
+// read in full. The check only ever reads. It runs by hand, holds the same
+// lock as scans and copies, and records what it learns in `content_checks`.
+
+// Files smaller than this are only ever shown as probable duplicates.
+const CONTENT_CHECK_MIN_BYTES: i64 = 1_000_000;
+// Read from each end of a file for its sample.
+const CONTENT_SAMPLE_BYTES: u64 = 64 * 1024;
+
+const CONTENT_CHECK_BUSY: &str =
+    "A copy or scan is running. Wait for it to finish, then check contents.";
+
+// Set by Cancel and checked as each file is started and each chunk is
+// read, keyed to the check's run like a copy's cancel.
+static CANCELLED_CONTENT_CHECK_RUN: AtomicU64 = AtomicU64::new(0);
+
+fn request_content_check_cancel(run_id: u64) {
+    CANCELLED_CONTENT_CHECK_RUN.store(run_id, Ordering::SeqCst);
+}
+
+fn content_check_run_cancelled(run_id: u64) -> bool {
+    run_id != 0 && CANCELLED_CONTENT_CHECK_RUN.load(Ordering::SeqCst) == run_id
+}
+
+// One catalogued file that shares its size with another, and what is
+// already known about its contents.
+#[derive(Clone, Debug)]
+struct ContentCandidate {
+    drive_id: String,
+    relative_path: String,
+    size_bytes: i64,
+    modified_at: Option<i64>,
+    // From a check that still matches the catalogue entry.
+    sample_hash: Option<Vec<u8>>,
+    full_hash: Option<Vec<u8>>,
+}
+
+// Files of at least CONTENT_CHECK_MIN_BYTES, not hidden, that share their
+// size with another such file on any drive, offline or not.
+fn content_candidates(connection: &Connection) -> Result<Vec<ContentCandidate>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH sizes AS MATERIALIZED (
+                SELECT size_bytes
+                FROM files
+                WHERE {}
+                  AND size_bytes >= ?1
+                GROUP BY size_bytes
+                HAVING COUNT(*) > 1
+             )
+             SELECT f.drive_id,
+                    f.relative_path,
+                    f.size_bytes,
+                    f.modified_at,
+                    c.sample_hash,
+                    c.full_hash
+             FROM files f
+             JOIN sizes s ON s.size_bytes = f.size_bytes
+             LEFT JOIN content_checks c
+               ON c.drive_id = f.drive_id
+              AND c.relative_path = f.relative_path
+              AND c.size_bytes = f.size_bytes
+              AND c.modified_at IS f.modified_at
+             WHERE {}
+             ORDER BY f.size_bytes DESC, f.drive_id, f.relative_path",
+            duplicate_candidate_filter(""),
+            duplicate_candidate_filter("f.")
+        ))
+        .map_err(|error| format!("Unable to find files to check: {error}"))?;
+    let candidates = statement
+        .query_map(params![CONTENT_CHECK_MIN_BYTES], |row| {
+            Ok(ContentCandidate {
+                drive_id: row.get(0)?,
+                relative_path: row.get(1)?,
+                size_bytes: row.get(2)?,
+                modified_at: row.get(3)?,
+                sample_hash: row.get(4)?,
+                full_hash: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("Unable to find files to check: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read files to check: {error}"))?;
+    Ok(candidates)
+}
+
+// What a check would read on one connected drive, at most: every candidate
+// there that hasn't been checked in full. Usually far less is read, as most
+// files are settled by their samples.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckEstimate {
+    drive_id: String,
+    drive_name: String,
+    file_count: i64,
+    max_bytes: i64,
+}
+
+fn estimate_content_check_for(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+) -> Result<Vec<ContentCheckEstimate>, String> {
+    let mut estimates: Vec<ContentCheckEstimate> = Vec::new();
+    for candidate in content_candidates(connection)? {
+        if candidate.full_hash.is_some() {
+            continue;
+        }
+        let Some(drive) = connected_drives
+            .iter()
+            .find(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+        else {
+            continue;
+        };
+        match estimates
+            .iter_mut()
+            .find(|estimate| estimate.drive_id == candidate.drive_id)
+        {
+            Some(estimate) => {
+                estimate.file_count += 1;
+                estimate.max_bytes += candidate.size_bytes;
+            }
+            None => estimates.push(ContentCheckEstimate {
+                drive_id: candidate.drive_id.clone(),
+                drive_name: drive.name.clone(),
+                file_count: 1,
+                max_bytes: candidate.size_bytes,
+            }),
+        }
+    }
+    estimates.sort_by(|left, right| {
+        left.drive_name
+            .to_lowercase()
+            .cmp(&right.drive_name.to_lowercase())
+    });
+    Ok(estimates)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ContentCheckStage {
+    // Reading the start and end of each candidate.
+    Sampling,
+    // Reading in full the candidates whose samples match.
+    Comparing,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckProgress {
+    stage: ContentCheckStage,
+    files_done: usize,
+    files_total: usize,
+}
+
+// What a finished or cancelled check did.
+#[derive(Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckSummary {
+    // Files whose contents were read and recorded.
+    files_checked: usize,
+    // Files that have changed since the last scan, so were left unchecked
+    // until the drive is rescanned.
+    files_changed: usize,
+    // Files that couldn't be read, such as missing ones.
+    files_unreadable: usize,
+    cancelled: bool,
+}
+
+// Why one file couldn't be checked. Cancelled stops the whole check.
+enum FileCheckError {
+    Changed,
+    Unreadable(String),
+    Cancelled,
+}
+
+// Opens a candidate for reading, if its drive is connected and the file is
+// still the one the catalogue describes: a regular file on that drive, not
+// through a link, with the catalogued size and date.
+fn open_candidate(
+    candidate: &ContentCandidate,
+    connected_drives: &[DriveInfo],
+) -> Result<Option<fs::File>, FileCheckError> {
+    let Some(drive) = connected_drives
+        .iter()
+        .find(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+    else {
+        return Ok(None);
+    };
+    let path = resolve_catalogued_file(Path::new(&drive.mount_point), &candidate.relative_path)
+        .map_err(FileCheckError::Unreadable)?;
+    let file = open_regular_file(&path)
+        .map_err(|error| FileCheckError::Unreadable(error.to_string()))?
+        .ok_or_else(|| FileCheckError::Unreadable("not a regular file".to_string()))?;
+    if !candidate_unchanged(candidate, &file) {
+        return Err(FileCheckError::Changed);
+    }
+    // Reading these files once shouldn't push everything else out of memory.
+    bypass_cache(&file).map_err(FileCheckError::Unreadable)?;
+    Ok(Some(file))
+}
+
+// Whether an open file still has its catalogued size and date.
+fn candidate_unchanged(candidate: &ContentCandidate, file: &fs::File) -> bool {
+    match file.metadata() {
+        Ok(metadata) => {
+            i64::try_from(metadata.len()).ok() == Some(candidate.size_bytes)
+                && system_time_unix(metadata.modified()) == candidate.modified_at
+        }
+        Err(_) => false,
+    }
+}
+
+// SHA-256 of a file's size and its first and last CONTENT_SAMPLE_BYTES.
+fn sample_hash_of(file: &mut fs::File, size: u64) -> std::io::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    let mut buffer = vec![0_u8; CONTENT_SAMPLE_BYTES as usize];
+    for offset in [0, size.saturating_sub(CONTENT_SAMPLE_BYTES)] {
+        file.seek(SeekFrom::Start(offset))?;
+        let length = CONTENT_SAMPLE_BYTES.min(size - offset) as usize;
+        file.read_exact(&mut buffer[..length])?;
+        hasher.update(&buffer[..length]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+// SHA-256 of a whole file. Stops if `is_cancelled` turns true.
+fn full_hash_of(
+    file: &mut fs::File,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, FileCheckError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        if is_cancelled() {
+            return Err(FileCheckError::Cancelled);
+        }
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+        if count == 0 {
+            return Ok(hasher.finalize().to_vec());
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
+fn record_file_check_error(
+    summary: &mut ContentCheckSummary,
+    candidate: &ContentCandidate,
+    error: FileCheckError,
+) -> bool {
+    match error {
+        FileCheckError::Changed => summary.files_changed += 1,
+        FileCheckError::Unreadable(detail) => {
+            log_diagnostic(&format!(
+                "Content check couldn't read {} on {}: {detail}",
+                candidate.relative_path, candidate.drive_id
+            ));
+            summary.files_unreadable += 1;
+        }
+        FileCheckError::Cancelled => return true,
+    }
+    false
+}
+
+// Runs a content check on the connected drives. Each file's result is saved
+// as soon as it is known, so a cancel keeps everything checked before it.
+fn run_content_check(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+    report: &dyn Fn(&ContentCheckProgress),
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ContentCheckSummary, String> {
+    let Some(_lock) = try_lock_transfers(connection)? else {
+        return Err(CONTENT_CHECK_BUSY.to_string());
+    };
+    connection
+        .busy_timeout(TRANSFER_BUSY_TIMEOUT)
+        .map_err(|error| format!("Unable to configure the catalogue: {error}"))?;
+
+    // Checks of files no longer in the catalogue can never count again.
+    connection
+        .execute(
+            "DELETE FROM content_checks
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM files f
+                 WHERE f.drive_id = content_checks.drive_id
+                   AND f.relative_path = content_checks.relative_path
+             )",
+            [],
+        )
+        .map_err(|error| format!("Unable to tidy content checks: {error}"))?;
+
+    let mut summary = ContentCheckSummary::default();
+    let connected = |candidate: &ContentCandidate| {
+        connected_drives
+            .iter()
+            .any(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+    };
+    let mut last_report: Option<Instant> = None;
+    let mut progress = |stage: ContentCheckStage, files_done: usize, files_total: usize| {
+        let due = last_report.is_none_or(|at| at.elapsed() >= Duration::from_millis(150));
+        if due || files_done == files_total {
+            report(&ContentCheckProgress {
+                stage,
+                files_done,
+                files_total,
+            });
+            last_report = Some(Instant::now());
+        }
+    };
+
+    // Stage 2: samples.
+    let mut candidates = content_candidates(connection)?;
+    let to_sample: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.sample_hash.is_none() && connected(candidate))
+        .map(|(index, _)| index)
+        .collect();
+    progress(ContentCheckStage::Sampling, 0, to_sample.len());
+    for (done, &index) in to_sample.iter().enumerate() {
+        if is_cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let candidate = candidates[index].clone();
+        let sampled = (|| -> Result<Option<Vec<u8>>, FileCheckError> {
+            let Some(mut file) = open_candidate(&candidate, connected_drives)? else {
+                return Ok(None);
+            };
+            let hash = sample_hash_of(&mut file, candidate.size_bytes as u64)
+                .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+            if !candidate_unchanged(&candidate, &file) {
+                return Err(FileCheckError::Changed);
+            }
+            Ok(Some(hash))
+        })();
+        match sampled {
+            Ok(Some(hash)) => {
+                connection
+                    .execute(
+                        "INSERT INTO content_checks (
+                            drive_id, relative_path, size_bytes, modified_at,
+                            sample_hash, full_hash, checked_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+                         ON CONFLICT(drive_id, relative_path) DO UPDATE SET
+                            size_bytes = excluded.size_bytes,
+                            modified_at = excluded.modified_at,
+                            sample_hash = excluded.sample_hash,
+                            full_hash = NULL,
+                            checked_at = excluded.checked_at",
+                        params![
+                            candidate.drive_id,
+                            candidate.relative_path,
+                            candidate.size_bytes,
+                            candidate.modified_at,
+                            hash,
+                            now_unix()
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to save a content check: {error}"))?;
+                candidates[index].sample_hash = Some(hash);
+                candidates[index].full_hash = None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if record_file_check_error(&mut summary, &candidate, error) {
+                    summary.cancelled = true;
+                    return Ok(summary);
+                }
+            }
+        }
+        progress(ContentCheckStage::Sampling, done + 1, to_sample.len());
+    }
+
+    // Stage 3: full contents, only where samples match another file's.
+    let mut sample_counts: HashMap<(i64, Vec<u8>), usize> = HashMap::new();
+    for candidate in &candidates {
+        if let Some(sample) = &candidate.sample_hash {
+            *sample_counts
+                .entry((candidate.size_bytes, sample.clone()))
+                .or_default() += 1;
+        }
+    }
+    let to_compare: Vec<&ContentCandidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.full_hash.is_none()
+                && connected(candidate)
+                && candidate.sample_hash.as_ref().is_some_and(|sample| {
+                    sample_counts
+                        .get(&(candidate.size_bytes, sample.clone()))
+                        .is_some_and(|count| *count > 1)
+                })
+        })
+        .collect();
+    progress(ContentCheckStage::Comparing, 0, to_compare.len());
+    for (done, candidate) in to_compare.iter().enumerate() {
+        if is_cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let hashed = (|| -> Result<Option<Vec<u8>>, FileCheckError> {
+            let Some(mut file) = open_candidate(candidate, connected_drives)? else {
+                return Ok(None);
+            };
+            let hash = full_hash_of(&mut file, is_cancelled)?;
+            if !candidate_unchanged(candidate, &file) {
+                return Err(FileCheckError::Changed);
+            }
+            Ok(Some(hash))
+        })();
+        match hashed {
+            Ok(Some(hash)) => {
+                // Only completes the sample this run relied on.
+                connection
+                    .execute(
+                        "UPDATE content_checks
+                         SET full_hash = ?1, checked_at = ?2
+                         WHERE drive_id = ?3
+                           AND relative_path = ?4
+                           AND size_bytes = ?5
+                           AND modified_at IS ?6
+                           AND sample_hash = ?7",
+                        params![
+                            hash,
+                            now_unix(),
+                            candidate.drive_id,
+                            candidate.relative_path,
+                            candidate.size_bytes,
+                            candidate.modified_at,
+                            candidate.sample_hash
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to save a content check: {error}"))?;
+                summary.files_checked += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if record_file_check_error(&mut summary, candidate, error) {
+                    summary.cancelled = true;
+                    return Ok(summary);
+                }
+            }
+        }
+        progress(ContentCheckStage::Comparing, done + 1, to_compare.len());
+    }
+
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn estimate_content_check(
+    app: tauri::AppHandle,
+) -> Result<Vec<ContentCheckEstimate>, String> {
+    run_command("estimate the content check", move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        estimate_content_check_for(&connection, &drives)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn check_duplicate_contents(
+    app: tauri::AppHandle,
+    run_id: u64,
+) -> Result<ContentCheckSummary, String> {
+    run_command("check duplicate contents", move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        run_content_check(
+            &connection,
+            &drives,
+            &|progress| {
+                let _ = app.emit("duplicate-check-progress", progress);
+            },
+            &|| content_check_run_cancelled(run_id),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+fn cancel_duplicate_check(run_id: u64) {
+    request_content_check_cancel(run_id);
 }
 
 #[tauri::command]
@@ -5343,7 +6123,10 @@ pub fn run() {
             search_catalogue,
             search_all_catalogues,
             largest_files,
-            probable_duplicates,
+            list_duplicates,
+            estimate_content_check,
+            check_duplicate_contents,
+            cancel_duplicate_check,
             list_locations,
             set_drive_label,
             add_local_folder_location,
@@ -5958,7 +6741,16 @@ mod tests {
             ("759b5aa", unreadable, with_unreadable),
             (
                 "66426ad",
-                main,
+                main.clone(),
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
+            // Version 1 is the 66426ad schema with its version stamped.
+            (
+                "ed3f730 (version 1)",
+                format!("{main}PRAGMA user_version = 1;"),
                 Holds {
                     transfers: true,
                     ..with_unreadable
@@ -6347,6 +7139,41 @@ mod tests {
             sync_drive_locations(&again).unwrap();
             assert_catalogue_survived(&again, holds, commit);
         }
+    }
+
+    #[test]
+    fn content_checks_belong_to_their_drive() {
+        let database = TestDatabase::new("content-checks-table");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        connection
+            .execute(
+                "INSERT INTO content_checks
+                    (drive_id, relative_path, size_bytes, modified_at, sample_hash, full_hash, checked_at)
+                 VALUES ('UUID-A', 'film.mov', 10, 5, x'01', NULL, 7)",
+                [],
+            )
+            .unwrap();
+
+        // A check names a catalogued drive, and goes when the drive does.
+        assert!(connection
+            .execute(
+                "INSERT INTO content_checks
+                    (drive_id, relative_path, size_bytes, modified_at, sample_hash, checked_at)
+                 VALUES ('UUID-GONE', 'film.mov', 10, 5, x'01', 7)",
+                [],
+            )
+            .is_err());
+        connection
+            .execute(
+                "DELETE FROM drives WHERE persistent_identifier = 'UUID-A'",
+                [],
+            )
+            .unwrap();
+        let checks: i64 = connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(checks, 0);
     }
 
     #[test]
@@ -6830,6 +7657,26 @@ mod tests {
         );
     }
 
+    // Each group as (name, size, copies, ["Drive:path", ...]).
+    fn duplicate_summary(overview: &DuplicateOverview) -> Vec<(String, i64, i64, Vec<String>)> {
+        overview
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name.clone(),
+                    group.size_bytes,
+                    group.copies,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn probable_duplicates_are_grouped_by_name_ignoring_case_and_size() {
         let database = TestDatabase::new("duplicates");
@@ -6852,41 +7699,23 @@ mod tests {
             )
             .unwrap();
 
-        let groups = find_probable_duplicates(&connection).unwrap();
-        let summary: Vec<(String, i64, i64, i64, Vec<String>)> = groups
-            .iter()
-            .map(|group| {
-                (
-                    group.name.clone(),
-                    group.size_bytes,
-                    group.copies,
-                    group.potential_wasted_bytes,
-                    group
-                        .files
-                        .iter()
-                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
-                        .collect(),
-                )
-            })
-            .collect();
+        let overview = find_duplicates(&connection).unwrap();
 
         // Largest saving first; each group lists copies by drive, then path.
         // Different sizes, empty files and folders are never duplicates.
         assert_eq!(
-            summary,
+            duplicate_summary(&overview),
             [
                 (
                     "Film.mp4".to_string(),
                     100,
                     2,
-                    100,
                     vec!["Alpha:Film.mp4".to_string(), "Beta:x/film.MP4".to_string()]
                 ),
                 (
                     "clip.mov".to_string(),
                     10,
                     2,
-                    10,
                     vec![
                         "Alpha:clip.mov".to_string(),
                         "Alpha:sub/clip.mov".to_string()
@@ -6894,6 +7723,106 @@ mod tests {
                 ),
             ]
         );
+        assert!(overview
+            .groups
+            .iter()
+            .all(|group| group.kind == DuplicateKind::Probable));
+        assert_eq!(overview.probable_group_count, 2);
+    }
+
+    #[test]
+    fn probable_duplicates_match_names_across_unicode_forms_and_case() {
+        let database = TestDatabase::new("duplicates-unicode");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', ?1, ?1, '', 0, 500),
+                        ('UUID-B', ?2, ?2, '', 0, 500),
+                        ('UUID-B', 'cafe.mov', 'cafe.mov', '', 0, 500),
+                        ('UUID-A', 'a_b.mov', 'a_b.mov', '', 0, 9),
+                        ('UUID-B', 'a b.mov', 'a b.mov', '', 0, 9)",
+                // Composed é, then e followed by a combining accent.
+                params!["Caf\u{e9}.MOV", "cafe\u{301}.mov"],
+            )
+            .unwrap();
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        // The accented names match each other but not the unaccented one,
+        // and separators are not treated as the same character.
+        assert_eq!(overview.groups.len(), 1);
+        let files: Vec<&str> = overview.groups[0]
+            .files
+            .iter()
+            .map(|file| file.drive_name.as_str())
+            .collect();
+        assert_eq!(files, ["Alpha", "Beta"]);
+        assert_eq!(overview.groups[0].copies, 2);
+    }
+
+    #[test]
+    fn hidden_files_are_never_duplicates() {
+        let database = TestDatabase::new("duplicates-hidden");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', '._film.mov', '._film.mov', '', 0, 4096),
+                        ('UUID-B', '._film.mov', '._film.mov', '', 0, 4096),
+                        ('UUID-A', '.hidden/film.mov', 'film.mov', '.hidden', 0, 70),
+                        ('UUID-B', 'Films/.cache/film.mov', 'film.mov', 'Films/.cache', 0, 70),
+                        ('UUID-A', 'Films/film.mov', 'film.mov', 'Films', 0, 70),
+                        ('UUID-B', 'Backup.film/film.mov', 'film.mov', 'Backup.film', 0, 70);",
+            )
+            .unwrap();
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        // Only the two visible copies; a dot inside a name is not hidden.
+        assert_eq!(
+            duplicate_summary(&overview),
+            [(
+                "film.mov".to_string(),
+                70,
+                2,
+                vec![
+                    "Alpha:Films/film.mov".to_string(),
+                    "Beta:Backup.film/film.mov".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn duplicate_groups_are_limited_but_all_are_counted() {
+        let database = TestDatabase::new("duplicates-limit");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        let groups = DUPLICATE_GROUP_LIMIT + 5;
+        for index in 0..groups {
+            for drive in ["UUID-A", "UUID-B"] {
+                connection
+                    .execute(
+                        "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                         VALUES (?1, ?2, ?2, '', 0, ?3)",
+                        params![drive, format!("file-{index}.bin"), 1_000 + index],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        assert_eq!(overview.groups.len() as i64, DUPLICATE_GROUP_LIMIT);
+        assert_eq!(overview.probable_group_count, groups);
+        // The largest are kept.
+        assert_eq!(overview.groups[0].name, format!("file-{}.bin", groups - 1));
     }
 
     #[test]
@@ -10190,6 +11119,37 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
     }
 
+    // A process started while the lock is held briefly inherits the lock
+    // file, so the lock can still look held just after it is released. The
+    // app starts diskutil every two seconds, which must never make the next
+    // copy in a run look like it clashes with another transfer.
+    #[test]
+    fn a_released_lock_is_available_while_processes_are_being_started() {
+        let fixture = transfer_fixture("transfer-lock-spawn");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("/usr/bin/true").status();
+                }
+            })
+        };
+
+        let mut refused = 0;
+        for _ in 0..2_000 {
+            let held = try_lock_transfers(&fixture.connection).unwrap();
+            if held.is_none() {
+                refused += 1;
+            }
+            drop(held);
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+
+        assert_eq!(refused, 0);
+    }
+
     #[test]
     fn transfer_lock_rejects_a_second_transfer() {
         let fixture = transfer_fixture("transfer-lock");
@@ -11426,5 +12386,600 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let history = list_transfer_records(&fixture.connection).unwrap();
         assert_eq!(history[0].status, "failed");
         let _ = &fixture.database;
+    }
+
+    // ---- Content checks ----
+
+    // Two temporary drives, Alpha and Beta, with a catalogue to fill.
+    struct CheckFixture {
+        connection: Connection,
+        drives: Vec<DriveInfo>,
+        alpha: TestVolume,
+        beta: TestVolume,
+        _database: TestDatabase,
+    }
+
+    fn check_fixture(name: &str) -> CheckFixture {
+        let database = TestDatabase::new(name);
+        let unique = format!("{name}-{}-{}", std::process::id(), now_unix());
+        let alpha = TestVolume(std::env::temp_dir().join(format!("media-mapper-{unique}-alpha")));
+        let beta = TestVolume(std::env::temp_dir().join(format!("media-mapper-{unique}-beta")));
+        for volume in [&alpha, &beta] {
+            let _ = fs::remove_dir_all(&volume.0);
+            fs::create_dir_all(&volume.0).unwrap();
+        }
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        let drives = vec![
+            test_drive("UUID-A", "Alpha", &alpha.0, 1_000_000_000),
+            test_drive("UUID-B", "Beta", &beta.0, 1_000_000_000),
+        ];
+        CheckFixture {
+            connection,
+            drives,
+            alpha,
+            beta,
+            _database: database,
+        }
+    }
+
+    impl CheckFixture {
+        // Writes a file on a drive and catalogues it as a scan would.
+        fn add(&self, drive_id: &str, relative_path: &str, contents: &[u8]) -> PathBuf {
+            let volume = if drive_id == "UUID-A" {
+                &self.alpha
+            } else {
+                &self.beta
+            };
+            let path = volume.0.join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            let modified_at = system_time_unix(fs::metadata(&path).unwrap().modified());
+            let relative = Path::new(relative_path);
+            self.connection
+                .execute(
+                    "INSERT INTO files (
+                        drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
+                     ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                    params![
+                        drive_id,
+                        relative_path,
+                        relative.file_name().unwrap().to_string_lossy(),
+                        relative
+                            .parent()
+                            .map(|parent| parent.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        contents.len() as i64,
+                        modified_at
+                    ],
+                )
+                .unwrap();
+            path
+        }
+
+        fn check(&self) -> ContentCheckSummary {
+            run_content_check(&self.connection, &self.drives, &|_| {}, &|| false).unwrap()
+        }
+
+        // The stored (sample, full) hashes of one file, if it was checked.
+        fn hashes(
+            &self,
+            drive_id: &str,
+            relative_path: &str,
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+            self.connection
+                .query_row(
+                    "SELECT sample_hash, full_hash FROM content_checks
+                     WHERE drive_id = ?1 AND relative_path = ?2",
+                    params![drive_id, relative_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .unwrap()
+        }
+    }
+
+    // 1.2 MB of bytes that differ from one position to the next.
+    fn content(seed: u8) -> Vec<u8> {
+        (0..1_200_000_u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8 ^ seed)
+            .collect()
+    }
+
+    #[test]
+    fn identical_files_are_found_whatever_their_names() {
+        let fixture = check_fixture("check-identical");
+        let original = content(1);
+        fixture.add("UUID-A", "Films/holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/renamed copy.mov", &original);
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_checked, 2);
+        assert!(!summary.cancelled);
+        let first = fixture.hashes("UUID-A", "Films/holiday.mov").unwrap();
+        let second = fixture.hashes("UUID-B", "Backup/renamed copy.mov").unwrap();
+        assert!(first.1.is_some());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn same_size_with_different_contents_is_never_identical() {
+        let fixture = check_fixture("check-different");
+        let original = content(2);
+        let mut at_start = original.clone();
+        at_start[10] ^= 0xFF;
+        let mut in_middle = original.clone();
+        in_middle[600_000] ^= 0xFF;
+        let mut at_end = original.clone();
+        let last = at_end.len() - 3;
+        at_end[last] ^= 0xFF;
+        fixture.add("UUID-A", "original.mov", &original);
+        fixture.add("UUID-B", "start.mov", &at_start);
+        fixture.add("UUID-B", "middle.mov", &in_middle);
+        fixture.add("UUID-B", "end.mov", &at_end);
+
+        fixture.check();
+
+        let original_hashes = fixture.hashes("UUID-A", "original.mov").unwrap();
+        // A change at either end is settled by the sample, without a full read.
+        for name in ["start.mov", "end.mov"] {
+            let (sample, full) = fixture.hashes("UUID-B", name).unwrap();
+            assert_ne!(sample, original_hashes.0, "{name}");
+            assert_eq!(full, None, "{name} needs no full read");
+        }
+        // A change in the middle shares the sample, so is read in full.
+        let middle = fixture.hashes("UUID-B", "middle.mov").unwrap();
+        assert_eq!(middle.0, original_hashes.0);
+        assert!(middle.1.is_some() && original_hashes.1.is_some());
+        assert_ne!(middle.1, original_hashes.1);
+    }
+
+    #[test]
+    fn a_check_counts_only_while_the_catalogue_entry_is_unchanged() {
+        let fixture = check_fixture("check-stale");
+        let original = content(3);
+        fixture.add("UUID-A", "a.mov", &original);
+        fixture.add("UUID-B", "b.mov", &original);
+        fixture.check();
+        assert!(content_candidates(&fixture.connection)
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.full_hash.is_some()));
+
+        // A rescan finds b.mov with a new date.
+        fixture
+            .connection
+            .execute(
+                "UPDATE files SET modified_at = modified_at + 60 WHERE relative_path = 'b.mov'",
+                [],
+            )
+            .unwrap();
+
+        let candidates = content_candidates(&fixture.connection).unwrap();
+        let b = candidates
+            .iter()
+            .find(|candidate| candidate.relative_path == "b.mov")
+            .unwrap();
+        assert_eq!(b.sample_hash, None);
+        assert_eq!(b.full_hash, None);
+    }
+
+    #[test]
+    fn a_file_changed_since_the_scan_is_left_unchecked() {
+        let fixture = check_fixture("check-changed-on-disk");
+        let original = content(4);
+        fixture.add("UUID-A", "a.mov", &original);
+        let b = fixture.add("UUID-B", "b.mov", &original);
+        // Rewritten after the scan, with a different date.
+        let later = std::time::SystemTime::now() + Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(fixture.hashes("UUID-B", "b.mov"), None);
+    }
+
+    #[test]
+    fn checks_of_an_offline_drive_are_kept() {
+        let fixture = check_fixture("check-offline");
+        let original = content(5);
+        fixture.add("UUID-A", "a.mov", &original);
+        fixture.add("UUID-B", "b.mov", &original);
+        fixture.check();
+
+        // Beta is disconnected: its check still stands, nothing is lost and
+        // a new check has nothing to read there.
+        let alpha_only = vec![fixture.drives[0].clone()];
+        let summary =
+            run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+        assert_eq!(summary, ContentCheckSummary::default());
+        assert!(fixture.hashes("UUID-B", "b.mov").unwrap().1.is_some());
+        assert!(estimate_content_check_for(&fixture.connection, &alpha_only)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_and_pipes_are_never_read() {
+        let fixture = check_fixture("check-links");
+        let original = content(6);
+        fixture.add("UUID-A", "a.mov", &original);
+        let link = fixture.add("UUID-B", "link.mov", &original);
+        let pipe = fixture.add("UUID-B", "pipe.mov", &original);
+        // After the scan, one becomes a link to the real file, the other a pipe.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(fixture.alpha.0.join("a.mov"), &link).unwrap();
+        fs::remove_file(&pipe).unwrap();
+        assert!(std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success());
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_unreadable, 2);
+        assert_eq!(fixture.hashes("UUID-B", "link.mov"), None);
+        assert_eq!(fixture.hashes("UUID-B", "pipe.mov"), None);
+    }
+
+    #[test]
+    fn a_cancelled_check_keeps_what_it_finished_and_records_nothing_more() {
+        let fixture = check_fixture("check-cancel");
+        for index in 0..4 {
+            fixture.add("UUID-A", &format!("a{index}.mov"), &content(10 + index));
+            fixture.add("UUID-B", &format!("b{index}.mov"), &content(10 + index));
+        }
+        // Cancel after a few files.
+        let calls = std::cell::Cell::new(0);
+        let summary = run_content_check(&fixture.connection, &fixture.drives, &|_| {}, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 3
+        })
+        .unwrap();
+
+        assert!(summary.cancelled);
+        let recorded: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recorded, 3, "the three files sampled before the cancel");
+
+        // The next check carries on and finishes.
+        let summary = fixture.check();
+        assert!(!summary.cancelled);
+        assert_eq!(summary.files_checked, 8);
+    }
+
+    #[test]
+    fn a_check_never_changes_any_file() {
+        let fixture = check_fixture("check-read-only");
+        let original = content(7);
+        let paths = [
+            fixture.add("UUID-A", "a.mov", &original),
+            fixture.add("UUID-B", "b.mov", &original),
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.created().ok(),
+                )
+            })
+            .collect();
+
+        fixture.check();
+
+        let after: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.created().ok(),
+                )
+            })
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(folder_names(&fixture.alpha.0), ["a.mov"]);
+        assert_eq!(folder_names(&fixture.beta.0), ["b.mov"]);
+    }
+
+    #[test]
+    fn small_and_hidden_files_are_never_read() {
+        let fixture = check_fixture("check-small-hidden");
+        fixture.add("UUID-A", "small.jpg", &[1_u8; 999_999]);
+        fixture.add("UUID-B", "small.jpg", &[1_u8; 999_999]);
+        fixture.add("UUID-A", ".hidden/big.mov", &content(8));
+        fixture.add("UUID-B", "._big.mov", &content(8));
+
+        let summary = fixture.check();
+
+        assert_eq!(summary, ContentCheckSummary::default());
+        let recorded: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    #[test]
+    fn a_check_waits_for_copies_and_scans() {
+        let fixture = check_fixture("check-locked");
+        fixture.add("UUID-A", "a.mov", &content(9));
+        fixture.add("UUID-B", "b.mov", &content(9));
+        let other = open_database(&fixture._database.0).unwrap();
+        let held = try_lock_transfers(&other).unwrap().expect("lock is free");
+
+        let error = run_content_check(&fixture.connection, &fixture.drives, &|_| {}, &|| false)
+            .unwrap_err();
+
+        assert_eq!(error, CONTENT_CHECK_BUSY);
+        assert_eq!(fixture.hashes("UUID-A", "a.mov"), None);
+        drop(held);
+        assert_eq!(fixture.check().files_checked, 2);
+    }
+
+    #[test]
+    fn the_estimate_counts_unchecked_candidates_on_connected_drives() {
+        let fixture = check_fixture("check-estimate");
+        fixture.add("UUID-A", "a.mov", &content(11));
+        fixture.add("UUID-B", "b.mov", &content(11));
+        fixture.add("UUID-B", "c.mov", &content(12));
+        fixture.add("UUID-B", "lonely.mov", &[0_u8; 1_500_000]);
+
+        let estimate = estimate_content_check_for(&fixture.connection, &fixture.drives).unwrap();
+        assert_eq!(
+            estimate,
+            [
+                ContentCheckEstimate {
+                    drive_id: "UUID-A".to_string(),
+                    drive_name: "Alpha".to_string(),
+                    file_count: 1,
+                    max_bytes: 1_200_000
+                },
+                ContentCheckEstimate {
+                    drive_id: "UUID-B".to_string(),
+                    drive_name: "Beta".to_string(),
+                    file_count: 2,
+                    max_bytes: 2_400_000
+                },
+            ]
+        );
+
+        // Once checked in full, nothing is left to estimate.
+        fixture.check();
+        let remaining = estimate_content_check_for(&fixture.connection, &fixture.drives).unwrap();
+        // c.mov's sample differs, so it was never read in full and stays
+        // in the estimate as an upper bound.
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].file_count, 1);
+    }
+
+    // Groups as (kind, name, copies, ["Drive:path", ...]).
+    fn duplicate_kinds(
+        overview: &DuplicateOverview,
+    ) -> Vec<(DuplicateKind, String, i64, Vec<String>)> {
+        overview
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.kind,
+                    group.name.clone(),
+                    group.copies,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checked_copies_are_listed_as_identical_with_their_extra_space() {
+        let fixture = check_fixture("identical-listed");
+        let original = content(20);
+        fixture.add("UUID-A", "Films/holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/holiday.mov", &original);
+        fixture.add("UUID-B", "Other/renamed.mov", &original);
+        // Probable before the check, by name; the renamed copy isn't.
+        let before = find_duplicates(&fixture.connection).unwrap();
+        assert_eq!(before.probable_group_count, 1);
+        assert_eq!(before.identical_group_count, 0);
+        assert_eq!(before.identical_extra_bytes, 0);
+
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(
+            duplicate_kinds(&after),
+            [(
+                DuplicateKind::Identical,
+                "holiday.mov".to_string(),
+                3,
+                vec![
+                    "Alpha:Films/holiday.mov".to_string(),
+                    "Beta:Backup/holiday.mov".to_string(),
+                    "Beta:Other/renamed.mov".to_string()
+                ]
+            )]
+        );
+        assert!(after.groups[0].checked_at.is_some());
+        assert_eq!(after.identical_group_count, 1);
+        assert_eq!(after.identical_extra_bytes, 2 * original.len() as i64);
+        // Settled files are no longer probable.
+        assert_eq!(after.probable_group_count, 0);
+    }
+
+    #[test]
+    fn a_probable_pair_with_different_contents_disappears_once_checked() {
+        let fixture = check_fixture("identical-differ");
+        let original = content(21);
+        let mut changed = original.clone();
+        changed[5] ^= 0xFF;
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &changed);
+        assert_eq!(
+            find_duplicates(&fixture.connection)
+                .unwrap()
+                .probable_group_count,
+            1
+        );
+
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert!(after.groups.is_empty());
+        assert_eq!(after.probable_group_count, 0);
+        assert_eq!(after.identical_extra_bytes, 0);
+    }
+
+    #[test]
+    fn a_probable_pair_stays_probable_until_both_copies_are_checked() {
+        let fixture = check_fixture("identical-half-checked");
+        let original = content(22);
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &original);
+
+        // Only Alpha is connected: its copy is sampled, Beta's can't be.
+        let alpha_only = vec![fixture.drives[0].clone()];
+        run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(
+            duplicate_kinds(&after),
+            [(
+                DuplicateKind::Probable,
+                "clip.mov".to_string(),
+                2,
+                vec!["Alpha:clip.mov".to_string(), "Beta:clip.mov".to_string()]
+            )]
+        );
+
+        // With both connected it is settled as identical.
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+        assert_eq!(after.identical_group_count, 1);
+        assert_eq!(after.probable_group_count, 0);
+    }
+
+    #[test]
+    fn an_identical_group_goes_back_to_probable_when_a_copy_changes() {
+        let fixture = check_fixture("identical-stale");
+        let original = content(23);
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &original);
+        fixture.check();
+        assert_eq!(
+            find_duplicates(&fixture.connection)
+                .unwrap()
+                .identical_group_count,
+            1
+        );
+
+        // A rescan finds Beta's copy with a new date.
+        fixture
+            .connection
+            .execute(
+                "UPDATE files SET modified_at = modified_at + 60 WHERE drive_id = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(after.identical_group_count, 0);
+        assert_eq!(after.identical_extra_bytes, 0);
+        assert_eq!(after.probable_group_count, 1);
+    }
+
+    #[test]
+    fn identical_groups_come_first_and_only_they_count_towards_extra_space() {
+        let fixture = check_fixture("identical-order");
+        let big = content(24);
+        fixture.add("UUID-A", "same.mov", &big);
+        fixture.add("UUID-B", "same.mov", &big);
+        // Small files are only ever probable, however large the group.
+        for drive in ["UUID-A", "UUID-B"] {
+            fixture.add(drive, "small.jpg", &[7_u8; 500_000]);
+        }
+        fixture.check();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+        let kinds: Vec<DuplicateKind> = overview.groups.iter().map(|group| group.kind).collect();
+
+        assert_eq!(kinds, [DuplicateKind::Identical, DuplicateKind::Probable]);
+        assert_eq!(overview.identical_extra_bytes, big.len() as i64);
+        assert_eq!(overview.probable_group_count, 1);
+    }
+
+    #[test]
+    fn an_unchecked_copy_keeps_its_group_probable_beside_the_identical_ones() {
+        let fixture = check_fixture("identical-plus-unchecked");
+        let original = content(25);
+        fixture.add("UUID-A", "a/clip.mov", &original);
+        fixture.add("UUID-A", "b/clip.mov", &original);
+        // A third copy, on Beta, which is offline during the check.
+        fixture.add("UUID-B", "clip.mov", &original);
+        let alpha_only = vec![fixture.drives[0].clone()];
+        run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+
+        // Alpha's copies are known to be identical; Beta's may match them.
+        assert_eq!(
+            duplicate_kinds(&overview),
+            [
+                (
+                    DuplicateKind::Identical,
+                    "clip.mov".to_string(),
+                    2,
+                    vec![
+                        "Alpha:a/clip.mov".to_string(),
+                        "Alpha:b/clip.mov".to_string()
+                    ]
+                ),
+                (
+                    DuplicateKind::Probable,
+                    "clip.mov".to_string(),
+                    3,
+                    vec![
+                        "Alpha:a/clip.mov".to_string(),
+                        "Alpha:b/clip.mov".to_string(),
+                        "Beta:clip.mov".to_string()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_identical_group_is_named_after_the_name_most_copies_share() {
+        let fixture = check_fixture("identical-name");
+        let original = content(26);
+        fixture.add("UUID-A", "holiday.mov", &original);
+        fixture.add("UUID-B", "holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/a copy.mov", &original);
+        fixture.check();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(overview.groups[0].kind, DuplicateKind::Identical);
+        assert_eq!(overview.groups[0].name, "holiday.mov");
     }
 }

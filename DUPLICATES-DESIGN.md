@@ -1,6 +1,6 @@
 # Duplicate awareness: proposed design
 
-**Status: decisions made 2026-10-01 (see the end of this document). Waiting for the go-ahead to build.** Nothing in this document is built yet.
+**Status: built 2026-10-02**, as designed except where "As built" at the end says otherwise.
 
 The V1 goal is information only. Media Mapper says which files appear more than once, where the copies are, why it thinks they match, and how much space the confirmed extra copies take. It never deletes, never suggests deleting a particular copy, and never ranks one copy as "the original".
 
@@ -165,3 +165,17 @@ Each step is a small, separately tested commit:
 3. **Minimum size for content checks:** 1 MB. Smaller files are shown only as probable.
 4. **Hash:** SHA-256 with the `sha2` crate. This was the default; no alternative was asked for.
 5. **Step 5,** hashing during copy verification: deferred past V1. The copy engine stays untouched.
+
+## As built (2026-10-02)
+
+Steps 1 to 4 are built. Step 5 is deferred, as decided.
+
+These differ from the design above:
+
+- **The size index came with schema version 2,** not with step 1. That way the schema changed once.
+- **When a probable group goes away.** A file stops being probable once its contents are settled against every other file of its size. Every other such file must have been checked, and each must either have a different sample or have been read in full too. So a pair proven different disappears, and a pair with an unchecked copy, or with a check made stale by a rescan, stays probable. In one case a file appears in both lists: two copies proven identical, plus a third with the same name on a drive that wasn't connected for the check. The identical section lists the two; the probable group lists all three, because the third may match them.
+- **Group names.** An identical group is named after the name most of its copies share. A copy whose name differs shows its full path.
+- **The estimate is an upper bound.** It reads "This reads up to … on Source and Mars, usually much less", because samples settle most files without a full read.
+- **The 1 MB threshold is decimal** (1,000,000 bytes), matching how sizes are shown.
+
+In the lists, "Show in folder" opens Browse at that copy's folder. "Open" is offered only while the copy's drive is connected.

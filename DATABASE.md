@@ -19,6 +19,7 @@ Development builds and release builds use the same catalogue (RELEASE-TESTING.md
 | `locations` | Where files can be planned to: every drive (`drive:<uuid>`), and folders on this Mac. Holds user labels. |
 | `planned_moves` | The plan: source file and destination location and path |
 | `transfers` | Transfer history: a snapshot of each copy attempt's source, destination and outcome |
+| `content_checks` | Version 2. Hashes from checking duplicate candidates' contents, per file. A row counts only while the file's catalogue entry still has the same size and date. |
 
 ## Schema versions
 
@@ -28,6 +29,7 @@ The schema version is SQLite's `PRAGMA user_version`. `SCHEMA_VERSION` in `src-t
 |---|---|---|
 | 0 | Every build before `ed3f730` | No version stored. The schema could be any of the eight shapes below. |
 | 1 | `ed3f730` | The schema as of `main` 66426ad, with a version |
+| 2 | Duplicate awareness | Adds `content_checks` and an index on file size. Nothing existing changes. |
 
 The shapes that version 0 covers, each of which has a test fixture:
 
@@ -70,7 +72,7 @@ In `src-tauri/src/lib.rs`, `mod tests`:
 
 | Test | Checks |
 |---|---|
-| `every_historical_catalogue_upgrades_keeping_its_data` | Each of the eight historical shapes upgrades to exactly the current schema. Drives, capacity, mount points, scan and connection times, totals, every entry with its exact name and parent folder, unreadable markers, locations, labels, folders on this Mac, planned moves, transfer history (including a cancel and an unfinished record), foreign keys and integrity are all kept. Reopening changes nothing. |
+| `every_historical_catalogue_upgrades_keeping_its_data` | Each of the eight version 0 shapes, and a version 1 catalogue, upgrades to exactly the current schema. Drives, capacity, mount points, scan and connection times, totals, every entry with its exact name and parent folder, unreadable markers, locations, labels, folders on this Mac, planned moves, transfer history (including a cancel and an unfinished record), foreign keys and integrity are all kept. Reopening changes nothing. |
 | `a_failed_upgrade_leaves_the_catalogue_exactly_as_it_was` | An upgrade that fails at its last step keeps none of its earlier steps, and succeeds in full later |
 | `two_app_instances_upgrading_at_once_both_succeed` | Six connections upgrading at once, without the in-app lock, all succeed |
 | `a_catalogue_from_a_newer_version_is_left_untouched` | Refused, unchanged, no backup |

@@ -91,13 +91,50 @@ type DuplicateFile = {
   modifiedAt: number | null;
 };
 
+// Identical: same size and same contents, from a content check.
+// Probable: same name and size, contents not compared.
 type DuplicateGroup = {
+  kind: "identical" | "probable";
   name: string;
   sizeBytes: number;
   copies: number;
-  potentialWastedBytes: number;
+  checkedAt: number | null;
   files: DuplicateFile[];
 };
+
+type DuplicateOverview = {
+  groups: DuplicateGroup[];
+  identicalGroupCount: number;
+  identicalExtraBytes: number;
+  probableGroupCount: number;
+};
+
+// What a content check would read on one connected drive, at most.
+type ContentCheckEstimate = {
+  driveId: string;
+  driveName: string;
+  fileCount: number;
+  maxBytes: number;
+};
+
+type ContentCheckProgress = {
+  stage: "sampling" | "comparing";
+  filesDone: number;
+  filesTotal: number;
+};
+
+type ContentCheckSummary = {
+  filesChecked: number;
+  filesChanged: number;
+  filesUnreadable: number;
+  cancelled: boolean;
+};
+
+type ContentCheckState =
+  | { phase: "idle" }
+  | { phase: "estimating" }
+  | { phase: "confirm"; estimate: ContentCheckEstimate[] }
+  | { phase: "running"; runId: number; cancelling: boolean };
 
 
 type Location = {
@@ -225,6 +262,46 @@ function formatDate(timestamp: number | null) {
   if (!timestamp) return "Never";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
     .format(new Date(timestamp * 1000));
+}
+
+// A date without its time, such as "1 Aug 2019".
+function formatDay(timestamp: number | null) {
+  if (!timestamp) return "—";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(timestamp * 1000));
+}
+
+// The one-line summary on the Browse landing, such as
+// "12 identical groups · 48.2 GB in extra copies · 30 probable".
+function duplicatesSummary(overview: DuplicateOverview) {
+  const parts: string[] = [];
+  if (overview.identicalGroupCount > 0) {
+    parts.push(count(overview.identicalGroupCount, "identical group"));
+    parts.push(`${formatBytes(overview.identicalExtraBytes)} in extra copies`);
+  }
+  if (overview.probableGroupCount > 0) {
+    parts.push(`${overview.probableGroupCount.toLocaleString()} probable`);
+  }
+  return parts.join(" · ");
+}
+
+// "Source", "Source and Mars", "Source, Mars and Archive".
+function joinNames(names: string[]) {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+// What a finished content check found, for the view and VoiceOver.
+function contentCheckResultMessage(summary: ContentCheckSummary) {
+  const parts = [summary.cancelled
+    ? "Check cancelled. Files checked before you cancelled are kept."
+    : "Check complete."];
+  if (summary.filesChanged > 0) {
+    parts.push(`${count(summary.filesChanged, "file")} changed since ${summary.filesChanged === 1 ? "its drive was" : "their drives were"} last scanned, so ${summary.filesChanged === 1 ? "it wasn't" : "they weren't"} checked. Rescan to include ${summary.filesChanged === 1 ? "it" : "them"}.`);
+  }
+  if (summary.filesUnreadable > 0) {
+    parts.push(`${count(summary.filesUnreadable, "file")} couldn't be read.`);
+  }
+  return parts.join(" ");
 }
 
 const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
@@ -422,10 +499,16 @@ function App() {
   const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
   const [largestFilesLoading, setLargestFilesLoading] = useState(false);
   const [showLargestFiles, setShowLargestFiles] = useState(false);
-  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
+  const [duplicateOverview, setDuplicateOverview] = useState<DuplicateOverview | null>(null);
   const [duplicatesLoading, setDuplicatesLoading] = useState(false);
-  const [showDuplicates, setShowDuplicates] = useState(false);
+  const [duplicatesError, setDuplicatesError] = useState<string | null>(null);
+  // Browse shows the Duplicates view in place of the drive list.
+  const [showDuplicatesView, setShowDuplicatesView] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
+  const [contentCheck, setContentCheck] = useState<ContentCheckState>({ phase: "idle" });
+  const [contentCheckProgress, setContentCheckProgress] = useState<ContentCheckProgress | null>(null);
+  const [contentCheckResult, setContentCheckResult] = useState<string | null>(null);
+  const lastContentCheckRunId = useRef(0);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
   const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
@@ -1037,27 +1120,82 @@ function App() {
     }
   }, []);
 
+  // Reads the catalogue only. Nothing on any drive is read.
   const loadDuplicates = useCallback(async () => {
-    if (showDuplicates) {
-      setShowDuplicates(false);
-      setExpandedDuplicate(null);
-      return;
-    }
-
     setDuplicatesLoading(true);
-    setError(null);
-
     try {
-      const results = await invoke<DuplicateGroup[]>("probable_duplicates");
-      setDuplicateGroups(results);
-      setShowDuplicates(true);
+      setDuplicateOverview(await invoke<DuplicateOverview>("list_duplicates"));
+      setDuplicatesError(null);
     } catch (cause) {
-      setError(String(cause));
-      setDuplicateGroups([]);
+      setDuplicateOverview(null);
+      setDuplicatesError(String(cause));
     } finally {
       setDuplicatesLoading(false);
     }
-  }, [showDuplicates]);
+  }, []);
+
+  // Browse lists duplicates under the drives, so refresh them whenever Browse
+  // shows its landing or the catalogue changes, such as after a scan.
+  useEffect(() => {
+    if (activeView === "browse" && !browserDrive) {
+      void loadDuplicates();
+    }
+  }, [activeView, browserDrive, catalogued, loadDuplicates]);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<ContentCheckProgress>("duplicate-check-progress", (event) => setContentCheckProgress(event.payload))
+      .then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, []);
+
+  // Says how much a check would read before anything is read.
+  const prepareContentCheck = async () => {
+    setContentCheckResult(null);
+    setContentCheck({ phase: "estimating" });
+    try {
+      const estimate = await invoke<ContentCheckEstimate[]>("estimate_content_check");
+      setContentCheck({ phase: "confirm", estimate });
+      setPendingFocus({ selector: '[data-focus="content-check-confirm"]', onlyIfLost: false });
+    } catch (cause) {
+      setContentCheck({ phase: "idle" });
+      setDuplicatesError(String(cause));
+    }
+  };
+
+  const startContentCheck = async () => {
+    // Ids come from the clock, as copy runs' do.
+    const runId = Math.max(Date.now(), lastContentCheckRunId.current + 1);
+    lastContentCheckRunId.current = runId;
+    setDuplicatesError(null);
+    setContentCheckProgress(null);
+    setContentCheck({ phase: "running", runId, cancelling: false });
+    setAnnouncement("Checking contents.");
+    setPendingFocus({ selector: '[data-focus="content-check-cancel"]', onlyIfLost: false });
+    try {
+      const summary = await invoke<ContentCheckSummary>("check_duplicate_contents", { runId });
+      const message = contentCheckResultMessage(summary);
+      setContentCheckResult(message);
+      setAnnouncement(message);
+    } catch (cause) {
+      setDuplicatesError(String(cause));
+    } finally {
+      setContentCheck({ phase: "idle" });
+      setContentCheckProgress(null);
+      setPendingFocus({ selector: '[data-focus="content-check-start"]', onlyIfLost: true });
+      await loadDuplicates();
+    }
+  };
+
+  const cancelContentCheck = async () => {
+    if (contentCheck.phase !== "running") return;
+    setContentCheck({ ...contentCheck, cancelling: true });
+    try {
+      await invoke("cancel_duplicate_check", { runId: contentCheck.runId });
+    } catch (cause) {
+      setDuplicatesError(String(cause));
+    }
+  };
 
   const loadLargestFiles = useCallback(async () => {
     if (showLargestFiles) {
@@ -1104,6 +1242,7 @@ function App() {
 
   const openDuplicateFile = async (file: DuplicateFile) => {
     const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
+    setShowDuplicatesView(false);
 
     if (!drive) {
       setError("That drive is no longer in the catalogue.");
@@ -2055,6 +2194,235 @@ function App() {
     );
   }
 
+    if (activeView === "browse" && !browserDrive && showDuplicatesView) {
+    const groups = duplicateOverview?.groups ?? [];
+    const identicalGroups = groups.filter((group) => group.kind === "identical");
+    const probableGroups = groups.filter((group) => group.kind === "probable");
+    const copyOrScanRunning = executingPlan || scanningId !== null;
+    const leave = (view: "drives" | "browse" | "plan" | "transfers") => {
+      setShowDuplicatesView(false);
+      setActiveView(view);
+    };
+
+    const renderGroup = (group: DuplicateGroup, index: number) => {
+      const key = `${group.kind}:${group.sizeBytes}:${group.name}`;
+      const expanded = expandedDuplicate === key;
+      const copiesId = `duplicate-copies-${group.kind}-${index}`;
+      return (
+        <div className="duplicate-group" key={key}>
+          <button
+            className="duplicate-group-row"
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={copiesId}
+            onClick={() => setExpandedDuplicate(expanded ? null : key)}
+          >
+            <span className="duplicate-group-name">
+              <strong>{group.name}</strong>
+              <span>{group.copies.toLocaleString()} copies · {formatBytes(group.sizeBytes)} each</span>
+            </span>
+            <span className="duplicate-group-reason">
+              {group.kind === "identical"
+                ? `Same contents, checked ${formatDay(group.checkedAt)}`
+                : "Same name and size, not checked"}
+            </span>
+            <span className={`duplicate-disclosure${expanded ? " expanded" : ""}`} aria-hidden="true"><FolderChevron /></span>
+          </button>
+          {expanded && (
+            <ul className="duplicate-copies" id={copiesId} aria-label={`Copies of ${group.name}`}>
+              {group.files.map((file, fileIndex) => {
+                const driveName = driveDisplayName(file.driveId, file.driveName);
+                const connected = connectedIds.has(file.driveId);
+                const locationId = `${copiesId}-location-${fileIndex}`;
+                return (
+                  <li className="duplicate-copy" key={`${file.driveId}:${file.relativePath}`}>
+                    <span className="duplicate-copy-location" id={locationId}>
+                      {/* Identical copies can have other names; show the name when it differs. */}
+                      {formatLocationPath(driveName, file.name === group.name ? parentFolder(file.relativePath) : file.relativePath)}
+                    </span>
+                    <span className="duplicate-copy-state">{connected ? "Connected" : "Offline"}</span>
+                    <span className="duplicate-copy-date">{formatDay(file.modifiedAt)}</span>
+                    <span className="duplicate-copy-actions">
+                      <button type="button" aria-describedby={locationId} onClick={() => void openDuplicateFile(file)}>
+                        Show in folder
+                      </button>
+                      {connected && (
+                        <button
+                          type="button"
+                          aria-describedby={locationId}
+                          onClick={() => openCataloguedFile(file.driveId, driveName, file.relativePath)}
+                        >
+                          Open
+                        </button>
+                      )}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      );
+    };
+
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => leave("drives")}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page" onClick={() => leave("browse")}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => leave("plan")}>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => leave("transfers")}>Transfers</button>
+          </nav>
+        </aside>
+        {liveRegion}
+        <div className="app-content browse-detail duplicates-view">
+          <header className="app-header browse-detail-header">
+            <div>
+              <nav className="browse-detail-breadcrumb" aria-label="Browse path">
+                <button type="button" onClick={() => setShowDuplicatesView(false)}>All files</button>
+                <span aria-hidden="true">/</span>
+                <span className="current" aria-current="location">Duplicates</span>
+              </nav>
+              <h1>Duplicates</h1>
+              <p className="duplicates-intro">
+                Files that appear more than once across your drives. Copies are often intentional, such as backups. Media Mapper never removes files.
+              </p>
+            </div>
+          </header>
+
+          {error && <div className="notice error" role="alert">{error}</div>}
+          {duplicatesError && <div className="notice error" role="alert">{duplicatesError}</div>}
+
+          {(() => {
+            const estimateTotal = contentCheck.phase === "confirm"
+              ? contentCheck.estimate.reduce((sum, drive) => sum + drive.maxBytes, 0)
+              : 0;
+            return (
+              <section className="duplicate-check" aria-labelledby="duplicate-check-heading">
+                <div className="duplicate-check-row">
+                  <div>
+                    <h2 className="duplicate-check-title" id="duplicate-check-heading">
+                      {duplicateOverview && duplicateOverview.identicalGroupCount > 0
+                        ? `Identical: ${count(duplicateOverview.identicalGroupCount, "group")} · ${formatBytes(duplicateOverview.identicalExtraBytes)} in extra copies`
+                        : "Identical: none found yet"}
+                    </h2>
+                    <p>Checks files that share a size on connected drives. Reads files only.</p>
+                  </div>
+                  {contentCheck.phase === "idle" && (
+                    <button
+                      className="section-action"
+                      type="button"
+                      data-focus="content-check-start"
+                      disabled={copyOrScanRunning}
+                      onClick={() => void prepareContentCheck()}
+                    >
+                      Check contents
+                    </button>
+                  )}
+                  {contentCheck.phase === "estimating" && <span className="duplicate-check-status">Working out what to read…</span>}
+                </div>
+                {contentCheck.phase === "idle" && copyOrScanRunning && (
+                  <p className="duplicate-check-note">Contents can be checked once the copy or scan has finished.</p>
+                )}
+                {contentCheck.phase === "confirm" && (
+                  <div className="duplicate-check-confirm">
+                    {contentCheck.estimate.length === 0 ? (
+                      <p>Nothing to check on the connected drives. Connect the drives that hold the copies, then check again.</p>
+                    ) : (
+                      <p>
+                        This reads up to {formatBytes(estimateTotal)} on {joinNames(contentCheck.estimate.map((drive) => driveDisplayName(drive.driveId, drive.driveName)))}, usually much less. Files are only read, never changed. Copies on drives that aren't connected are skipped.
+                      </p>
+                    )}
+                    <div className="duplicate-check-actions">
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        data-focus={contentCheck.estimate.length === 0 ? "content-check-confirm" : undefined}
+                        onClick={() => {
+                          setContentCheck({ phase: "idle" });
+                          setPendingFocus({ selector: '[data-focus="content-check-start"]', onlyIfLost: false });
+                        }}
+                      >
+                        {contentCheck.estimate.length === 0 ? "OK" : "Cancel"}
+                      </button>
+                      {contentCheck.estimate.length > 0 && (
+                        <button className="section-action" type="button" data-focus="content-check-confirm" onClick={() => void startContentCheck()}>
+                          Check contents
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {contentCheck.phase === "running" && (
+                  <div className="duplicate-check-progress">
+                    <span>
+                      {!contentCheckProgress
+                        ? "Starting…"
+                        : contentCheckProgress.stage === "sampling"
+                          ? `Comparing the start and end of files: ${contentCheckProgress.filesDone.toLocaleString()} of ${contentCheckProgress.filesTotal.toLocaleString()}`
+                          : `Reading matching files in full: ${contentCheckProgress.filesDone.toLocaleString()} of ${contentCheckProgress.filesTotal.toLocaleString()}`}
+                    </span>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      data-focus="content-check-cancel"
+                      disabled={contentCheck.cancelling}
+                      onClick={() => void cancelContentCheck()}
+                    >
+                      {contentCheck.cancelling ? "Cancelling…" : "Cancel"}
+                    </button>
+                  </div>
+                )}
+                {contentCheck.phase === "idle" && contentCheckResult && (
+                  <p className="duplicate-check-result">{contentCheckResult}</p>
+                )}
+              </section>
+            );
+          })()}
+
+          {!duplicateOverview ? (
+            duplicatesLoading && <div className="browser-message">Finding duplicates…</div>
+          ) : groups.length === 0 ? (
+            <div className="empty-state compact">
+              <h3>No duplicates found</h3>
+              <p>No two catalogued files share a name and size.</p>
+            </div>
+          ) : (
+            <>
+              {identicalGroups.length > 0 && (
+                <section className="duplicate-section" aria-labelledby="duplicates-identical-heading">
+                  <h2 className="duplicate-section-heading" id="duplicates-identical-heading">Identical</h2>
+                  <p className="duplicate-section-note">Same size and the same contents, byte for byte, when they were checked.</p>
+                  <div className="duplicate-list">{identicalGroups.map(renderGroup)}</div>
+                  {duplicateOverview.identicalGroupCount > identicalGroups.length && (
+                    <p className="duplicate-section-note">
+                      Showing the {identicalGroups.length.toLocaleString()} groups with the most space in extra copies, of {duplicateOverview.identicalGroupCount.toLocaleString()}.
+                    </p>
+                  )}
+                </section>
+              )}
+              {probableGroups.length > 0 && (
+                <section className="duplicate-section" aria-labelledby="duplicates-probable-heading">
+                  <h2 className="duplicate-section-heading" id="duplicates-probable-heading">Probable</h2>
+                  <p className="duplicate-section-note">Same name and size. Their contents haven't all been compared.</p>
+                  <div className="duplicate-list">{probableGroups.map(renderGroup)}</div>
+                  {duplicateOverview.probableGroupCount > probableGroups.length && (
+                    <p className="duplicate-section-note">
+                      Showing the {probableGroups.length.toLocaleString()} groups with the most space in extra copies, of {duplicateOverview.probableGroupCount.toLocaleString()}.
+                    </p>
+                  )}
+                </section>
+              )}
+            </>
+          )}
+
+        </div>
+      </main>
+    );
+  }
+
     if (activeView === "browse" && !browserDrive) {
     const plannedMoveBySource = new Map(
       plannedMoves.map((move) => [`${move.sourceDriveId}\u0000${move.sourceRelativePath}`, move]),
@@ -2220,6 +2588,19 @@ function App() {
                 ))}
               </div>
               {catalogued.length === 0 && <div className="empty-state compact"><h3>No catalogued drives</h3><p>Scan a drive first, then its files will appear here.</p></div>}
+              {duplicateOverview && duplicateOverview.groups.length > 0 && (
+                <button
+                  className="browse-duplicates-row"
+                  type="button"
+                  onClick={() => { setExpandedDuplicate(null); setShowDuplicatesView(true); }}
+                >
+                  <span className="browse-duplicates-text">
+                    <strong>Duplicates</strong>
+                    <span>{duplicatesSummary(duplicateOverview)}</span>
+                  </span>
+                  <FolderChevron />
+                </button>
+              )}
             </section>
           )}
 
@@ -3190,63 +3571,6 @@ function App() {
 
       {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
-        <div className="tool-row">
-          <div>
-            <h3>Probable duplicates</h3>
-            <p>Same filename and exact file size. Contents have not been compared.</p>
-          </div>
-          <button
-            className="section-action"
-            onClick={() => void loadDuplicates()}
-            disabled={duplicatesLoading}
-          >
-            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
-          </button>
-        </div>
-
-        {showDuplicates && <div className="search-results">
-          {duplicateGroups.length === 0 ? (
-            <div className="browser-message">No probable duplicates found.</div>
-          ) : (
-            duplicateGroups.map((group) => {
-              const key = `${group.name}:${group.sizeBytes}`;
-              const expanded = expandedDuplicate === key;
-
-              return (
-                <div className="duplicate-group" key={key}>
-                  <button
-                    className="search-result"
-                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
-                  >
-                    <span className="search-result-main">
-                      <strong>{group.name}</strong>
-                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
-                    </span>
-                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
-                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
-                  </button>
-
-                  {expanded && <div className="duplicate-files">
-                    {group.files.map((file) => (
-                      <button
-                        className="search-result"
-                        key={`${file.driveId}:${file.relativePath}`}
-                        onClick={() => void openDuplicateFile(file)}
-                      >
-                        <span className="search-result-main">
-                          <strong>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</strong>
-                        </span>
-                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
-                        <span>{formatBytes(file.sizeBytes)}</span>
-                      </button>
-                    ))}
-                  </div>}
-                </div>
-              );
-            })
-          )}
-        </div>}
-
         <div className="tool-row">
           <div>
             <h3>Largest files</h3>

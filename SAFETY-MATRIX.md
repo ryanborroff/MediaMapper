@@ -109,6 +109,7 @@ Run the suite with `cargo test --manifest-path src-tauri/Cargo.toml`. The out-of
 | K3 | Reading the database while a scan runs | Reads succeed during the scan's write transaction | Auto: `read_connection_opens_while_scan_holds_write_transaction` | Existing | Pass | |
 | K4 | Scan while a transfer runs | Scan refused | Auto: `scan_is_refused_while_a_transfer_is_running` | New | Pass | |
 | K5 | Database contention while completing | Brief contention waited out; prolonged failure reported truthfully (A8) | Auto: `transfer_records_its_completion_despite_brief_database_contention`, `copy_finalised_but_not_recorded_is_reported_truthfully` | Existing / Fixed | Pass | |
+| K6 | Lock just released while the app starts a process (such as diskutil) | Not mistaken for another transfer: the next copy in a run starts | Auto: `a_released_lock_is_available_while_processes_are_being_started` | Fixed | Pass | A started process briefly inherits the lock file, so a busy lock is retried for up to 0.5 s |
 
 ## Recovery invariants
 
