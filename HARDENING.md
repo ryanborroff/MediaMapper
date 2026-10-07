@@ -220,6 +220,19 @@ Built as decided in [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md): information on
 - [x] **Tests:** 23 new. Rust tests went from 116 to 139, plus 1 opt-in, all passing, and 15 repeated full runs passed.
 - [x] **Release build, end to end** on disk images with a separate home folder. Three copies were found identical, including one renamed. A same-size file with a different middle was read in full and correctly left out. A small file stayed probable. Every file's hash and date were unchanged afterwards.
 
+## Phase 8: Shipping audit (done 2026-10-07)
+
+The full audit, the decisions it needs, and a release checklist are in [SHIPPING.md](SHIPPING.md).
+
+- **Blockers:**
+  - the bundle identifier (gap 12 / P3-1), which you need to choose;
+  - no Developer ID Application certificate on this Mac, only Apple Development and App Store distribution certificates;
+  - the icon is still Tauri's default.
+- **Hardened runtime** (required for notarisation): a copy signed with it and no entitlements launched, detected and scanned a drive, and browsed it. No entitlements are needed.
+- [x] **Privacy usage descriptions** for removable volumes and the Documents, Desktop and Downloads folders (`761706c`). P3-4 is fixed.
+- [x] **Plan's empty state** named a "Plan move" button that doesn't exist (`ab858ee`).
+- **Recommended:** no automatic updater in V1, and no onboarding screens.
+
 ## Later phases
 
 - [x] Phase 1: baseline
@@ -229,5 +242,5 @@ Built as decided in [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md): information on
 - [x] Phase 5: accessibility and keyboard QA, and `ACCESSIBILITY.md` (except the VoiceOver run by hand)
 - [x] Phase 6: error message audit, and `ERROR-MESSAGES.md`
 - [x] Phase 7: duplicate awareness, built from [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md)
-- [ ] Phase 8: shipping audit
+- [x] Phase 8: shipping audit, and `SHIPPING.md`. Seven decisions are waiting on you (D1–D7).
 - [ ] Phase 9: `RELEASE-READINESS.md`
