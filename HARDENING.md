@@ -243,4 +243,4 @@ The full audit, the decisions it needs, and a release checklist are in [SHIPPING
 - [x] Phase 6: error message audit, and `ERROR-MESSAGES.md`
 - [x] Phase 7: duplicate awareness, built from [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md)
 - [x] Phase 8: shipping audit, and `SHIPPING.md`. Seven decisions are waiting on you (D1–D7).
-- [ ] Phase 9: `RELEASE-READINESS.md`
+- [x] Phase 9: [RELEASE-READINESS.md](RELEASE-READINESS.md), the final report and the single list of what remains
