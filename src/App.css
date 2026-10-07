@@ -951,7 +951,8 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   }
 }
 
-.plan-copy-actions .secondary-button {
+.plan-copy-actions .secondary-button,
+.duplicate-check .secondary-button {
   height: 32px;
   padding: 0 13px;
   border: 1px solid var(--border-control);
@@ -963,11 +964,13 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   cursor: pointer;
 }
 
-.plan-copy-actions .secondary-button:hover:not(:disabled) {
+.plan-copy-actions .secondary-button:hover:not(:disabled),
+.duplicate-check .secondary-button:hover:not(:disabled) {
   background: var(--hover);
 }
 
-.plan-copy-actions .secondary-button:disabled {
+.plan-copy-actions .secondary-button:disabled,
+.duplicate-check .secondary-button:disabled {
   opacity: 0.5;
   cursor: default;
 }
@@ -1332,12 +1335,12 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--text);
   font: inherit;
   font-size: 14px;
-  outline: none;
 }
 
+/* The shared focus ring marks the field. The faint halo it replaces was
+   too low in contrast to show where focus was. */
 .browse-global-search:focus {
   border-color: var(--border-strong);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 14%, transparent);
 }
 
 .browse-search-block .hidden-items-toggle {
@@ -1426,6 +1429,28 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
 
 .browse-result-meta > span:first-child {
   min-width: 0;
+}
+
+/* A file result's location opens its folder. It reads as the plain path. */
+.browse-result-meta > .browse-result-location {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.browse-result-location:hover {
+  color: var(--text-body);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .browse-result-name .browse-drive-state {
@@ -2139,8 +2164,9 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--text-muted);
 }
 
+/* "From" and "To". --text-disabled was below 4.5:1 for this live text. */
 .transfer-path > span {
-  color: var(--text-disabled);
+  color: var(--text-muted);
 }
 
 .plan-remove-button,
@@ -2496,3 +2522,279 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   }
 }
 
+
+/* Read by VoiceOver, not shown. !important beats rules such as
+   `.transfer-path > span` that style every span in a container. */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* Sections and headings that receive focus from code, so VoiceOver reads
+   them, get no ring: they aren't controls. */
+[tabindex="-1"]:focus-visible {
+  outline: none;
+}
+
+/* Duplicates: one quiet row on the Browse landing, and its own view. */
+.browse-duplicates-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 16px;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.browse-duplicates-row:hover {
+  background: var(--hover);
+  border-color: var(--border-control);
+}
+
+.browse-duplicates-row:hover .folder-chevron,
+.browse-duplicates-row:focus-visible .folder-chevron { color: var(--text-body); }
+
+.browse-duplicates-text {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.browse-duplicates-text strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.duplicates-intro {
+  max-width: 620px;
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.duplicate-section {
+  margin-top: 20px;
+}
+
+.duplicate-section-heading {
+  margin: 0 0 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.duplicate-section-note {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.duplicate-list {
+  border-top: 1px solid var(--divider);
+  margin-bottom: 10px;
+}
+
+.duplicate-group {
+  border-bottom: 1px solid var(--divider);
+}
+
+.duplicate-group-row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 12px;
+  gap: 20px;
+  align-items: center;
+  padding: 12px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text-body);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.duplicate-group-row:hover {
+  background: var(--hover);
+}
+
+.duplicate-group-name {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.duplicate-group-name strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.duplicate-group-reason {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.duplicate-disclosure .folder-chevron {
+  transition: transform .15s ease;
+}
+
+.duplicate-disclosure.expanded .folder-chevron {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .duplicate-disclosure .folder-chevron { transition: none; }
+}
+
+.duplicate-copies {
+  margin: 0;
+  padding: 0 0 8px 24px;
+  list-style: none;
+}
+
+.duplicate-copy {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 80px 110px 150px;
+  gap: 16px;
+  align-items: center;
+  padding: 7px 10px;
+  color: var(--text-body);
+  font-size: 12px;
+}
+
+.duplicate-copy-location {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.duplicate-copy-state,
+.duplicate-copy-date {
+  color: var(--text-muted);
+}
+
+.duplicate-copy-actions {
+  display: flex;
+  justify-content: flex-start;
+  gap: 4px;
+}
+
+.duplicate-copy-actions button {
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-body);
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.duplicate-copy-actions button:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+@media (max-width: 760px) {
+  .duplicate-group-reason { display: none; }
+  .duplicate-group-row { grid-template-columns: minmax(0, 1fr) 12px; }
+  .duplicate-copy { grid-template-columns: minmax(0, 1fr) auto; }
+  .duplicate-copy-state,
+  .duplicate-copy-date { display: none; }
+}
+
+.duplicate-group-row:focus-visible { outline-offset: -2px; }
+
+/* Checking contents: the identical total, its action and its progress. */
+.duplicate-check {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.duplicate-check-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.duplicate-check-title {
+  margin: 0 0 3px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.duplicate-check-row p,
+.duplicate-check-note,
+.duplicate-check-confirm p,
+.duplicate-check-result {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.duplicate-check-status {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.duplicate-check-note,
+.duplicate-check-confirm,
+.duplicate-check-progress,
+.duplicate-check-result {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--divider);
+}
+
+.duplicate-check-confirm p {
+  color: var(--text-body);
+  max-width: 620px;
+}
+
+.duplicate-check-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.duplicate-check-actions .section-action {
+  margin-left: 0;
+}
+
+.duplicate-check-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--text-body);
+  font-size: 12px;
+}

@@ -50,9 +50,8 @@ type ScanResult = ScanProgress & {
 };
 
 function unreadableSummary(result: ScanResult) {
-  const count = result.unreadableFolderCount;
   const example = result.unreadableExamples[0];
-  const folders = count === 1 ? "1 folder" : `${count.toLocaleString()} folders`;
+  const folders = count(result.unreadableFolderCount, "folder");
   const including = example === undefined
     ? ""
     : `, including ${example === "" ? "the top folder of the drive" : example}`;
@@ -92,13 +91,50 @@ type DuplicateFile = {
   modifiedAt: number | null;
 };
 
+// Identical: same size and same contents, from a content check.
+// Probable: same name and size, contents not compared.
 type DuplicateGroup = {
+  kind: "identical" | "probable";
   name: string;
   sizeBytes: number;
   copies: number;
-  potentialWastedBytes: number;
+  checkedAt: number | null;
   files: DuplicateFile[];
 };
+
+type DuplicateOverview = {
+  groups: DuplicateGroup[];
+  identicalGroupCount: number;
+  identicalExtraBytes: number;
+  probableGroupCount: number;
+};
+
+// What a content check would read on one connected drive, at most.
+type ContentCheckEstimate = {
+  driveId: string;
+  driveName: string;
+  fileCount: number;
+  maxBytes: number;
+};
+
+type ContentCheckProgress = {
+  stage: "sampling" | "comparing";
+  filesDone: number;
+  filesTotal: number;
+};
+
+type ContentCheckSummary = {
+  filesChecked: number;
+  filesChanged: number;
+  filesUnreadable: number;
+  cancelled: boolean;
+};
+
+type ContentCheckState =
+  | { phase: "idle" }
+  | { phase: "estimating" }
+  | { phase: "confirm"; estimate: ContentCheckEstimate[] }
+  | { phase: "running"; runId: number; cancelling: boolean };
 
 
 type Location = {
@@ -204,6 +240,16 @@ type TransferRecord = {
   completedAt: number | null;
 };
 
+// "1 file", "2 files": a count with its noun, singular for one.
+function count(value: number, noun: string) {
+  return `${value.toLocaleString()} ${value === 1 ? noun : `${noun}s`}`;
+}
+
+// Search shows at most 200 results; "200+" means there may be more.
+function resultCount(shown: number, returned: number) {
+  return returned === 200 ? `${shown.toLocaleString()}+ results` : count(shown, "result");
+}
+
 function formatBytes(bytes: number | null) {
   if (bytes === null) return "—";
   if (bytes === 0) return "0 B";
@@ -216,6 +262,46 @@ function formatDate(timestamp: number | null) {
   if (!timestamp) return "Never";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
     .format(new Date(timestamp * 1000));
+}
+
+// A date without its time, such as "1 Aug 2019".
+function formatDay(timestamp: number | null) {
+  if (!timestamp) return "—";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(timestamp * 1000));
+}
+
+// The one-line summary on the Browse landing, such as
+// "12 identical groups · 48.2 GB in extra copies · 30 probable".
+function duplicatesSummary(overview: DuplicateOverview) {
+  const parts: string[] = [];
+  if (overview.identicalGroupCount > 0) {
+    parts.push(count(overview.identicalGroupCount, "identical group"));
+    parts.push(`${formatBytes(overview.identicalExtraBytes)} in extra copies`);
+  }
+  if (overview.probableGroupCount > 0) {
+    parts.push(`${overview.probableGroupCount.toLocaleString()} probable`);
+  }
+  return parts.join(" · ");
+}
+
+// "Source", "Source and Mars", "Source, Mars and Archive".
+function joinNames(names: string[]) {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+// What a finished content check found, for the view and VoiceOver.
+function contentCheckResultMessage(summary: ContentCheckSummary) {
+  const parts = [summary.cancelled
+    ? "Check cancelled. Files checked before you cancelled are kept."
+    : "Check complete."];
+  if (summary.filesChanged > 0) {
+    parts.push(`${count(summary.filesChanged, "file")} changed since ${summary.filesChanged === 1 ? "its drive was" : "their drives were"} last scanned, so ${summary.filesChanged === 1 ? "it wasn't" : "they weren't"} checked. Rescan to include ${summary.filesChanged === 1 ? "it" : "them"}.`);
+  }
+  if (summary.filesUnreadable > 0) {
+    parts.push(`${count(summary.filesUnreadable, "file")} couldn't be read.`);
+  }
+  return parts.join(" ");
 }
 
 const relativeTime = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
@@ -340,18 +426,24 @@ function fileName(relativePath: string) {
 }
 
 // The backend's own wording when a destination disappears mid-copy. The
-// window names the destination instead, without showing its path.
+// window names the destination instead, without showing its path. A
+// destination can be a drive or a folder, so it isn't called either.
 const DESTINATION_UNAVAILABLE = "The destination became unavailable during the copy.";
 
 // The backend records a copy the user stopped as failed with exactly this
 // message. The window shows it as cancelled rather than as a failure.
 const TRANSFER_CANCELLED = "Copy cancelled.";
 
+// The backend's error when a copy was verified and put in place but its
+// completion could not be saved. The file was copied, so the window must not
+// say that nothing was.
+const COPIED_NOT_RECORDED = "The file was copied and verified, but Media Mapper couldn't save that it finished.";
+
 function transferErrorMessage(message: string, destinationName: string | undefined) {
   if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
   return destinationName
-    ? `The destination folder “${destinationName}” is no longer available.`
-    : "The destination folder is no longer available.";
+    ? `“${destinationName}” became unavailable during the copy. Reconnect it, then copy again.`
+    : "The destination became unavailable during the copy. Reconnect it, then copy again.";
 }
 
 function isCancelledTransfer(transfer: TransferRecord) {
@@ -407,10 +499,16 @@ function App() {
   const [largestFiles, setLargestFiles] = useState<LargestFile[]>([]);
   const [largestFilesLoading, setLargestFilesLoading] = useState(false);
   const [showLargestFiles, setShowLargestFiles] = useState(false);
-  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
+  const [duplicateOverview, setDuplicateOverview] = useState<DuplicateOverview | null>(null);
   const [duplicatesLoading, setDuplicatesLoading] = useState(false);
-  const [showDuplicates, setShowDuplicates] = useState(false);
+  const [duplicatesError, setDuplicatesError] = useState<string | null>(null);
+  // Browse shows the Duplicates view in place of the drive list.
+  const [showDuplicatesView, setShowDuplicatesView] = useState(false);
   const [expandedDuplicate, setExpandedDuplicate] = useState<string | null>(null);
+  const [contentCheck, setContentCheck] = useState<ContentCheckState>({ phase: "idle" });
+  const [contentCheckProgress, setContentCheckProgress] = useState<ContentCheckProgress | null>(null);
+  const [contentCheckResult, setContentCheckResult] = useState<string | null>(null);
+  const lastContentCheckRunId = useRef(0);
   const [plannedMoves, setPlannedMoves] = useState<PlannedMove[]>([]);
   const [planPreflight, setPlanPreflight] = useState<PlanPreflight | null>(null);
   const [planValidation, setPlanValidation] = useState<PlanLiveValidation | null>(null);
@@ -426,6 +524,10 @@ function App() {
   const [fileProgress, setFileProgress] = useState<TransferProgress | null>(null);
   // Set by Cancel copy: stops the file in progress and any not yet started.
   const cancelRequested = useRef(false);
+  // The id of the copy run in progress, or 0. Ids come from the clock, so a
+  // reloaded window never reuses the id of a run the backend saw cancelled.
+  const lastTransferRunId = useRef(0);
+  const currentTransferRunId = useRef(0);
   const [cancellingCopy, setCancellingCopy] = useState(false);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [showAllTransfers, setShowAllTransfers] = useState(false);
@@ -457,6 +559,32 @@ function App() {
     itemName: string;
     message: string;
   } | null>(null);
+
+  // Where keyboard focus goes after the next render. Used when a control
+  // replaces itself or closes, which would otherwise drop focus to the
+  // window. With `onlyIfLost`, focus stays wherever the user has moved it.
+  const [pendingFocus, setPendingFocus] = useState<{ selector: string; onlyIfLost?: boolean } | null>(null);
+  useEffect(() => {
+    if (!pendingFocus) return;
+    setPendingFocus(null);
+    const active = document.activeElement as HTMLButtonElement | null;
+    const lost = !active || active === document.body || active.disabled || !active.isConnected;
+    if (pendingFocus.onlyIfLost && !lost) return;
+    document.querySelector<HTMLElement>(pendingFocus.selector)?.focus();
+  }, [pendingFocus]);
+
+  // Read out by VoiceOver: each copy stage, copy outcomes and scan results.
+  // Figures that change many times a second stay out of it.
+  const [announcement, setAnnouncement] = useState("");
+  // Cleared once read, so reading through the page later doesn't meet it.
+  useEffect(() => {
+    if (!announcement) return;
+    const timeout = window.setTimeout(() => setAnnouncement(""), 8000);
+    return () => window.clearTimeout(timeout);
+  }, [announcement]);
+  const liveRegion = (
+    <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
+  );
 
   const loadLocations = useCallback(async () => {
     try {
@@ -522,11 +650,17 @@ function App() {
 
     executionRunning.current = true;
     cancelRequested.current = false;
+    // Names this run, so a cancel stops every remaining file of it and never
+    // affects a later run.
+    const runId = Math.max(Date.now(), lastTransferRunId.current + 1);
+    lastTransferRunId.current = runId;
+    currentTransferRunId.current = runId;
     setCancellingCopy(false);
     setExecutingPlan(true);
     setExecutionResult(null);
     setShowCopyConfirmation(false);
     setExecutionProgress({ moves: readyMoves, completed: 0 });
+    setPendingFocus({ selector: '[data-focus="transfer-progress"]' });
 
     let completed = 0;
     let currentMove: PlannedMove | undefined;
@@ -543,6 +677,7 @@ function App() {
         setFileProgress(null);
         await invoke<TransferRecord>("execute_planned_move", {
           plannedMoveId: move.id,
+          runId,
         });
 
         completed += 1;
@@ -563,12 +698,16 @@ function App() {
       await Promise.all([loadPlannedMoves(), loadTransfers()]);
     } catch (cause) {
       const cancelled = String(cause).includes(TRANSFER_CANCELLED);
+      const notRecorded = String(cause).includes(COPIED_NOT_RECORDED);
       const reason = transferErrorMessage(String(cause), currentMove?.destinationLocationName);
+      const copied = completed + 1;
       setExecutionResult({
         stopped: true,
         cancelled,
         message: cancelled
           ? `${cancelledMessage()}${skippedNote}`
+          : notRecorded
+            ? `${copied.toLocaleString()} ${copied === 1 ? "file was" : "files were"} copied and verified, but Media Mapper couldn't save that the last one finished. It will check that copy again the next time it opens. The remaining files stay planned.${skippedNote}`
           : completed > 0
             ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${reason}${skippedNote}`
             : `Nothing was copied. ${reason}${skippedNote}`,
@@ -577,10 +716,12 @@ function App() {
     } finally {
       executionRunning.current = false;
       cancelRequested.current = false;
+      currentTransferRunId.current = 0;
       setCancellingCopy(false);
       setFileProgress(null);
       setExecutingPlan(false);
       setExecutionProgress(null);
+      setPendingFocus({ selector: '[data-focus="transfer-result"]', onlyIfLost: true });
     }
   }, [
     loadPlannedMoves,
@@ -590,11 +731,29 @@ function App() {
     plannedMoves,
   ]);
 
+  const copyStage = (() => {
+    if (!executionProgress) return "";
+    const { moves, completed } = executionProgress;
+    const current = moves[Math.min(completed, moves.length - 1)];
+    const stage = fileProgress?.plannedMoveId === current.id && fileProgress.stage === "verifying"
+      ? "Verifying"
+      : "Copying";
+    return `${stage} ${current.sourceName}, file ${Math.min(completed + 1, moves.length)} of ${moves.length}.`;
+  })();
+  useEffect(() => {
+    if (copyStage) setAnnouncement(copyStage);
+  }, [copyStage]);
+  useEffect(() => {
+    if (!executionResult) return;
+    const heading = executionResult.cancelled ? "Copy cancelled." : executionResult.stopped ? "Copy stopped." : "Copy finished.";
+    setAnnouncement(`${heading} ${executionResult.message}`);
+  }, [executionResult]);
+
   const cancelCopy = async () => {
     cancelRequested.current = true;
     setCancellingCopy(true);
     try {
-      await invoke("cancel_transfer");
+      await invoke("cancel_transfer", { runId: currentTransferRunId.current });
     } catch (cause) {
       setError(String(cause));
     }
@@ -678,6 +837,20 @@ function App() {
     planPanel.current?.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
     planLocationSelect.current?.focus({ preventScroll: true });
   }, [selectedPlanEntry]);
+
+  // Opening the folder picker, or moving to another folder in it, puts focus
+  // on its first folder, or on Choose this folder when there are none.
+  useEffect(() => {
+    if (!folderPickerOpen || folderPickerLoading) return;
+    document.querySelector<HTMLElement>(
+      ".folder-picker-list button, .folder-picker-footer button",
+    )?.focus();
+  }, [folderPickerOpen, folderPickerLoading, folderPickerPath]);
+
+  const closeFolderPicker = () => {
+    setFolderPickerOpen(false);
+    setPendingFocus({ selector: '[data-focus="folder-picker-trigger"]' });
+  };
 
   // A refusal describes the destination it was given; once the user picks
   // another item, location or folder it no longer applies.
@@ -845,6 +1018,11 @@ function App() {
     setDriveLabelDraft(currentLabel ?? "");
   };
 
+  const closeDriveLabelEditor = (persistentIdentifier: string) => {
+    setEditingDriveLabelId(null);
+    setPendingFocus({ selector: `[data-focus="label-${CSS.escape(persistentIdentifier)}"]` });
+  };
+
   const saveDriveLabel = async (persistentIdentifier: string) => {
     setSavingDriveLabel(true);
     setError(null);
@@ -857,6 +1035,7 @@ function App() {
       await loadLocations();
       setEditingDriveLabelId(null);
       setDriveLabelDraft("");
+      setPendingFocus({ selector: `[data-focus="label-${CSS.escape(persistentIdentifier)}"]` });
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -941,27 +1120,82 @@ function App() {
     }
   }, []);
 
+  // Reads the catalogue only. Nothing on any drive is read.
   const loadDuplicates = useCallback(async () => {
-    if (showDuplicates) {
-      setShowDuplicates(false);
-      setExpandedDuplicate(null);
-      return;
-    }
-
     setDuplicatesLoading(true);
-    setError(null);
-
     try {
-      const results = await invoke<DuplicateGroup[]>("probable_duplicates");
-      setDuplicateGroups(results);
-      setShowDuplicates(true);
+      setDuplicateOverview(await invoke<DuplicateOverview>("list_duplicates"));
+      setDuplicatesError(null);
     } catch (cause) {
-      setError(String(cause));
-      setDuplicateGroups([]);
+      setDuplicateOverview(null);
+      setDuplicatesError(String(cause));
     } finally {
       setDuplicatesLoading(false);
     }
-  }, [showDuplicates]);
+  }, []);
+
+  // Browse lists duplicates under the drives, so refresh them whenever Browse
+  // shows its landing or the catalogue changes, such as after a scan.
+  useEffect(() => {
+    if (activeView === "browse" && !browserDrive) {
+      void loadDuplicates();
+    }
+  }, [activeView, browserDrive, catalogued, loadDuplicates]);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    void listen<ContentCheckProgress>("duplicate-check-progress", (event) => setContentCheckProgress(event.payload))
+      .then((unlisten) => { dispose = unlisten; });
+    return () => { dispose?.(); };
+  }, []);
+
+  // Says how much a check would read before anything is read.
+  const prepareContentCheck = async () => {
+    setContentCheckResult(null);
+    setContentCheck({ phase: "estimating" });
+    try {
+      const estimate = await invoke<ContentCheckEstimate[]>("estimate_content_check");
+      setContentCheck({ phase: "confirm", estimate });
+      setPendingFocus({ selector: '[data-focus="content-check-confirm"]', onlyIfLost: false });
+    } catch (cause) {
+      setContentCheck({ phase: "idle" });
+      setDuplicatesError(String(cause));
+    }
+  };
+
+  const startContentCheck = async () => {
+    // Ids come from the clock, as copy runs' do.
+    const runId = Math.max(Date.now(), lastContentCheckRunId.current + 1);
+    lastContentCheckRunId.current = runId;
+    setDuplicatesError(null);
+    setContentCheckProgress(null);
+    setContentCheck({ phase: "running", runId, cancelling: false });
+    setAnnouncement("Checking contents.");
+    setPendingFocus({ selector: '[data-focus="content-check-cancel"]', onlyIfLost: false });
+    try {
+      const summary = await invoke<ContentCheckSummary>("check_duplicate_contents", { runId });
+      const message = contentCheckResultMessage(summary);
+      setContentCheckResult(message);
+      setAnnouncement(message);
+    } catch (cause) {
+      setDuplicatesError(String(cause));
+    } finally {
+      setContentCheck({ phase: "idle" });
+      setContentCheckProgress(null);
+      setPendingFocus({ selector: '[data-focus="content-check-start"]', onlyIfLost: true });
+      await loadDuplicates();
+    }
+  };
+
+  const cancelContentCheck = async () => {
+    if (contentCheck.phase !== "running") return;
+    setContentCheck({ ...contentCheck, cancelling: true });
+    try {
+      await invoke("cancel_duplicate_check", { runId: contentCheck.runId });
+    } catch (cause) {
+      setDuplicatesError(String(cause));
+    }
+  };
 
   const loadLargestFiles = useCallback(async () => {
     if (showLargestFiles) {
@@ -998,7 +1232,7 @@ function App() {
   const openLibraryResult = async (result: LibrarySearchResult) => {
     const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
     setLibraryQuery("");
@@ -1008,9 +1242,10 @@ function App() {
 
   const openDuplicateFile = async (file: DuplicateFile) => {
     const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
+    setShowDuplicatesView(false);
 
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
 
@@ -1027,7 +1262,7 @@ function App() {
     const drive = catalogued.find((item) => item.persistentIdentifier === file.driveId);
 
     if (!drive) {
-      setError("That drive catalogue is no longer available.");
+      setError("That drive is no longer in the catalogue.");
       return;
     }
 
@@ -1051,7 +1286,16 @@ function App() {
       .catch((reason) => setError(String(reason)));
   };
 
+  // The row whose Add to plan opened the panel. Focus returns there when the
+  // panel closes, to Add to plan or to the Remove that replaced it.
+  const planReturnRow = useRef("");
+  const closePlanPanel = () => {
+    setSelectedPlanEntry(null);
+    setPendingFocus({ selector: `[data-row-action="${CSS.escape(planReturnRow.current)}"] button` });
+  };
+
   const beginPlanMove = (drive: CataloguedDrive, entry: CatalogueEntry) => {
+    planReturnRow.current = `${drive.persistentIdentifier}:${entry.relativePath}`;
     setSelectedPlanEntry(entry);
     setPlanSourceDrive(drive);
     // Do not preselect the source drive. Planning should begin with an
@@ -1113,7 +1357,7 @@ function App() {
       await loadPlannedMoves();
       if (browserDrive) await openFolder(browserDrive, browserPath);
 
-      setSelectedPlanEntry(null);
+      closePlanPanel();
       setPlanDestinationFolder("");
     } catch (cause) {
       setPlanError(String(cause));
@@ -1197,15 +1441,25 @@ function App() {
       proposedDestinationPath === selectedPlanEntry.relativePath;
 
     return (
-  <section className="plan-move-panel compact-plan-panel" ref={planPanel}>
+  <section
+    className="plan-move-panel compact-plan-panel"
+    ref={planPanel}
+    aria-labelledby="plan-panel-heading"
+    onKeyDown={(event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closePlanPanel();
+      }
+    }}
+  >
             <div className="plan-move-heading">
               <div>
-                <h2>Add to plan</h2>
+                <h2 id="plan-panel-heading">Add to plan</h2>
                 <p className="plan-file-summary" title={selectedPlanEntry.name}>
                   {selectedPlanEntry.name}
                 </p>
               </div>
-              <button className="plan-cancel-button" onClick={() => setSelectedPlanEntry(null)}>Cancel</button>
+              <button className="plan-cancel-button" onClick={closePlanPanel}>Cancel</button>
             </div>
 
             <div className="plan-fields compact-plan-fields">
@@ -1256,7 +1510,7 @@ function App() {
               </label>
 
               <label>
-                <span>Subfolder <span className="field-optional">(optional)</span></span>
+                <span id="plan-subfolder-label">Subfolder <span className="field-optional">(optional)</span></span>
                 {(() => {
                   const destination = locations.find(
                     (location) => location.id === planDestinationLocationId,
@@ -1268,17 +1522,20 @@ function App() {
                     <button
                       type="button"
                       className="folder-picker-button"
+                      data-focus="folder-picker-trigger"
                       aria-expanded={folderPickerOpen}
+                      aria-controls="folder-picker"
+                      aria-labelledby="plan-subfolder-label folder-picker-path folder-picker-choose"
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
                         void openDestinationFolderPicker(planDestinationFolder);
                       }}
                     >
-                      <span className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
+                      <span id="folder-picker-path" className="folder-picker-path" title={planDestinationFolder || "Copy to top level"}>
                         {planDestinationFolder || "Top level"}
                       </span>
-                      <span className="folder-picker-choose">Choose…</span>
+                      <span id="folder-picker-choose" className="folder-picker-choose">Choose…</span>
                     </button>
                   ) : (
                     <div className="folder-picker-readonly">
@@ -1295,21 +1552,42 @@ function App() {
               const parts = folderPickerPath ? folderPickerPath.split("/") : [];
 
               return (
-                <div className="folder-picker" role="dialog" aria-label="Choose destination folder">
+                <div
+                  className="folder-picker"
+                  id="folder-picker"
+                  role="group"
+                  aria-labelledby="folder-picker-heading"
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      // Closes the picker only, not the panel around it.
+                      event.preventDefault();
+                      event.stopPropagation();
+                      closeFolderPicker();
+                    }
+                  }}
+                >
                   <div className="folder-picker-header">
-                    <strong>Choose folder</strong>
-                    <button type="button" onClick={() => setFolderPickerOpen(false)}>Cancel</button>
+                    <strong id="folder-picker-heading">Choose folder</strong>
+                    <button type="button" onClick={closeFolderPicker}>Cancel</button>
                   </div>
                   <nav className="folder-picker-breadcrumbs" aria-label="Destination folder path">
-                    <button type="button" onClick={() => void openDestinationFolderPicker("")}>
+                    <button
+                      type="button"
+                      aria-current={parts.length === 0 ? "location" : undefined}
+                      onClick={() => void openDestinationFolderPicker("")}
+                    >
                       Top level
                     </button>
                     {parts.map((part, index) => {
                       const path = parts.slice(0, index + 1).join("/");
                       return (
                         <span key={path}>
-                          <span>/</span>
-                          <button type="button" onClick={() => void openDestinationFolderPicker(path)}>
+                          <span aria-hidden="true">/</span>
+                          <button
+                            type="button"
+                            aria-current={index === parts.length - 1 ? "location" : undefined}
+                            onClick={() => void openDestinationFolderPicker(path)}
+                          >
                             {part}
                           </button>
                         </span>
@@ -1327,7 +1605,7 @@ function App() {
                         key={entry.relativePath}
                         onClick={() => void openDestinationFolderPicker(entry.relativePath)}
                       >
-                        <span>{entry.name}</span><span>›</span>
+                        <span>{entry.name}</span><span aria-hidden="true">›</span>
                       </button>
                     ))}
                   </div>
@@ -1337,7 +1615,7 @@ function App() {
                       className="browse-button"
                       onClick={() => {
                         setPlanDestinationFolder(folderPickerPath);
-                        setFolderPickerOpen(false);
+                        closeFolderPicker();
                       }}
                     >
                       Choose this folder
@@ -1402,7 +1680,7 @@ function App() {
 
   const scan = async (drive: DriveInfo) => {
     if (!drive.persistentIdentifier) {
-      setError("This drive does not provide a stable volume identifier, so it cannot be catalogued safely.");
+      setError("This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.");
       return;
     }
     setScanningId(drive.persistentIdentifier);
@@ -1411,9 +1689,13 @@ function App() {
     setScanComplete(null);
     setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
     setError(null);
+    const name = driveDisplayName(drive.persistentIdentifier, drive.name);
+    setAnnouncement(`Scanning ${name}.`);
+    setPendingFocus({ selector: `[data-focus="cancel-scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
     try {
       const result = await invoke<ScanResult>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
+      setAnnouncement(`Scan of ${name} complete. ${count(result.fileCount, "file")}, ${count(result.directoryCount, "folder")}.${result.unreadableFolderCount > 0 ? ` ${unreadableSummary(result)}` : ""}`);
       // A scan can add a drive's location or rename it, and changes the names
       // and sizes planned moves show, so reload those alongside the drives.
       await Promise.all([refresh(), loadLocations(), loadPlannedMoves()]);
@@ -1438,6 +1720,7 @@ function App() {
       const message = String(cause);
       if (message.includes("Scan cancelled.")) {
         setScanCancelledId(drive.persistentIdentifier);
+        setAnnouncement("Scan cancelled.");
         window.setTimeout(() => setScanCancelledId(null), 4000);
       } else {
         setError(message);
@@ -1446,6 +1729,7 @@ function App() {
       setScanningId(null);
       setCancellingId(null);
       setScanProgress(null);
+      setPendingFocus({ selector: `[data-focus="scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
     }
   };
 
@@ -1477,39 +1761,52 @@ function App() {
             <button className="sidebar-item active" type="button" aria-current="page">Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content transfers-home">
           <header className="app-header">
             <div>
-              <h1>Transfers</h1>
+              <h1 tabIndex={-1} data-focus="page-heading">Transfers</h1>
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           {executionProgress && (() => {
             const { moves, completed } = executionProgress;
             const current = moves[Math.min(completed, moves.length - 1)];
             const paths = plannedMovePaths(current);
             return (
-              <section className="transfer-active-card" aria-live="polite">
+              <section className="transfer-active-card">
                 <span className="transfer-active-label">COPYING</span>
                 <h2>{current.sourceName}</h2>
                 <TransferPaths from={paths.from} to={paths.to} />
-                <div className="transfer-file-progress">
+                <div className="transfer-file-progress" aria-hidden="true">
                   <span style={{ width: `${moves.length ? (completed / moves.length) * 100 : 0}%` }} />
                 </div>
-                <p>{Math.min(completed + 1, moves.length)} of {moves.length} files · Each file is verified before the next begins.</p>
+                <p>File {Math.min(completed + 1, moves.length).toLocaleString()} of {moves.length.toLocaleString()} · Each file is verified before the next begins.</p>
               </section>
             );
           })()}
 
           {!executionProgress && executionResult && (
-            <section className={`transfer-result-card ${executionResult.cancelled ? "cancelled" : executionResult.stopped ? "failed" : "completed"}`}>
+            <section
+              className={`transfer-result-card ${executionResult.cancelled ? "cancelled" : executionResult.stopped ? "failed" : "completed"}`}
+              tabIndex={-1}
+              data-focus="transfer-result"
+            >
               <div>
                 <strong>{executionResult.cancelled ? "Copy cancelled" : executionResult.stopped ? "Copy stopped" : "Copy finished"}</strong>
                 <p>{executionResult.message}</p>
               </div>
-              <button className="section-action" onClick={() => setExecutionResult(null)}>Dismiss</button>
+              <button
+                className="section-action"
+                onClick={() => {
+                  setExecutionResult(null);
+                  setPendingFocus({ selector: '[data-focus="page-heading"]' });
+                }}
+              >
+                Dismiss
+              </button>
             </section>
           )}
 
@@ -1542,16 +1839,16 @@ function App() {
               </div>
             ) : (
               <>
-                <div className="transfer-history-new">
+                <div className="transfer-history-new" role="list">
                   {(showAllTransfers ? transfers : transfers.slice(0, RECENT_TRANSFER_COUNT)).map((transfer) => {
                     const outcome = transferOutcome(transfer);
                     const size = transfer.status === "completed" ? transfer.copiedBytes : transfer.totalBytes;
                     const location = locations.find((item) => item.id === transfer.destinationLocationId);
                     return (
-                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id}>
+                      <div className={`transfer-history-new-row ${outcome.tone}`} key={transfer.id} role="listitem">
                         <span className="transfer-history-mark" aria-hidden="true">{outcome.tone === "completed" ? "✓" : outcome.tone === "failed" ? "×" : "–"}</span>
                         <div className="transfer-item">
-                          <strong>{fileName(transfer.sourceRelativePath)}</strong>
+                          <strong id={`transfer-name-${transfer.id}`}>{fileName(transfer.sourceRelativePath)}</strong>
                           <TransferPaths
                             from={formatLocationPath(sourceDriveName(transfer.sourceDriveId), transfer.sourceRelativePath)}
                             to={formatLocationPath(location ? location.userLabel ?? location.displayName : "Unknown location", transfer.destinationRelativePath)}
@@ -1560,6 +1857,7 @@ function App() {
                             <button
                               className="transfer-reveal-button"
                               type="button"
+                              aria-describedby={`transfer-name-${transfer.id}`}
                               onClick={() => {
                                 setError(null);
                                 void invoke("reveal_transferred_file", { transferId: transfer.id })
@@ -1636,15 +1934,16 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content plan-home">
           <header className="app-header">
             <div>
-              <h1>Planned transfers</h1>
+              <h1 tabIndex={-1} data-focus="page-heading">Planned transfers</h1>
               <p className="intro">Organise your files. Decide what goes where. Copy only when you’re ready.</p>
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           {executionProgress && (() => {
             const { moves, completed } = executionProgress;
@@ -1660,7 +1959,12 @@ function App() {
             const fileIndex = Math.min(completed + 1, moves.length);
 
             return (
-              <section className="plan-transfer-progress" aria-live="polite">
+              <section
+                className="plan-transfer-progress"
+                tabIndex={-1}
+                data-focus="transfer-progress"
+                aria-label="Transfer in progress"
+              >
                 <span className="plan-transfer-progress-label">
                   {currentFileProgress
                     ? (currentFileProgress.stage === "copying" ? "COPYING" : "VERIFYING")
@@ -1698,7 +2002,7 @@ function App() {
           })()}
 
           {!executionProgress && executionResult && (
-            <section className="plan-transfer-progress" aria-live="polite">
+            <section className="plan-transfer-progress" tabIndex={-1} data-focus="transfer-result">
               <span className="plan-transfer-progress-label">
                 {executionResult.cancelled ? "TRANSFER CANCELLED" : executionResult.stopped ? "TRANSFER STOPPED" : "TRANSFER COMPLETE"}
               </span>
@@ -1707,7 +2011,14 @@ function App() {
                 <button className="section-action" type="button" onClick={() => setActiveView("transfers")}>
                   View transfers
                 </button>
-                <button className="browse-button" type="button" onClick={() => setExecutionResult(null)}>
+                <button
+                  className="browse-button"
+                  type="button"
+                  onClick={() => {
+                    setExecutionResult(null);
+                    setPendingFocus({ selector: '[data-focus="page-heading"]' });
+                  }}
+                >
                   {executionResult.stopped ? "Dismiss" : "Done"}
                 </button>
               </div>
@@ -1718,7 +2029,7 @@ function App() {
             executionResult && !executionProgress && !executionResult.stopped ? null : (
             <section className="plan-empty">
               <h2>Nothing planned yet</h2>
-              <p>Browse your catalogued files and choose Plan move to add files here.</p>
+              <p>Browse your catalogued files and choose Add to plan to add files here.</p>
               <button className="browse-button" type="button" onClick={() => setActiveView("browse")}>Browse files</button>
             </section>
             )
@@ -1770,6 +2081,9 @@ function App() {
                           {destination.projectedAvailableBytes === null
                             ? "Not available"
                             : formatBytes(destination.projectedAvailableBytes)}
+                          {destination.capacitySufficient === false && (
+                            <span className="visually-hidden"> (not enough space)</span>
+                          )}
                         </strong>
                       </div>
                     </div>
@@ -1796,35 +2110,75 @@ function App() {
                 </section>
               )}
 
-              <section className="plan-file-list">
+              <section className="plan-file-list" role="list" aria-label="Planned files">
                 {plannedMoves.map((move) => {
                   const paths = plannedMovePaths(move);
                   return (
-                    <div className="plan-file-row" key={move.id}>
+                    <div className="plan-file-row" key={move.id} role="listitem">
                       <div className="transfer-item">
-                        <strong>{move.sourceName}</strong>
-                        <span className="transfer-path" title={paths.from}>{paths.from}</span>
-                        <span className="transfer-path" title={paths.to}><span className="plan-destination-arrow">→</span>{paths.to}</span>
+                        <strong id={`plan-move-${move.id}`}>{move.sourceName}</strong>
+                        <span className="transfer-path" title={paths.from}><span className="visually-hidden">From </span>{paths.from}</span>
+                        <span className="transfer-path" title={paths.to}><span className="plan-destination-arrow" aria-hidden="true">→</span><span className="visually-hidden">To </span>{paths.to}</span>
                       </div>
                       <div className="plan-file-side">
                         <span>{formatBytes(move.sourceSizeBytes)}</span>
-                        <button className="plan-remove-button" disabled={executingPlan} onClick={() => void removePlannedMove(move.id)}>Remove</button>
+                        <button
+                          className="plan-remove-button"
+                          disabled={executingPlan}
+                          aria-describedby={`plan-move-${move.id}`}
+                          onClick={() => void removePlannedMove(move.id)}
+                        >
+                          Remove
+                        </button>
                       </div>
                     </div>
                   );
                 })}
               </section>
 
-              <section className="plan-review">
+              <section
+                className="plan-review"
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && showCopyConfirmation && !executingPlan) {
+                    event.preventDefault();
+                    setShowCopyConfirmation(false);
+                    setPendingFocus({ selector: '[data-focus="plan-continue"]' });
+                  }
+                }}
+              >
                 <div>
-                  <span>{showCopyConfirmation ? "Each file is copied and verified. Originals remain untouched." : "Originals remain untouched."}</span>
+                  <span tabIndex={showCopyConfirmation ? -1 : undefined} data-focus="copy-confirmation">
+                    {showCopyConfirmation ? "Each file is copied and verified. Originals remain untouched." : "Originals remain untouched."}
+                  </span>
                   {folderMoveCount > 0 && <span>{folderMoveCount} planned {folderMoveCount === 1 ? "folder is" : "folders are"} not executable yet.</span>}
                 </div>
                 {!showCopyConfirmation ? (
-                  <button className="section-action" disabled={!canCopy} onClick={() => { setExecutionResult(null); setShowCopyConfirmation(true); }}>Continue</button>
+                  <button
+                    className="section-action"
+                    data-focus="plan-continue"
+                    disabled={!canCopy}
+                    onClick={() => {
+                      setExecutionResult(null);
+                      setShowCopyConfirmation(true);
+                      // The confirmation text, not Copy and verify, so pressing
+                      // Return twice can't start a copy.
+                      setPendingFocus({ selector: '[data-focus="copy-confirmation"]' });
+                    }}
+                  >
+                    Continue
+                  </button>
                 ) : (
                   <div className="plan-copy-actions">
-                    <button className="secondary-button" disabled={executingPlan} onClick={() => setShowCopyConfirmation(false)}>Cancel</button>
+                    <button
+                      className="secondary-button"
+                      disabled={executingPlan}
+                      onClick={() => {
+                        setShowCopyConfirmation(false);
+                        setPendingFocus({ selector: '[data-focus="plan-continue"]' });
+                      }}
+                    >
+                      Cancel
+                    </button>
                     <button className="section-action" disabled={!canCopy} onClick={() => void copyPlannedFiles()}>
                       {executingPlan ? "Copying…" : "Copy and verify"}
                     </button>
@@ -1835,6 +2189,235 @@ function App() {
 
             </>
           )}
+        </div>
+      </main>
+    );
+  }
+
+    if (activeView === "browse" && !browserDrive && showDuplicatesView) {
+    const groups = duplicateOverview?.groups ?? [];
+    const identicalGroups = groups.filter((group) => group.kind === "identical");
+    const probableGroups = groups.filter((group) => group.kind === "probable");
+    const copyOrScanRunning = executingPlan || scanningId !== null;
+    const leave = (view: "drives" | "browse" | "plan" | "transfers") => {
+      setShowDuplicatesView(false);
+      setActiveView(view);
+    };
+
+    const renderGroup = (group: DuplicateGroup, index: number) => {
+      const key = `${group.kind}:${group.sizeBytes}:${group.name}`;
+      const expanded = expandedDuplicate === key;
+      const copiesId = `duplicate-copies-${group.kind}-${index}`;
+      return (
+        <div className="duplicate-group" key={key}>
+          <button
+            className="duplicate-group-row"
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={copiesId}
+            onClick={() => setExpandedDuplicate(expanded ? null : key)}
+          >
+            <span className="duplicate-group-name">
+              <strong>{group.name}</strong>
+              <span>{group.copies.toLocaleString()} copies · {formatBytes(group.sizeBytes)} each</span>
+            </span>
+            <span className="duplicate-group-reason">
+              {group.kind === "identical"
+                ? `Same contents, checked ${formatDay(group.checkedAt)}`
+                : "Same name and size, not checked"}
+            </span>
+            <span className={`duplicate-disclosure${expanded ? " expanded" : ""}`} aria-hidden="true"><FolderChevron /></span>
+          </button>
+          {expanded && (
+            <ul className="duplicate-copies" id={copiesId} aria-label={`Copies of ${group.name}`}>
+              {group.files.map((file, fileIndex) => {
+                const driveName = driveDisplayName(file.driveId, file.driveName);
+                const connected = connectedIds.has(file.driveId);
+                const locationId = `${copiesId}-location-${fileIndex}`;
+                return (
+                  <li className="duplicate-copy" key={`${file.driveId}:${file.relativePath}`}>
+                    <span className="duplicate-copy-location" id={locationId}>
+                      {/* Identical copies can have other names; show the name when it differs. */}
+                      {formatLocationPath(driveName, file.name === group.name ? parentFolder(file.relativePath) : file.relativePath)}
+                    </span>
+                    <span className="duplicate-copy-state">{connected ? "Connected" : "Offline"}</span>
+                    <span className="duplicate-copy-date">{formatDay(file.modifiedAt)}</span>
+                    <span className="duplicate-copy-actions">
+                      <button type="button" aria-describedby={locationId} onClick={() => void openDuplicateFile(file)}>
+                        Show in folder
+                      </button>
+                      {connected && (
+                        <button
+                          type="button"
+                          aria-describedby={locationId}
+                          onClick={() => openCataloguedFile(file.driveId, driveName, file.relativePath)}
+                        >
+                          Open
+                        </button>
+                      )}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      );
+    };
+
+    return (
+      <main className="app-shell app-navigation-shell">
+        <aside className="app-sidebar" aria-label="Media Mapper">
+          <div className="sidebar-brand">MediaMapper</div>
+          <nav className="sidebar-navigation" aria-label="Main navigation">
+            <button className="sidebar-item" type="button" onClick={() => leave("drives")}>Drives</button>
+            <button className="sidebar-item active" type="button" aria-current="page" onClick={() => leave("browse")}>Browse</button>
+            <button className="sidebar-item" type="button" onClick={() => leave("plan")}>Plan</button>
+            <button className="sidebar-item" type="button" onClick={() => leave("transfers")}>Transfers</button>
+          </nav>
+        </aside>
+        {liveRegion}
+        <div className="app-content browse-detail duplicates-view">
+          <header className="app-header browse-detail-header">
+            <div>
+              <nav className="browse-detail-breadcrumb" aria-label="Browse path">
+                <button type="button" onClick={() => setShowDuplicatesView(false)}>All files</button>
+                <span aria-hidden="true">/</span>
+                <span className="current" aria-current="location">Duplicates</span>
+              </nav>
+              <h1>Duplicates</h1>
+              <p className="duplicates-intro">
+                Files that appear more than once across your drives. Copies are often intentional, such as backups. Media Mapper never removes files.
+              </p>
+            </div>
+          </header>
+
+          {error && <div className="notice error" role="alert">{error}</div>}
+          {duplicatesError && <div className="notice error" role="alert">{duplicatesError}</div>}
+
+          {(() => {
+            const estimateTotal = contentCheck.phase === "confirm"
+              ? contentCheck.estimate.reduce((sum, drive) => sum + drive.maxBytes, 0)
+              : 0;
+            return (
+              <section className="duplicate-check" aria-labelledby="duplicate-check-heading">
+                <div className="duplicate-check-row">
+                  <div>
+                    <h2 className="duplicate-check-title" id="duplicate-check-heading">
+                      {duplicateOverview && duplicateOverview.identicalGroupCount > 0
+                        ? `Identical: ${count(duplicateOverview.identicalGroupCount, "group")} · ${formatBytes(duplicateOverview.identicalExtraBytes)} in extra copies`
+                        : "Identical: none found yet"}
+                    </h2>
+                    <p>Checks files that share a size on connected drives. Reads files only.</p>
+                  </div>
+                  {contentCheck.phase === "idle" && (
+                    <button
+                      className="section-action"
+                      type="button"
+                      data-focus="content-check-start"
+                      disabled={copyOrScanRunning}
+                      onClick={() => void prepareContentCheck()}
+                    >
+                      Check contents
+                    </button>
+                  )}
+                  {contentCheck.phase === "estimating" && <span className="duplicate-check-status">Working out what to read…</span>}
+                </div>
+                {contentCheck.phase === "idle" && copyOrScanRunning && (
+                  <p className="duplicate-check-note">Contents can be checked once the copy or scan has finished.</p>
+                )}
+                {contentCheck.phase === "confirm" && (
+                  <div className="duplicate-check-confirm">
+                    {contentCheck.estimate.length === 0 ? (
+                      <p>Nothing to check on the connected drives. Connect the drives that hold the copies, then check again.</p>
+                    ) : (
+                      <p>
+                        This reads up to {formatBytes(estimateTotal)} on {joinNames(contentCheck.estimate.map((drive) => driveDisplayName(drive.driveId, drive.driveName)))}, usually much less. Files are only read, never changed. Copies on drives that aren't connected are skipped.
+                      </p>
+                    )}
+                    <div className="duplicate-check-actions">
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        data-focus={contentCheck.estimate.length === 0 ? "content-check-confirm" : undefined}
+                        onClick={() => {
+                          setContentCheck({ phase: "idle" });
+                          setPendingFocus({ selector: '[data-focus="content-check-start"]', onlyIfLost: false });
+                        }}
+                      >
+                        {contentCheck.estimate.length === 0 ? "OK" : "Cancel"}
+                      </button>
+                      {contentCheck.estimate.length > 0 && (
+                        <button className="section-action" type="button" data-focus="content-check-confirm" onClick={() => void startContentCheck()}>
+                          Check contents
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {contentCheck.phase === "running" && (
+                  <div className="duplicate-check-progress">
+                    <span>
+                      {!contentCheckProgress
+                        ? "Starting…"
+                        : contentCheckProgress.stage === "sampling"
+                          ? `Comparing the start and end of files: ${contentCheckProgress.filesDone.toLocaleString()} of ${contentCheckProgress.filesTotal.toLocaleString()}`
+                          : `Reading matching files in full: ${contentCheckProgress.filesDone.toLocaleString()} of ${contentCheckProgress.filesTotal.toLocaleString()}`}
+                    </span>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      data-focus="content-check-cancel"
+                      disabled={contentCheck.cancelling}
+                      onClick={() => void cancelContentCheck()}
+                    >
+                      {contentCheck.cancelling ? "Cancelling…" : "Cancel"}
+                    </button>
+                  </div>
+                )}
+                {contentCheck.phase === "idle" && contentCheckResult && (
+                  <p className="duplicate-check-result">{contentCheckResult}</p>
+                )}
+              </section>
+            );
+          })()}
+
+          {!duplicateOverview ? (
+            duplicatesLoading && <div className="browser-message">Finding duplicates…</div>
+          ) : groups.length === 0 ? (
+            <div className="empty-state compact">
+              <h3>No duplicates found</h3>
+              <p>No two catalogued files share a name and size.</p>
+            </div>
+          ) : (
+            <>
+              {identicalGroups.length > 0 && (
+                <section className="duplicate-section" aria-labelledby="duplicates-identical-heading">
+                  <h2 className="duplicate-section-heading" id="duplicates-identical-heading">Identical</h2>
+                  <p className="duplicate-section-note">Same size and the same contents, byte for byte, when they were checked.</p>
+                  <div className="duplicate-list">{identicalGroups.map(renderGroup)}</div>
+                  {duplicateOverview.identicalGroupCount > identicalGroups.length && (
+                    <p className="duplicate-section-note">
+                      Showing the {identicalGroups.length.toLocaleString()} groups with the most space in extra copies, of {duplicateOverview.identicalGroupCount.toLocaleString()}.
+                    </p>
+                  )}
+                </section>
+              )}
+              {probableGroups.length > 0 && (
+                <section className="duplicate-section" aria-labelledby="duplicates-probable-heading">
+                  <h2 className="duplicate-section-heading" id="duplicates-probable-heading">Probable</h2>
+                  <p className="duplicate-section-note">Same name and size. Their contents haven't all been compared.</p>
+                  <div className="duplicate-list">{probableGroups.map(renderGroup)}</div>
+                  {duplicateOverview.probableGroupCount > probableGroups.length && (
+                    <p className="duplicate-section-note">
+                      Showing the {probableGroups.length.toLocaleString()} groups with the most space in extra copies, of {duplicateOverview.probableGroupCount.toLocaleString()}.
+                    </p>
+                  )}
+                </section>
+              )}
+            </>
+          )}
+
         </div>
       </main>
     );
@@ -1856,6 +2439,7 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content browse-home">
           <header className="app-header">
             <div>
@@ -1863,7 +2447,7 @@ function App() {
             </div>
           </header>
 
-          {error && <div className="notice error">{error}</div>}
+          {error && <div className="notice error" role="alert">{error}</div>}
 
           <section className="browse-search-block">
             <input
@@ -1882,37 +2466,43 @@ function App() {
           </section>
 
           {libraryQuery.trim() ? (
-            <section className="browse-results" aria-live="polite">
-              <div className="browse-results-heading">
-                <span>{librarySearching ? "Searching…" : `${visibleLibraryResults.length}${libraryResults.length === 200 ? "+" : ""} results`}</span>
+            <section className="browse-results">
+              <div className="browse-results-heading" role="status">
+                <span>{librarySearching ? "Searching…" : resultCount(visibleLibraryResults.length, libraryResults.length)}</span>
               </div>
               {librarySearching ? <div className="browser-message">Searching catalogues…</div>
               : visibleLibraryResults.length === 0 ? <div className="browser-message">No matching files or folders.</div>
-              : visibleLibraryResults.map((result) => {
+              : <div role="list" aria-label="Search results">{visibleLibraryResults.map((result, index) => {
                 const driveName = driveDisplayName(result.driveId, result.driveName);
                 const location = formatLocationPath(driveName, parentFolder(result.relativePath));
                 const plannedMove = plannedMoveBySource.get(`${result.driveId}\u0000${result.relativePath}`);
                 return (
+                  // A click anywhere on the row opens its folder. Keyboard and
+                  // VoiceOver use the buttons inside it: the name, the
+                  // location, and Add to plan or Remove.
                   <div
                     className="browse-result-row"
                     key={`${result.driveId}:${result.relativePath}`}
-                    role="button"
-                    tabIndex={0}
+                    role="listitem"
                     onClick={() => void openLibraryResult(result)}
-                    onKeyDown={(event) => {
-                      // Enter on the name or action buttons belongs to them.
-                      if (event.key === "Enter" && event.target === event.currentTarget) {
-                        event.preventDefault();
-                        void openLibraryResult(result);
-                      }
-                    }}
                   >
                     <span className="browse-result-name">
                       {result.isDirectory ? (
-                        <strong>{result.name}</strong>
+                        <button
+                          className="file-open-button browse-result-open"
+                          id={`result-name-${index}`}
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void openLibraryResult(result);
+                          }}
+                        >
+                          {result.name}
+                        </button>
                       ) : (
                         <button
                           className="file-open-button browse-result-open"
+                          id={`result-name-${index}`}
                           type="button"
                           title={`Open ${result.name}`}
                           onClick={(event) => {
@@ -1927,18 +2517,33 @@ function App() {
                         </button>
                       )}
                       <span className="browse-result-meta">
-                        <span title={location}>{location}</span>
+                        {result.isDirectory ? (
+                          <span title={location}>{location}</span>
+                        ) : (
+                          <button
+                            className="browse-result-location"
+                            type="button"
+                            title={`Show in ${location}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void openLibraryResult(result);
+                            }}
+                          >
+                            {location}
+                          </button>
+                        )}
                         {!connectedIds.has(result.driveId) && <span className="browse-drive-state">Drive offline</span>}
                       </span>
                     </span>
                     <span className="browse-result-size">{result.isDirectory ? "Folder" : formatBytes(result.sizeBytes)}</span>
-                    <span className="row-action">
+                    <span className="row-action" data-row-action={`${result.driveId}:${result.relativePath}`}>
                       {result.isDirectory ? (
                         <FolderChevron />
                       ) : plannedMove ? (
                         <button
                           className="plan-remove-button"
                           type="button"
+                          aria-describedby={`result-name-${index}`}
                           disabled={executingPlan}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -1950,11 +2555,12 @@ function App() {
                       ) : (
                         <button
                           type="button"
+                          aria-describedby={`result-name-${index}`}
                           onClick={(event) => {
                             event.stopPropagation();
                             const drive = catalogued.find((item) => item.persistentIdentifier === result.driveId);
                             if (!drive) {
-                              setError("That drive catalogue is no longer available.");
+                              setError("That drive is no longer in the catalogue.");
                               return;
                             }
                             beginPlanMove(drive, result);
@@ -1966,7 +2572,7 @@ function App() {
                     </span>
                   </div>
                 );
-              })}
+              })}</div>}
             </section>
           ) : (
             <section className="browse-drives">
@@ -1977,11 +2583,24 @@ function App() {
                       <strong>{driveDisplayName(drive.persistentIdentifier, drive.name)}</strong>
                       <FolderChevron />
                     </span>
-                    <span>{drive.fileCount.toLocaleString()} files · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
+                    <span>{count(drive.fileCount, "file")} · {formatBytes(drive.cataloguedBytes)} · {connectedIds.has(drive.persistentIdentifier) ? "Connected" : "Offline"}</span>
                   </button>
                 ))}
               </div>
               {catalogued.length === 0 && <div className="empty-state compact"><h3>No catalogued drives</h3><p>Scan a drive first, then its files will appear here.</p></div>}
+              {duplicateOverview && duplicateOverview.groups.length > 0 && (
+                <button
+                  className="browse-duplicates-row"
+                  type="button"
+                  onClick={() => { setExpandedDuplicate(null); setShowDuplicatesView(true); }}
+                >
+                  <span className="browse-duplicates-text">
+                    <strong>Duplicates</strong>
+                    <span>{duplicatesSummary(duplicateOverview)}</span>
+                  </span>
+                  <FolderChevron />
+                </button>
+              )}
             </section>
           )}
 
@@ -2031,7 +2650,7 @@ function App() {
 
     return (
       <main className="app-navigation-shell">
-        <aside className="app-sidebar">
+        <aside className="app-sidebar" aria-label="Media Mapper">
           <div className="sidebar-brand">MediaMapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
@@ -2040,21 +2659,29 @@ function App() {
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
           </nav>
         </aside>
+        {liveRegion}
         <div className="app-content browse-detail">
           <header className="app-header browse-detail-header">
             <div>
               <nav className="browse-detail-breadcrumb" aria-label="Browse path">
                 <button type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); }}>All files</button>
-                <span>/</span>
-                <button type="button" className={pathParts.length === 0 ? "current" : undefined} onClick={() => void openFolder(liveDrive, "")}>{liveDriveName}</button>
+                <span aria-hidden="true">/</span>
+                <button
+                  type="button"
+                  className={pathParts.length === 0 ? "current" : undefined}
+                  aria-current={pathParts.length === 0 ? "location" : undefined}
+                  onClick={() => void openFolder(liveDrive, "")}
+                >
+                  {liveDriveName}
+                </button>
                 {pathParts.map((part, index) => {
                   const path = pathParts.slice(0, index + 1).join("/");
                   const current = index === pathParts.length - 1;
                   return (
                     <span className="browse-detail-crumb" key={path}>
-                      <span>/</span>
+                      <span aria-hidden="true">/</span>
                       {current
-                        ? <span className="current">{part}</span>
+                        ? <span className="current" aria-current="location">{part}</span>
                         : <button type="button" onClick={() => void openFolder(liveDrive, path)}>{part}</button>}
                     </span>
                   );
@@ -2080,13 +2707,13 @@ function App() {
             </label>
           </section>
           {searchQuery.trim() && (
-            <div className="browse-results-heading">
-              {searching ? "Searching…" : `${visibleSearchResults.length}${searchResults.length === 200 ? "+" : ""} results`}
+            <div className="browse-results-heading" role="status">
+              {searching ? "Searching…" : resultCount(visibleSearchResults.length, searchResults.length)}
             </div>
           )}
 
-        {error && <div className="notice error">{error}</div>}
-        {searchQuery.trim() && <section className="file-browser" aria-live="polite">
+        {error && <div className="notice error" role="alert">{error}</div>}
+        {searchQuery.trim() && <section className="file-browser">
           <div className="file-browser-head">
             <span>Name</span><span>Modified</span><span>Size</span><span>Action</span>
           </div>
@@ -2136,7 +2763,7 @@ function App() {
             <div className="browser-message">This folder is empty in the catalogue and plan.</div>
           ) : (
             <>
-              {visibleEntries.map((entry) => {
+              {visibleEntries.map((entry, index) => {
                 const plannedMove = plannedMoveBySourcePath.get(entry.relativePath);
                 const plannedFolderPrefix = `${entry.relativePath}/`;
                 const containsPlannedChanges =
@@ -2169,8 +2796,6 @@ function App() {
                       dragOverFolderPath === entry.relativePath ? "folder-drop-target" : "",
                     ].filter(Boolean).join(" ")}
                     key={entry.relativePath}
-                    role="button"
-                    tabIndex={0}
                     draggable
                     onDragStart={(event) => {
                       setDraggedEntry(entry);
@@ -2219,23 +2844,31 @@ function App() {
 
                       void planEntryToFolder(source, entry.relativePath);
                     }}
+                    // A click anywhere on a folder's row opens it, and a
+                    // double-click on a file's row opens the file. Keyboard
+                    // and VoiceOver use the name button for both.
                     onClick={openRow}
                     onDoubleClick={openFile}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && entry.isDirectory) {
-                        event.preventDefault();
-                        openRow();
-                      }
-                    }}
                   >
-                    <span className={entry.isDirectory ? "file-name" : "file-name file-name-openable"}>
+                    <span className="file-name file-name-openable">
 
                       <span className="file-name-text">
                         {entry.isDirectory ? (
-                          <span className="file-name-primary">{entry.name}</span>
+                          <button
+                            className="file-name-primary file-open-button"
+                            id={`entry-name-${index}`}
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openRow();
+                            }}
+                          >
+                            {entry.name}
+                          </button>
                         ) : (
                           <button
                             className="file-name-primary file-open-button"
+                            id={`entry-name-${index}`}
                             type="button"
                             title={`Open ${entry.name}`}
                             onClick={(event) => {
@@ -2276,11 +2909,12 @@ function App() {
                         ? (dragOverFolderPath === entry.relativePath ? "Drop to move here" : "Folder")
                         : formatBytes(entry.sizeBytes)}
                     </span>
-                    <span className="row-action">
+                    <span className="row-action" data-row-action={`${liveDrive.persistentIdentifier}:${entry.relativePath}`}>
                       {entry.isDirectory && <FolderChevron />}
                       {!entry.isDirectory && !plannedMove && (
                         <button
                           type="button"
+                          aria-describedby={`entry-name-${index}`}
                           onClick={(event) => {
                             event.stopPropagation();
                             beginPlanMove(liveDrive, entry);
@@ -2293,6 +2927,7 @@ function App() {
                         <button
                           className="plan-remove-button"
                           type="button"
+                          aria-describedby={`entry-name-${index}`}
                           disabled={executingPlan}
                           onClick={(event) => {
                             event.stopPropagation();
@@ -2311,17 +2946,20 @@ function App() {
                 .filter((planned) =>
                   !entries.some((entry) => entry.relativePath === planned.destinationRelativePath),
                 )
-                .map((planned) => (
-                  <button
+                .map((planned) => {
+                  // Only a planned folder can be opened. A planned file is
+                  // plain text rather than a dimmed button.
+                  const Row = planned.isDirectory ? "button" : "div";
+                  return (
+                  <Row
                     className={`file-row planned-arrival-row ${planned.isDirectory ? "folder-row" : ""}`}
                     key={`planned:${planned.moveId}:${planned.destinationRelativePath}`}
-                    type="button"
-                    disabled={!planned.isDirectory}
-                    onClick={() => {
-                      if (planned.isDirectory) {
-                        void openFolder(liveDrive, planned.destinationRelativePath);
+                    {...(planned.isDirectory
+                      ? {
+                        type: "button" as const,
+                        onClick: () => void openFolder(liveDrive, planned.destinationRelativePath),
                       }
-                    }}
+                      : {})}
                   >
                     <span className="file-name">
 
@@ -2333,11 +2971,15 @@ function App() {
                           : plannedFromPath(planned)}
                       </span>
                     </span>
-                    <span aria-label="Not on the drive yet">—</span>
+                    <span>
+                      <span aria-hidden="true">—</span>
+                      <span className="visually-hidden">Not on the drive yet</span>
+                    </span>
                     <span>{planned.isDirectory ? "Folder" : formatBytes(planned.sizeBytes)}</span>
                     <span className="row-action">{planned.isDirectory && <FolderChevron />}</span>
-                  </button>
-                ))}
+                  </Row>
+                  );
+                })}
             </>
           )}
         </section>}
@@ -2360,18 +3002,26 @@ function App() {
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("transfers"); }}>Transfers</button>
         </nav>
       </aside>
+      {liveRegion}
       <div className="app-content">
       <header className="app-header">
         <div>
           <p className="eyebrow">DRIVES</p>
           <h1>Your storage</h1>
         </div>
-        <button className="refresh-button" onClick={() => void refresh()} disabled={loading || scanningId !== null}>
+        <button
+          className="refresh-button"
+          data-focus="refresh"
+          onClick={() => {
+            void refresh().then(() => setPendingFocus({ selector: '[data-focus="refresh"]', onlyIfLost: true }));
+          }}
+          disabled={loading || scanningId !== null}
+        >
           {loading ? "Checking…" : "Refresh"}
         </button>
       </header>
 
-      {error && <div className="notice error">{error}</div>}
+      {error && <div className="notice error" role="alert">{error}</div>}
 
       {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Search all drives</h2></div>
@@ -2429,7 +3079,7 @@ function App() {
                       const label = location?.userLabel ?? null;
                       return (
                         <>
-                          <h3>{label ?? drive.name}</h3>
+                          <h3 id={`drive-name-${drive.persistentIdentifier}`}>{label ?? drive.name}</h3>
                           {label && <div className="drive-volume-name">{drive.name}</div>}
                           {drive.persistentIdentifier && (
                             editingDriveLabelId === drive.persistentIdentifier ? (
@@ -2439,17 +3089,23 @@ function App() {
                                   maxLength={40}
                                   value={driveLabelDraft}
                                   placeholder="Drive label"
+                                  aria-label={`Label for ${drive.name}`}
                                   onChange={(event) => setDriveLabelDraft(event.target.value)}
                                   onKeyDown={(event) => {
                                     if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier!);
-                                    if (event.key === "Escape") setEditingDriveLabelId(null);
+                                    if (event.key === "Escape") closeDriveLabelEditor(drive.persistentIdentifier!);
                                   }}
                                 />
                                 <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier!)}>Save</button>
-                                <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                                <button disabled={savingDriveLabel} onClick={() => closeDriveLabelEditor(drive.persistentIdentifier!)}>Cancel</button>
                               </div>
                             ) : (
-                              <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}>
+                              <button
+                                className="drive-label-button"
+                                data-focus={`label-${drive.persistentIdentifier}`}
+                                aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                                onClick={() => beginDriveLabelEdit(drive.persistentIdentifier!, label)}
+                              >
                                 {label ? "Edit name" : "Add label"}
                               </button>
                             )
@@ -2460,8 +3116,22 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      {catalogue && <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}>Browse</button>}
-                      <button className="scan-button" disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier} onClick={() => void scan(drive)}>
+                      {catalogue && (
+                        <button
+                          className="browse-button"
+                          aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                          onClick={() => { setActiveView("browse"); void openFolder(catalogue, ""); }}
+                        >
+                          Browse
+                        </button>
+                      )}
+                      <button
+                        className="scan-button"
+                        data-focus={`scan-${drive.persistentIdentifier}`}
+                        aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                        disabled={scanningId !== null || executingPlan || !drive.persistentIdentifier}
+                        onClick={() => void scan(drive)}
+                      >
                         {scanning ? "Scanning…" : catalogue ? "Rescan" : "Scan"}
                       </button>
                     </div>
@@ -2471,7 +3141,7 @@ function App() {
                 <div className="drive-meta">
                   <span>
                     {catalogue
-                      ? `${catalogue.fileCount.toLocaleString()} files · ${catalogue.directoryCount.toLocaleString()} folders · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
+                      ? `${count(catalogue.fileCount, "file")} · ${count(catalogue.directoryCount, "folder")} · ${formatBytes(catalogue.cataloguedBytes)} catalogued`
                       : "Not catalogued yet"}
                   </span>
                   <span title={catalogue?.lastScannedAt ? formatDate(catalogue.lastScannedAt) : undefined}>{formatScanAge(catalogue?.lastScannedAt ?? null)}</span>
@@ -2479,24 +3149,29 @@ function App() {
                     <span className="unreadable-note">Couldn't read {catalogue.unreadableFolderCount.toLocaleString()} {catalogue.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
                   )}
                 </div>
-                <div className="scan-status-slot" aria-live="polite">
+                <div className="scan-status-slot">
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-progress">
                       <div className="scan-progress-row">
                         <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : "Scanning catalogue…"}</strong>
                         <div className="scan-progress-actions">
-                          <span>{(scanProgress.fileCount + scanProgress.directoryCount).toLocaleString()} items</span>
-                          <button className="cancel-scan-button" disabled={cancellingId === drive.persistentIdentifier} onClick={() => void cancelScan(drive.persistentIdentifier!)}>
+                          <span>{count((scanProgress.fileCount + scanProgress.directoryCount), "item")}</span>
+                          <button
+                            className="cancel-scan-button"
+                            data-focus={`cancel-scan-${drive.persistentIdentifier}`}
+                            disabled={cancellingId === drive.persistentIdentifier}
+                            onClick={() => void cancelScan(drive.persistentIdentifier!)}
+                          >
                             {cancellingId === drive.persistentIdentifier ? "Cancelling…" : "Cancel scan"}
                           </button>
                         </div>
                       </div>
-                      <div className="scan-progress-stats"><span>{scanProgress.fileCount.toLocaleString()} files</span><span>{scanProgress.directoryCount.toLocaleString()} folders</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
+                      <div className="scan-progress-stats"><span>{count(scanProgress.fileCount, "file")}</span><span>{count(scanProgress.directoryCount, "folder")}</span><span>{formatBytes(scanProgress.cataloguedBytes)}</span>{scanProgress.skippedCount > 0 && <span>{scanProgress.skippedCount.toLocaleString()} skipped</span>}</div>
                       <div className="scan-progress-path">{scanProgress.currentPath || "Starting scan…"}</div>
                     </div>
                   ) : scanComplete?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-complete">
-                      Scan complete · {scanComplete.fileCount.toLocaleString()} files · {scanComplete.directoryCount.toLocaleString()} folders · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}
+                      Scan complete · {count(scanComplete.fileCount, "file")} · {count(scanComplete.directoryCount, "folder")} · {formatBytes(scanComplete.cataloguedBytes)}{scanComplete.skippedCount > 0 ? ` · ${scanComplete.skippedCount.toLocaleString()} skipped` : ""}
                       {scanComplete.unreadableFolderCount > 0 && (
                         <div className="unreadable-note">{unreadableSummary(scanComplete)}</div>
                       )}
@@ -2527,7 +3202,7 @@ function App() {
                       const label = location?.userLabel ?? null;
                       return (
                         <>
-                          <h3>{label ?? drive.name}</h3>
+                          <h3 id={`drive-name-${drive.persistentIdentifier}`}>{label ?? drive.name}</h3>
                           {label && <div className="drive-volume-name">{drive.name}</div>}
                           {editingDriveLabelId === drive.persistentIdentifier ? (
                             <div className="drive-label-editor">
@@ -2536,17 +3211,23 @@ function App() {
                                 maxLength={40}
                                 value={driveLabelDraft}
                                 placeholder="Drive label"
+                                aria-label={`Label for ${drive.name}`}
                                 onChange={(event) => setDriveLabelDraft(event.target.value)}
                                 onKeyDown={(event) => {
                                   if (event.key === "Enter") void saveDriveLabel(drive.persistentIdentifier);
-                                  if (event.key === "Escape") setEditingDriveLabelId(null);
+                                  if (event.key === "Escape") closeDriveLabelEditor(drive.persistentIdentifier);
                                 }}
                               />
                               <button disabled={savingDriveLabel} onClick={() => void saveDriveLabel(drive.persistentIdentifier)}>Save</button>
-                              <button disabled={savingDriveLabel} onClick={() => setEditingDriveLabelId(null)}>Cancel</button>
+                              <button disabled={savingDriveLabel} onClick={() => closeDriveLabelEditor(drive.persistentIdentifier)}>Cancel</button>
                             </div>
                           ) : (
-                            <button className="drive-label-button" onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}>
+                            <button
+                              className="drive-label-button"
+                              data-focus={`label-${drive.persistentIdentifier}`}
+                              aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                              onClick={() => beginDriveLabelEdit(drive.persistentIdentifier, label)}
+                            >
                               {label ? "Edit name" : "Add label"}
                             </button>
                           )}
@@ -2556,13 +3237,19 @@ function App() {
                   </div>
                   <div className="drive-actions">
                     <div className="button-row">
-                      <button className="browse-button" onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}>Browse</button>
+                      <button
+                        className="browse-button"
+                        aria-describedby={`drive-name-${drive.persistentIdentifier}`}
+                        onClick={() => { setActiveView("browse"); void openFolder(drive, ""); }}
+                      >
+                        Browse
+                      </button>
                     </div>
                   </div>
                 </div>
                 <CapacitySummary totalBytes={drive.totalBytes} availableBytes={drive.availableBytes} atLastScan />
                 <div className="drive-meta">
-                  <span>{drive.fileCount.toLocaleString()} files · {drive.directoryCount.toLocaleString()} folders · {formatBytes(drive.cataloguedBytes)} catalogued</span>
+                  <span>{count(drive.fileCount, "file")} · {count(drive.directoryCount, "folder")} · {formatBytes(drive.cataloguedBytes)} catalogued</span>
                   <span title={drive.lastScannedAt ? formatDate(drive.lastScannedAt) : undefined}>{formatScanAge(drive.lastScannedAt)}</span>
                   {drive.unreadableFolderCount > 0 && (
                     <span className="unreadable-note">Couldn't read {drive.unreadableFolderCount.toLocaleString()} {drive.unreadableFolderCount === 1 ? "folder" : "folders"}</span>
@@ -2884,63 +3571,6 @@ function App() {
 
       {showLegacyDashboard && catalogued.length > 0 && <section className="section-block">
         <div className="section-heading"><h2>Tools</h2></div>
-        <div className="tool-row">
-          <div>
-            <h3>Probable duplicates</h3>
-            <p>Same filename and exact file size. Contents have not been compared.</p>
-          </div>
-          <button
-            className="section-action"
-            onClick={() => void loadDuplicates()}
-            disabled={duplicatesLoading}
-          >
-            {duplicatesLoading ? "Checking…" : showDuplicates ? "Hide" : "Find duplicates"}
-          </button>
-        </div>
-
-        {showDuplicates && <div className="search-results">
-          {duplicateGroups.length === 0 ? (
-            <div className="browser-message">No probable duplicates found.</div>
-          ) : (
-            duplicateGroups.map((group) => {
-              const key = `${group.name}:${group.sizeBytes}`;
-              const expanded = expandedDuplicate === key;
-
-              return (
-                <div className="duplicate-group" key={key}>
-                  <button
-                    className="search-result"
-                    onClick={() => setExpandedDuplicate(expanded ? null : key)}
-                  >
-                    <span className="search-result-main">
-                      <strong>{group.name}</strong>
-                      <span>{group.copies} copies · {formatBytes(group.sizeBytes)} each</span>
-                    </span>
-                    <span>{formatBytes(group.potentialWastedBytes)} potential waste</span>
-                    <span>{expanded ? "Hide copies" : "Show copies"}</span>
-                  </button>
-
-                  {expanded && <div className="duplicate-files">
-                    {group.files.map((file) => (
-                      <button
-                        className="search-result"
-                        key={`${file.driveId}:${file.relativePath}`}
-                        onClick={() => void openDuplicateFile(file)}
-                      >
-                        <span className="search-result-main">
-                          <strong>{formatLocationPath(driveDisplayName(file.driveId, file.driveName), parentFolder(file.relativePath))}</strong>
-                        </span>
-                        <span>{connectedIds.has(file.driveId) ? "Connected" : "Offline"}</span>
-                        <span>{formatBytes(file.sizeBytes)}</span>
-                      </button>
-                    ))}
-                  </div>}
-                </div>
-              );
-            })
-          )}
-        </div>}
-
         <div className="tool-row">
           <div>
             <h3>Largest files</h3>

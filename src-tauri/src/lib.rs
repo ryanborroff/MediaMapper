@@ -8,7 +8,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -121,7 +121,12 @@ fn clear_scan_cancel(drive_id: &str) {
 fn cancel_scan(persistent_identifier: String) -> Result<(), String> {
     cancelled_scans()
         .lock()
-        .map_err(|_| "Unable to access scan cancellation state.".to_string())?
+        .map_err(|_| {
+            present_error(
+                "Unable to access scan cancellation state.",
+                "cancel the scan",
+            )
+        })?
         .insert(persistent_identifier);
     Ok(())
 }
@@ -172,14 +177,42 @@ struct DuplicateFile {
     modified_at: Option<i64>,
 }
 
+// Why Media Mapper thinks the files in a group are the same file.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DuplicateKind {
+    // Same size and the same SHA-256 of the whole contents, as found by a
+    // content check that still matches the catalogue.
+    Identical,
+    // Same size and same name, ignoring case and Unicode form. Contents
+    // were not compared.
+    Probable,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DuplicateGroup {
+    kind: DuplicateKind,
     name: String,
     size_bytes: i64,
     copies: i64,
-    potential_wasted_bytes: i64,
+    // For identical groups: when the oldest of their checks was made.
+    checked_at: Option<i64>,
     files: Vec<DuplicateFile>,
+}
+
+// Everything the Duplicates view shows. Groups are listed up to
+// DUPLICATE_GROUP_LIMIT; the counts cover every group.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateOverview {
+    // Identical groups first, then probable ones.
+    groups: Vec<DuplicateGroup>,
+    identical_group_count: i64,
+    // Space taken by the extra copies in identical groups: each group's
+    // size times one less than its number of copies.
+    identical_extra_bytes: i64,
+    probable_group_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -390,13 +423,15 @@ fn resolve_transfer_paths(
         destination_local_path,
     )) = planned
     else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
 
     let source_drive = connected_drives
         .iter()
         .find(|drive| drive.persistent_identifier.as_deref() == Some(source_drive_id.as_str()))
-        .ok_or_else(|| "The source drive is not connected.".to_string())?;
+        .ok_or_else(|| {
+            "The source drive isn't connected. Connect it, then copy again.".to_string()
+        })?;
 
     let source = PathBuf::from(&source_drive.mount_point).join(&source_relative_path);
 
@@ -409,7 +444,10 @@ fn resolve_transfer_paths(
             let drive = connected_drives
                 .iter()
                 .find(|drive| drive.persistent_identifier.as_deref() == Some(drive_id.as_str()))
-                .ok_or_else(|| "The destination drive is not connected.".to_string())?;
+                .ok_or_else(|| {
+                    "The destination drive isn't connected. Connect it, then copy again."
+                        .to_string()
+                })?;
 
             PathBuf::from(&drive.mount_point)
         }
@@ -454,12 +492,28 @@ fn try_lock_transfers(connection: &Connection) -> Result<Option<TransferLock>, S
         .open(&path)
         .map_err(|error| format!("Unable to open the transfer lock: {error}"))?;
 
-    match file.try_lock() {
-        Ok(()) => Ok(Some(TransferLock { _file: file })),
-        Err(fs::TryLockError::WouldBlock) => Ok(None),
-        Err(fs::TryLockError::Error(error)) => Err(format!("Unable to lock transfers: {error}")),
+    // A process started at the moment the lock is released briefly
+    // inherits the lock file and holds the lock until it starts running its
+    // program. The app starts diskutil every two seconds, so a lock that is
+    // busy is retried for a moment before it counts as taken. A real
+    // transfer or scan holds it far longer and is still refused.
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(TransferLock { _file: file })),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < TRANSFER_LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(format!("Unable to lock transfers: {error}"))
+            }
+        }
     }
 }
+
+// How long a busy transfer lock is retried before it counts as held.
+const TRANSFER_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 const INTERRUPTED_TRANSFER_MESSAGE: &str = "Interrupted before verification completed.";
 const MISMATCHED_DESTINATION_MESSAGE: &str =
@@ -532,7 +586,7 @@ fn verifying_outcome(
         Ok(true) => VerifyingOutcome::Finalised(copied_bytes),
         Ok(false) => VerifyingOutcome::Failed(MISMATCHED_DESTINATION_MESSAGE),
         Err(error) => {
-            eprintln!("Media Mapper transfer recovery: {error}");
+            log_diagnostic(&format!("Transfer recovery: {error}"));
             VerifyingOutcome::Undetermined
         }
     }
@@ -781,7 +835,7 @@ fn recover_interrupted_transfers(
             Ok(true) => recovery.temporary_files_removed += 1,
             Ok(false) => {}
             // One stuck file must not stop the rest being cleaned up.
-            Err(error) => eprintln!("Media Mapper transfer recovery: {error}"),
+            Err(error) => log_diagnostic(&format!("Transfer recovery: {error}")),
         }
     }
 
@@ -817,7 +871,7 @@ fn recover_transfers_at_startup(app: &tauri::AppHandle) -> Result<(), String> {
                 let _ = app.emit("transfers-recovered", ());
             }
             Ok(_) => {}
-            Err(error) => eprintln!("Media Mapper transfer recovery failed: {error}"),
+            Err(error) => log_diagnostic(&format!("Transfer recovery failed: {error}")),
         }
     });
 
@@ -838,6 +892,9 @@ fn issue_blocks_move(
         (None, None) => true,
     }
 }
+
+const FOLDER_TRANSFER_UNSUPPORTED: &str =
+    "Folders can't be copied yet. Plan the files inside the folder instead.";
 
 #[cfg(test)]
 fn execute_planned_transfer(
@@ -861,6 +918,12 @@ fn execute_planned_transfer_reporting(
     report: &dyn Fn(&TransferProgress),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<TransferRecord, String> {
+    // A cancel that arrived before this file started stops it before any
+    // record, folder or temporary file is made.
+    if is_cancelled() {
+        return Err(TRANSFER_CANCELLED.to_string());
+    }
+
     let Some(_lock) = try_lock_transfers(connection)? else {
         return Err(
             "Another transfer or a drive scan is running. Wait for it to finish, then try again."
@@ -927,8 +990,27 @@ fn execute_planned_transfer_reporting(
     }
 
     let Some((destination_location_id, _)) = &destination else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
+
+    // Transfers copy one file. Folder moves can be planned and previewed, but
+    // copying one is refused here, before any record or folder is created,
+    // rather than relying on the window to leave them out.
+    let source_is_directory: bool = connection
+        .query_row(
+            "SELECT COALESCE(f.is_directory, 0) != 0
+             FROM planned_moves p
+             LEFT JOIN files f
+               ON f.drive_id = p.source_drive_id
+              AND f.relative_path = p.source_relative_path
+             WHERE p.id = ?1",
+            params![planned_move_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to read planned transfer: {error}"))?;
+    if source_is_directory {
+        return Err(FOLDER_TRANSFER_UNSUPPORTED.to_string());
+    }
 
     // Only issues that concern this move stop it. A problem with another
     // planned move, such as its drive being disconnected, does not.
@@ -978,13 +1060,29 @@ struct TransferProgress {
     total_bytes: u64,
 }
 
-// Set by Cancel copy and checked as each chunk is copied or verified.
-static TRANSFER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+// The window copies a run of files one command at a time, naming the run
+// with a nonzero id. Cancel copy records that run's id here, and each chunk
+// copied or verified checks it. Keying the cancel to the run means it is
+// never cleared as the run's next file starts, and never carries over to a
+// later run.
+static CANCELLED_TRANSFER_RUN: AtomicU64 = AtomicU64::new(0);
 const TRANSFER_CANCELLED: &str = "Copy cancelled.";
 
+fn request_transfer_cancel(run_id: u64) {
+    CANCELLED_TRANSFER_RUN.store(run_id, Ordering::SeqCst);
+}
+
+fn transfer_run_cancelled(run_id: u64) -> bool {
+    run_id != 0 && CANCELLED_TRANSFER_RUN.load(Ordering::SeqCst) == run_id
+}
+// A copy that was verified and put in place, but whose completion could not
+// be saved. Media Mapper confirms it against the source when it next opens,
+// or when the copy is tried again.
+const COPIED_NOT_RECORDED: &str = "The file was copied and verified, but Media Mapper couldn't save that it finished. It will check the copy again the next time it opens.";
+
 #[tauri::command]
-fn cancel_transfer() {
-    TRANSFER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+fn cancel_transfer(run_id: u64) {
+    request_transfer_cancel(run_id);
 }
 
 // How long transfer bookkeeping waits for the database. Once a copy has been
@@ -1093,27 +1191,40 @@ fn execute_transfer_paths_reporting(
             // so a finished copy never keeps an active plan item. The transfer
             // record contains its own source/destination snapshot, so removing
             // the plan does not remove execution history.
-            let completion = connection
-                .unchecked_transaction()
-                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
-            update_transfer_status(
-                &completion,
-                transfer.id,
-                "completed",
-                Some(copied_bytes),
-                None,
-            )?;
-            completion
-                .execute(
-                    "DELETE FROM planned_moves WHERE id = ?1",
-                    params![planned_move_id],
-                )
-                .map_err(|error| {
-                    format!("Transfer completed, but the plan could not be cleared: {error}")
-                })?;
-            completion
-                .commit()
-                .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
+            let record_completion = || -> Result<(), String> {
+                let completion = connection
+                    .unchecked_transaction()
+                    .map_err(|error| format!("Unable to record completed transfer: {error}"))?;
+                update_transfer_status(
+                    &completion,
+                    transfer.id,
+                    "completed",
+                    Some(copied_bytes),
+                    None,
+                )?;
+                completion
+                    .execute(
+                        "DELETE FROM planned_moves WHERE id = ?1",
+                        params![planned_move_id],
+                    )
+                    .map_err(|error| {
+                        format!("Transfer completed, but the plan could not be cleared: {error}")
+                    })?;
+                completion
+                    .commit()
+                    .map_err(|error| format!("Unable to record completed transfer: {error}"))
+            };
+            // The copy is already verified and in place. The record stays
+            // `verifying`, so it is never shown as completed until recovery
+            // compares it with the source again, but the error must not
+            // suggest that nothing was copied.
+            if let Err(error) = record_completion() {
+                log_diagnostic(&format!(
+                    "Transfer {} was copied but not recorded: {error}",
+                    transfer.id
+                ));
+                return Err(COPIED_NOT_RECORDED.to_string());
+            }
         }
         Err(error) => {
             // The transfer snapshot survives the failure and records why it
@@ -1188,7 +1299,7 @@ fn create_transfer_record(
         total_bytes,
     )) = planned
     else {
-        return Err("The planned move no longer exists.".to_string());
+        return Err("That file is no longer in the plan.".to_string());
     };
 
     let created_at = now_unix();
@@ -1307,6 +1418,49 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
     Ok(())
 }
 
+const SOURCE_NOT_A_FILE: &str =
+    "The source is no longer a file, so it was not copied. Rescan the source drive to update the catalogue.";
+
+const DESTINATION_EXISTS: &str = "There's already a file at the destination. Media Mapper never replaces existing files, so nothing was copied. Remove it from the plan, or choose another destination.";
+
+const DESTINATION_APPEARED: &str = "A file appeared at the destination during the copy. Media Mapper never replaces existing files, so the copy was discarded and that file was left as it is.";
+
+// Opens a file for reading only if the path itself is a regular file. A
+// symbolic link at the path is never followed, so a source swapped for a
+// link after validation cannot hand the copy some other file. Non-blocking
+// mode keeps a named pipe from stalling the open; it changes nothing for
+// regular files. Returns None for anything that is not a regular file.
+fn open_regular_file(path: &Path) -> std::io::Result<Option<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(target_os = "macos")]
+    const ELOOP: i32 = 62;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(target_os = "macos"))]
+    const O_NOFOLLOW: i32 = 0o400000;
+    #[cfg(not(target_os = "macos"))]
+    const ELOOP: i32 = 40;
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(ELOOP) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
 // Compares a source with its copy byte for byte. The copy is read with the
 // cache bypassed, so its bytes come from the drive.
 fn files_are_identical(first: &Path, second: &Path) -> Result<bool, String> {
@@ -1320,10 +1474,15 @@ fn files_are_identical_with_progress(
     second: &Path,
     on_progress: &mut dyn FnMut(u64) -> Result<(), String>,
 ) -> Result<bool, String> {
-    let first_file = fs::File::open(first)
-        .map_err(|error| format!("Unable to open source for verification: {error}"))?;
-    let second_file = fs::File::open(second)
-        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?;
+    let first_file = open_regular_file(first)
+        .map_err(|error| format!("Unable to open source for verification: {error}"))?
+        .ok_or_else(|| SOURCE_NOT_A_FILE.to_string())?;
+    let second_file = open_regular_file(second)
+        .map_err(|error| format!("Unable to open copied file for verification: {error}"))?
+        .ok_or_else(|| {
+            "The copy changed while it was being checked, so it was discarded. Copy again."
+                .to_string()
+        })?;
     bypass_cache(&second_file)?;
 
     if first_file
@@ -1399,10 +1558,7 @@ fn rename_exclusive(source: &Path, destination: &Path) -> Result<(), String> {
     let error = std::io::Error::last_os_error();
 
     if error.kind() == std::io::ErrorKind::AlreadyExists {
-        return Err(format!(
-            "Destination already exists: {}",
-            destination.display()
-        ));
+        return Err(DESTINATION_APPEARED.to_string());
     }
 
     Err(format!(
@@ -1499,7 +1655,7 @@ fn transfer_temporary_path(
     ));
 
     if temporary == destination {
-        return Err("The destination has the same name as a transfer temporary file.".to_string());
+        return Err("That name is reserved for Media Mapper's temporary copies. Remove the file from the plan and choose another name.".to_string());
     }
 
     Ok(temporary)
@@ -1533,11 +1689,10 @@ fn copy_file_verified_with_progress<F>(
 where
     F: FnMut(u64) -> Result<(), String>,
 {
-    if destination.exists() {
-        return Err(format!(
-            "Destination already exists: {}",
-            destination.display()
-        ));
+    // Anything at the destination counts, including a link to nothing,
+    // which `exists()` would report as absent.
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(DESTINATION_EXISTS.to_string());
     }
 
     if temporary.parent() != destination.parent() || temporary == destination {
@@ -1559,8 +1714,9 @@ where
     let mut temporary_handle: Option<fs::File> = None;
 
     let mut attempt = || -> Result<u64, String> {
-        let source_file = fs::File::open(source)
-            .map_err(|error| format!("Unable to open source file: {error}"))?;
+        let source_file = open_regular_file(source)
+            .map_err(|error| format!("Unable to open source file: {error}"))?
+            .ok_or_else(|| SOURCE_NOT_A_FILE.to_string())?;
         let mut reader = BufReader::new(source_file);
 
         let temporary_file = fs::OpenOptions::new()
@@ -1598,13 +1754,13 @@ where
         loop {
             let count = reader
                 .read(&mut buffer)
-                .map_err(|error| format!("Unable to copy file: {error}"))?;
+                .map_err(|error| format!("Unable to read the source file: {error}"))?;
             if count == 0 {
                 break;
             }
             writer
                 .write_all(&buffer[..count])
-                .map_err(|error| format!("Unable to copy file: {error}"))?;
+                .map_err(|error| format!("Unable to write the copy: {error}"))?;
             copied += count as u64;
             on_progress(TransferStage::Copying, copied)?;
             check_destination(false)?;
@@ -1630,7 +1786,7 @@ where
             on_progress(TransferStage::Verifying, verified)?;
             check_destination(false)
         })? {
-            return Err("Copied file failed byte-for-byte verification.".to_string());
+            return Err(VERIFICATION_FAILED.to_string());
         }
 
         // Finalise with no-overwrite semantics. A destination created after
@@ -1665,6 +1821,9 @@ where
 // folder is still where it was. Each check is a single metadata lookup.
 const DESTINATION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const DESTINATION_UNAVAILABLE: &str = "The destination became unavailable during the copy.";
+
+// A serious failure: say so, and what it may mean.
+const VERIFICATION_FAILED: &str = "The copy didn't match the original when it was checked, so it was discarded. The original is untouched. Copy again. If it happens again, the source or destination drive may be failing.";
 
 // Whether a path still leads to exactly this open file.
 fn path_leads_to(path: &Path, file: &fs::File) -> bool {
@@ -1776,6 +1935,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
         .map_err(|error| format!("Unable to configure catalogue database: {error}"))?;
     register_search_function(&connection)
+        .and_then(|()| register_name_key_function(&connection))
         .map_err(|error| format!("Unable to configure catalogue search: {error}"))?;
     // Foreign keys are a per-connection setting, so every connection sets it.
     connection
@@ -1790,23 +1950,153 @@ fn open_database(path: &Path) -> Result<Connection, String> {
         .lock()
         .map_err(|_| "Unable to access catalogue migration state.".to_string())?;
     if !migrated.contains(path) {
-        migrate_database(&mut connection)?;
+        migrate_database(&mut connection, path)?;
         migrated.insert(path.to_path_buf());
     }
 
     Ok(connection)
 }
 
+// The catalogue schema this build writes, stored in SQLite's `user_version`.
+// Catalogues from before schema versions existed read as 0. They are brought
+// up to date by the checks in `migrate_schema`, then stamped with this number.
+//
+// To change the schema: add a step at the end of `migrate_schema` that checks
+// before it writes, bump this number, and add a fixture test for a catalogue
+// at the previous version. See DATABASE.md.
+const SCHEMA_VERSION: i64 = 2;
+
+const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Media Mapper, so this version can't use it. Open it with the newer version of Media Mapper.";
+
+fn schema_version(connection: &Connection) -> Result<i64, String> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("Unable to read catalogue version: {error}"))
+}
+
+// Brings a catalogue up to `SCHEMA_VERSION`.
+//
+// The upgrade runs in one IMMEDIATE transaction. That takes the write lock
+// before anything is read, so a second copy of the app waits for the first
+// to finish instead of migrating at the same time. If the upgrade fails or
+// the app is killed part way, nothing is kept and the catalogue stays exactly
+// as it was, ready to be upgraded again on the next open.
+fn migrate_database(connection: &mut Connection, path: &Path) -> Result<(), String> {
+    // Reading the version takes no write lock, so a current catalogue opens
+    // without writing, even while a scan holds the write lock.
+    let version = schema_version(connection)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        return Err(NEWER_CATALOGUE_MESSAGE.to_string());
+    }
+
+    // WAL is stored in the file, and can't be changed inside a transaction.
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
+
+    back_up_before_migration(connection, path)?;
+
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to start catalogue update: {error}"))?;
+
+    // Another copy of the app may have upgraded it while this one waited.
+    let version = schema_version(&transaction)?;
+    if version > SCHEMA_VERSION {
+        return Err(NEWER_CATALOGUE_MESSAGE.to_string());
+    }
+    if version < SCHEMA_VERSION {
+        migrate_schema(&transaction)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|error| format!("Unable to record catalogue version: {error}"))?;
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to save catalogue update: {error}"))
+}
+
+// Where the copy taken before upgrading to `SCHEMA_VERSION` is kept:
+// `catalogue.sqlite3` is backed up to `catalogue-before-schema-1.sqlite3`.
+fn schema_backup_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "catalogue".to_string());
+    path.with_file_name(format!("{stem}-before-schema-{SCHEMA_VERSION}.sqlite3"))
+}
+
+static BACKUP_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Keeps a copy of an existing catalogue before its first upgrade to this
+// schema version. The upgrade itself is transactional, so this guards
+// against a mistake in a migration step rather than against interruption.
+//
+// The copy is written under a temporary name and then linked into place,
+// which never replaces an existing file. A backup that already exists was
+// taken before an earlier attempt at this upgrade, so it is kept. If the copy
+// can't be made, the catalogue is not upgraded.
+fn back_up_before_migration(connection: &Connection, path: &Path) -> Result<(), String> {
+    let has_catalogue: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'drives')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to inspect catalogue: {error}"))?;
+    if !has_catalogue {
+        return Ok(());
+    }
+
+    let backup = schema_backup_path(path);
+    if fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(());
+    }
+
+    let mut temporary = backup.clone().into_os_string();
+    temporary.push(format!(
+        ".{}-{}.partial",
+        std::process::id(),
+        BACKUP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temporary = PathBuf::from(temporary);
+
+    let result = connection
+        .execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
+        .map_err(|error| error.to_string())
+        .and_then(|_| match fs::hard_link(&temporary, &backup) {
+            Ok(()) => Ok(()),
+            // Another copy of the app finished its backup first.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_file()) {
+                    Ok(())
+                } else {
+                    Err(error.to_string())
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        });
+    // Only ever this attempt's own temporary file.
+    let _ = fs::remove_file(&temporary);
+
+    result.map_err(|error| {
+        log_diagnostic(&format!("Catalogue backup failed: {error}"));
+        "Media Mapper couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Media Mapper.".to_string()
+    })
+}
+
 // Creates any missing tables, indexes and columns, and upgrades data from
-// older schema versions. Every step checks first, so it is safe to run on a
-// database that is already current.
-fn migrate_database(connection: &mut Connection) -> Result<(), String> {
+// older catalogues. Every step checks first, so it is safe to run on a
+// catalogue that is already current. It runs inside `migrate_database`'s
+// transaction, so it must not start its own.
+fn migrate_schema(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE IF NOT EXISTS drives (
                 persistent_identifier TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1952,29 +2242,21 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| format!("Unable to read catalogue paths: {error}"))?
         };
 
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| format!("Unable to migrate catalogue parent paths: {error}"))?;
-        {
-            let mut update = transaction
-                .prepare("UPDATE files SET parent_path = ?1 WHERE id = ?2")
-                .map_err(|error| format!("Unable to prepare parent path migration: {error}"))?;
+        let mut update = connection
+            .prepare("UPDATE files SET parent_path = ?1 WHERE id = ?2")
+            .map_err(|error| format!("Unable to prepare parent path migration: {error}"))?;
 
-            for (id, relative_path) in existing_paths {
-                let parent_path = Path::new(&relative_path)
-                    .parent()
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+        for (id, relative_path) in existing_paths {
+            let parent_path = Path::new(&relative_path)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-                update
-                    .execute(params![parent_path, id])
-                    .map_err(|error| format!("Unable to migrate catalogue parent path: {error}"))?;
-            }
+            update
+                .execute(params![parent_path, id])
+                .map_err(|error| format!("Unable to migrate catalogue parent path: {error}"))?;
         }
-        transaction
-            .commit()
-            .map_err(|error| format!("Unable to commit parent path migration: {error}"))?;
     }
 
     if !file_columns.contains("unreadable") {
@@ -2094,13 +2376,9 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
         };
 
         if planned_move_columns.contains("destination_drive_id") {
-            let transaction = connection
-                .transaction()
-                .map_err(|error| format!("Unable to start planned move migration: {error}"))?;
-
             // The migrated rows reference `drive:` locations through a foreign
             // key, so those locations must exist before the rows are copied.
-            sync_drive_locations(&transaction)?;
+            sync_drive_locations(connection)?;
 
             // Tables created before locations existed only have
             // `destination_drive_id`. Referencing `destination_location_id`
@@ -2115,7 +2393,7 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                     "'drive:' || destination_drive_id"
                 };
 
-            transaction
+            connection
                 .execute_batch(&format!(
                     "CREATE TABLE planned_moves_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2163,10 +2441,6 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|error| {
                     format!("Unable to migrate planned moves to locations: {error}")
                 })?;
-
-            transaction
-                .commit()
-                .map_err(|error| format!("Unable to commit planned move migration: {error}"))?;
         }
     }
 
@@ -2208,6 +2482,34 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
             ",
         )
         .map_err(|error| format!("Unable to initialise transfer schema: {error}"))?;
+
+    // Version 2. The result of reading a file to compare its contents with
+    // other files of the same size. A check only counts while the catalogue
+    // entry still has the same size and date, so a rescan that finds the file
+    // changed makes it stale without touching this table.
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS content_checks (
+                drive_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                modified_at INTEGER,
+                -- SHA-256 of the size and the first and last 64 KB.
+                sample_hash BLOB NOT NULL,
+                -- SHA-256 of the whole file, read only when samples match.
+                full_hash BLOB,
+                checked_at INTEGER NOT NULL,
+                PRIMARY KEY (drive_id, relative_path),
+                FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_files_size
+                ON files(size_bytes)
+                WHERE is_directory = 0;
+            ",
+        )
+        .map_err(|error| format!("Unable to initialise content check schema: {error}"))?;
 
     Ok(())
 }
@@ -2267,6 +2569,8 @@ fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
     let connection = open_database(&database_path(app)?)?;
     sync_drive_locations(&connection)
 }
+
+const DRIVE_WITHOUT_IDENTITY: &str = "This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.";
 
 // Parses `diskutil info` output into its `Key: Value` pairs.
 fn parse_diskutil_info(text: &str) -> std::collections::HashMap<String, String> {
@@ -2391,6 +2695,207 @@ fn external_drives() -> Result<Vec<DriveInfo>, String> {
 // window, so a slow query or `diskutil` call would freeze the interface.
 // Commands that touch SQLite or the filesystem are async and hand their work
 // to the blocking thread pool through this helper, as `scan_drive` does.
+
+// User-facing errors.
+//
+// Internal failures are built as "Unable to <step>: <detail>", where the
+// detail is a SQLite or macOS error that means nothing to a user, and can
+// name paths and internal ids. Commands pass every error through
+// `present_error`. It logs the detail and shows what happened and what to do
+// next. Messages already written for the window pass through unchanged.
+
+// Failures that are internal however they are worded.
+const INTERNAL_ERROR_PREFIXES: &[&str] = &[
+    "Unable to ",
+    "Background task failed",
+    "Drive scan task failed",
+    "Destination location ",
+    "Transfers need a catalogue",
+    "Exclusive transfer finalisation",
+    "Temporary path contains",
+    "Destination path contains",
+    "Source path contains",
+    "Destination has no parent",
+    "The temporary file must sit",
+    "External drive location has no",
+    "Folder location has no path",
+    "Copied file is too large",
+    "Transfer completed, but the plan could not be cleared",
+    "External drive discovery is implemented",
+    "The transfer record no longer exists",
+];
+
+// Copy steps that read the source, and steps that write the destination, so
+// an I/O error can say which drive failed.
+const SOURCE_STEPS: &[&str] = &[
+    "Unable to open source file",
+    "Unable to read the source file",
+    "Unable to open source for verification",
+    "Unable to verify source file",
+];
+const DESTINATION_STEPS: &[&str] = &[
+    "Unable to create destination folder",
+    "Unable to create temporary destination file",
+    "Unable to track temporary destination file",
+    "Unable to write the copy",
+    "Unable to flush copied file",
+    "Unable to sync copied file",
+    "Unable to open copied file for verification",
+    "Unable to verify copied file",
+    "Unable to copy the file's dates",
+    "Unable to finalise copied file",
+];
+
+const CATALOGUE_BUSY: &str =
+    "Media Mapper is still finishing another task, such as a scan. Try again in a moment.";
+const CATALOGUE_DAMAGED: &str = "Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.mediamapper.app) before trying anything else.";
+const MAC_FULL: &str =
+    "This Mac is out of space, so Media Mapper couldn't save its catalogue. Free some space, then try again.";
+
+// The macOS error number in an `io::Error` message, as in "(os error 5)".
+fn os_error_code(error: &str) -> Option<i32> {
+    let start = error.rfind("(os error ")? + "(os error ".len();
+    let digits: String = error[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn is_internal_error(error: &str) -> bool {
+    INTERNAL_ERROR_PREFIXES
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+        || error.contains("(os error ")
+}
+
+// The window's wording for an internal failure, or `None` when `error` is
+// already written for the window.
+fn user_message(error: &str, action: &str) -> Option<String> {
+    if !is_internal_error(error) {
+        return None;
+    }
+
+    let lower = error.to_lowercase();
+    if lower.contains("database is locked")
+        || lower.contains("database table is locked")
+        || lower.contains("database is busy")
+    {
+        return Some(CATALOGUE_BUSY.to_string());
+    }
+    if lower.contains("malformed") || lower.contains("not a database") {
+        return Some(CATALOGUE_DAMAGED.to_string());
+    }
+    if lower.contains("database or disk is full") {
+        return Some(MAC_FULL.to_string());
+    }
+
+    let source = SOURCE_STEPS.iter().any(|step| error.starts_with(step));
+    let destination = DESTINATION_STEPS.iter().any(|step| error.starts_with(step));
+    let message = match (os_error_code(error), source, destination) {
+        // ENOSPC
+        (Some(28), _, true) => {
+            "The destination ran out of space during the copy. Free some space there, then copy again."
+        }
+        (Some(28), _, _) => MAC_FULL,
+        // EROFS
+        (Some(30), _, true) => {
+            "The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to."
+        }
+        // EACCES, EPERM
+        (Some(1 | 13), true, _) => {
+            "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again."
+        }
+        (Some(1 | 13), _, true) => {
+            "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again."
+        }
+        // ENOENT
+        (Some(2), true, _) => {
+            "The source file is no longer there. Rescan the source drive to update the catalogue."
+        }
+        // EIO, ENXIO, ENODEV, and ENOENT at the destination
+        (Some(5 | 6 | 19), true, _) => {
+            "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        }
+        (Some(2 | 5 | 6 | 19), _, true) => {
+            "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        }
+        (Some(1 | 13), _, _) => {
+            return Some(format!(
+                "macOS didn't let Media Mapper {action}. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again."
+            ));
+        }
+        _ if action == "copy the file" => {
+            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+        }
+        _ => {
+            return Some(format!(
+                "Media Mapper couldn't {action}. Try again. If it keeps happening, quit and reopen Media Mapper."
+            ));
+        }
+    };
+    Some(message.to_string())
+}
+
+// What a command returns to the window. Internal detail goes to the log.
+fn present_error(error: &str, action: &str) -> String {
+    match user_message(error, action) {
+        Some(message) => {
+            log_diagnostic(&format!("Couldn't {action}: {error}"));
+            message
+        }
+        None => error.to_string(),
+    }
+}
+
+// Transfer history keeps each attempt's error as recorded, so the log and
+// the record agree. The window is shown the user-facing wording.
+fn present_transfer_error(error: &str) -> String {
+    if error == INTERRUPTED_TRANSFER_MESSAGE {
+        return "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+            .to_string();
+    }
+    user_message(error, "copy the file").unwrap_or_else(|| error.to_string())
+}
+
+// The diagnostics log: `~/Library/Logs/com.mediamapper.app/media-mapper.log`.
+// Set at startup. stderr alone is lost when the app is opened from Finder.
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+// The log is moved to `media-mapper.log.1`, replacing any older one, once it
+// passes this size.
+const LOG_LIMIT_BYTES: u64 = 1_000_000;
+
+fn log_diagnostic(message: &str) {
+    eprintln!("Media Mapper: {message}");
+    if let Some(path) = LOG_FILE.get() {
+        append_log(path, message);
+    }
+}
+
+fn append_log(path: &Path, message: &str) {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > LOG_LIMIT_BYTES) {
+        let mut previous = path.to_path_buf().into_os_string();
+        previous.push(".1");
+        let _ = fs::rename(path, previous);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{} {message}", now_unix());
+    }
+}
+
+// Runs a command's work off the main thread and turns any failure into a
+// message for the window. `action` completes "Media Mapper couldn't …".
+async fn run_command<T, F>(action: &str, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking(work)
+        .await
+        .map_err(|error| present_error(&error, action))
+}
+
 async fn run_blocking<T, F>(work: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -2470,7 +2975,7 @@ fn note_connected_drives(database: &Path, drives: &[DriveInfo]) {
 
 #[tauri::command]
 async fn list_external_drives(app: tauri::AppHandle) -> Result<Vec<DriveInfo>, String> {
-    run_blocking(move || {
+    run_command("check which drives are connected", move || {
         let drives = external_drives()?;
         if let Ok(database) = database_path(&app) {
             note_connected_drives(&database, &drives);
@@ -2536,7 +3041,7 @@ fn catalogued_drives(connection: &Connection) -> Result<Vec<CataloguedDrive>, St
 
 #[tauri::command]
 async fn list_catalogued_drives(app: tauri::AppHandle) -> Result<Vec<CataloguedDrive>, String> {
-    run_blocking(move || {
+    run_command("load your drives", move || {
         let connection = open_database(&database_path(&app)?)?;
         catalogued_drives(&connection)
     })
@@ -2720,11 +3225,11 @@ fn scan_drive_job(
         let drive_id = drive
             .persistent_identifier
             .clone()
-            .ok_or_else(|| "This drive does not provide a stable volume identifier.".to_string())?;
+            .ok_or_else(|| DRIVE_WITHOUT_IDENTITY.to_string())?;
         let root = PathBuf::from(&drive.mount_point);
 
         if !root.is_dir() {
-            return Err("The drive mount point is no longer available.".to_string());
+            return Err("The drive was disconnected. Reconnect it, then scan again.".to_string());
         }
 
         let mut connection = open_database(&database)?;
@@ -2879,10 +3384,21 @@ async fn scan_drive(
     app: tauri::AppHandle,
     persistent_identifier: String,
 ) -> Result<ScanResult, String> {
+    scan_connected_drive(app, persistent_identifier)
+        .await
+        .map_err(|error| present_error(&error, "scan this drive"))
+}
+
+async fn scan_connected_drive(
+    app: tauri::AppHandle,
+    persistent_identifier: String,
+) -> Result<ScanResult, String> {
     let drive = external_drives()?
         .into_iter()
         .find(|drive| drive.persistent_identifier.as_deref() == Some(&persistent_identifier))
-        .ok_or_else(|| "That drive is no longer connected.".to_string())?;
+        .ok_or_else(|| {
+            "That drive is no longer connected. Reconnect it, then scan again.".to_string()
+        })?;
 
     let database = database_path(&app)?;
     let progress_app = app.clone();
@@ -2907,7 +3423,7 @@ async fn list_catalogue_entries(
     persistent_identifier: String,
     parent_path: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    run_blocking(move || {
+    run_command("open this folder", move || {
         let connection = open_database(&database_path(&app)?)?;
 
         let mut statement = connection
@@ -2992,6 +3508,25 @@ fn register_search_function(connection: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+// Makes duplicate_name_key available to SQL as mm_name_key on this
+// connection.
+fn register_name_key_function(connection: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    connection.create_scalar_function(
+        "mm_name_key",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let text = context
+                .get_raw(0)
+                .as_str_or_null()
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+            Ok(text.map(duplicate_name_key))
+        },
+    )
+}
+
 fn normalised_search_expression(column: &str) -> String {
     format!("mm_search_fold({column})")
 }
@@ -3009,7 +3544,7 @@ async fn search_catalogue(
     persistent_identifier: String,
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
-    run_blocking(move || {
+    run_command("search this drive", move || {
         let tokens = search_tokens(query.trim());
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -3076,7 +3611,7 @@ async fn search_all_catalogues(
     app: tauri::AppHandle,
     query: String,
 ) -> Result<Vec<LibrarySearchResult>, String> {
-    run_blocking(move || {
+    run_command("search your drives", move || {
         let tokens = search_tokens(query.trim());
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -3147,105 +3682,793 @@ async fn search_all_catalogues(
 // the top groups are found once, then matched against the files in a single
 // pass. CROSS JOIN makes SQLite scan files once and look each row up in the
 // small groups table, instead of scanning files once per group.
-fn find_probable_duplicates(connection: &Connection) -> Result<Vec<DuplicateGroup>, String> {
-    let mut statement = connection
-        .prepare(
-            "WITH duplicate_groups AS MATERIALIZED (
-                SELECT lower(name) AS name_key,
-                       size_bytes,
-                       MIN(name) AS display_name,
-                       COUNT(*) AS copies
-                FROM files
-                WHERE is_directory = 0
-                  AND size_bytes IS NOT NULL
-                  AND size_bytes > 0
-                GROUP BY lower(name), size_bytes
-                HAVING COUNT(*) > 1
-                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
-                         size_bytes DESC,
-                         lower(MIN(name))
-                LIMIT 100
-             )
-             SELECT g.name_key,
-                    g.size_bytes,
-                    g.display_name,
-                    g.copies,
-                    f.drive_id,
-                    d.name,
-                    f.relative_path,
-                    f.name,
-                    f.modified_at
-             FROM files f
-             CROSS JOIN duplicate_groups g
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE f.is_directory = 0
-               AND f.size_bytes = g.size_bytes
-               AND lower(f.name) = g.name_key
-             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
-                      g.size_bytes DESC,
-                      lower(g.display_name),
-                      g.name_key,
-                      lower(d.name),
-                      lower(f.relative_path)",
-        )
-        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+// How many duplicate groups the Duplicates view lists.
+const DUPLICATE_GROUP_LIMIT: i64 = 200;
 
+// The key two file names must share to be probable duplicates: the name in
+// Unicode composed form, lowercased. "Café.MOV" typed with a composed é and
+// "café.mov" stored decomposed, as macOS often stores names, share a key.
+// Unlike search_fold, separators are kept, so "a_b" and "a b" differ.
+fn duplicate_name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    if name.is_ascii() {
+        return name.to_ascii_lowercase();
+    }
+    name.nfc().flat_map(char::to_lowercase).collect()
+}
+
+// Files that count towards duplicates: files with a known size above zero,
+// not hidden (no part of the path starts with a dot, as Browse hides them).
+// `table` prefixes the columns, such as "f." for a joined query.
+fn duplicate_candidate_filter(table: &str) -> String {
+    format!(
+        "{table}is_directory = 0
+         AND {table}size_bytes IS NOT NULL
+         AND {table}size_bytes > 0
+         AND {table}relative_path NOT LIKE '.%'
+         AND {table}relative_path NOT LIKE '%/.%'"
+    )
+}
+
+// Common table expressions for duplicate queries.
+//
+// `checked`: candidates of at least CONTENT_CHECK_MIN_BYTES with a content
+// check that still matches their catalogue entry.
+//
+// `settled`: files whose contents are known relative to every other file of
+// their size. Every other such file has been checked, and each one either
+// has a different sample or was read in full along with this file. Settled
+// files are shown as identical or not at all, never as probable. A file
+// that matches some copies in full but shares its size with an unchecked
+// file isn't settled, so it can appear in both lists.
+fn checked_and_settled_expressions() -> String {
+    format!(
+        "checked AS MATERIALIZED (
+            SELECT f.drive_id, f.relative_path, f.size_bytes,
+                   c.sample_hash, c.full_hash, c.checked_at
+            FROM files f
+            JOIN content_checks c
+              ON c.drive_id = f.drive_id
+             AND c.relative_path = f.relative_path
+             AND c.size_bytes = f.size_bytes
+             AND c.modified_at IS f.modified_at
+            WHERE {checked_filter}
+              AND f.size_bytes >= {min}
+         ),
+         settled AS MATERIALIZED (
+            SELECT k.drive_id, k.relative_path
+            FROM checked k
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM files o
+                LEFT JOIN checked x
+                  ON x.drive_id = o.drive_id AND x.relative_path = o.relative_path
+                WHERE {other_filter}
+                  AND o.size_bytes = k.size_bytes
+                  AND (o.drive_id, o.relative_path) IS NOT (k.drive_id, k.relative_path)
+                  AND (
+                        x.drive_id IS NULL
+                        OR (x.sample_hash = k.sample_hash
+                            AND (x.full_hash IS NULL OR k.full_hash IS NULL))
+                  )
+            )
+         )",
+        checked_filter = duplicate_candidate_filter("f."),
+        other_filter = duplicate_candidate_filter("o."),
+        min = CONTENT_CHECK_MIN_BYTES,
+    )
+}
+
+// Adds rows that arrive grouped and in display order to `groups`, one group
+// per run of the same key.
+fn collect_duplicate_rows(
+    statement: &mut rusqlite::Statement<'_>,
+    kind: DuplicateKind,
+    groups: &mut Vec<DuplicateGroup>,
+) -> Result<(), String> {
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![DUPLICATE_GROUP_LIMIT], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
                 DuplicateFile {
-                    drive_id: row.get(4)?,
-                    drive_name: row.get(5)?,
-                    relative_path: row.get(6)?,
-                    name: row.get(7)?,
+                    drive_id: row.get(5)?,
+                    drive_name: row.get(6)?,
+                    relative_path: row.get(7)?,
+                    name: row.get(8)?,
                     size_bytes: row.get(1)?,
-                    modified_at: row.get(8)?,
+                    modified_at: row.get(9)?,
                 },
             ))
         })
-        .map_err(|error| format!("Unable to read probable duplicates: {error}"))?;
+        .map_err(|error| format!("Unable to read duplicates: {error}"))?;
 
-    // Rows arrive grouped and in display order, so each group is a run.
-    let mut results: Vec<DuplicateGroup> = Vec::new();
-    let mut current_key: Option<(String, i64)> = None;
+    let mut current_key: Option<(Vec<u8>, i64)> = None;
     for row in rows {
-        let (name_key, size_bytes, display_name, copies, file) =
-            row.map_err(|error| format!("Unable to read probable duplicate rows: {error}"))?;
-        let key = (name_key, size_bytes);
+        let (key, size_bytes, display_name, copies, checked_at, file) =
+            row.map_err(|error| format!("Unable to read duplicate rows: {error}"))?;
+        let key = (key, size_bytes);
         if current_key.as_ref() != Some(&key) {
-            results.push(DuplicateGroup {
+            groups.push(DuplicateGroup {
+                kind,
                 name: display_name,
                 size_bytes,
                 copies,
-                potential_wasted_bytes: size_bytes.saturating_mul(copies.saturating_sub(1)),
+                checked_at,
                 files: Vec::new(),
             });
             current_key = Some(key);
         }
-        if let Some(group) = results.last_mut() {
+        if let Some(group) = groups.last_mut() {
             group.files.push(file);
         }
     }
+    Ok(())
+}
 
-    Ok(results)
+// Groups files from the catalogue and stored content checks alone, so
+// offline drives are included and nothing on any drive is read.
+fn find_duplicates(connection: &Connection) -> Result<DuplicateOverview, String> {
+    let shared = checked_and_settled_expressions();
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+    // Identical: the same size and whole-file hash.
+    let (identical_group_count, identical_extra_bytes): (i64, i64) = connection
+        .query_row(
+            &format!(
+                "WITH {shared}
+                 SELECT COUNT(*), COALESCE(SUM(size_bytes * (copies - 1)), 0)
+                 FROM (
+                    SELECT size_bytes, COUNT(*) AS copies
+                    FROM checked
+                    WHERE full_hash IS NOT NULL
+                    GROUP BY size_bytes, full_hash
+                    HAVING COUNT(*) > 1
+                 )"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("Unable to count identical files: {error}"))?;
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH {shared},
+             identical_groups AS MATERIALIZED (
+                SELECT full_hash, size_bytes, COUNT(*) AS copies,
+                       MIN(checked_at) AS checked_at
+                FROM checked
+                WHERE full_hash IS NOT NULL
+                GROUP BY size_bytes, full_hash
+                HAVING COUNT(*) > 1
+                ORDER BY size_bytes * (COUNT(*) - 1) DESC, size_bytes DESC, full_hash
+                LIMIT ?1
+             ),
+             members AS MATERIALIZED (
+                SELECT g.full_hash, g.size_bytes, g.copies, g.checked_at,
+                       f.drive_id, f.relative_path, f.name, f.modified_at
+                FROM identical_groups g
+                JOIN checked k
+                  ON k.full_hash = g.full_hash AND k.size_bytes = g.size_bytes
+                JOIN files f
+                  ON f.drive_id = k.drive_id AND f.relative_path = k.relative_path
+             )
+             SELECT m.full_hash, m.size_bytes,
+                    -- Named after the name most copies share.
+                    (SELECT name FROM members n
+                     WHERE n.full_hash = m.full_hash AND n.size_bytes = m.size_bytes
+                     GROUP BY name
+                     ORDER BY COUNT(*) DESC, lower(name), name
+                     LIMIT 1),
+                    m.copies, m.checked_at,
+                    m.drive_id, d.name, m.relative_path, m.name, m.modified_at
+             FROM members m
+             JOIN drives d ON d.persistent_identifier = m.drive_id
+             ORDER BY m.size_bytes * (m.copies - 1) DESC,
+                      m.size_bytes DESC,
+                      m.full_hash,
+                      lower(d.name),
+                      lower(m.relative_path)"
+        ))
+        .map_err(|error| format!("Unable to query identical files: {error}"))?;
+    collect_duplicate_rows(&mut statement, DuplicateKind::Identical, &mut groups)?;
+
+    // Probable: the same name and size, among files not already settled.
+    let unsettled = format!(
+        "{} AND NOT EXISTS (
+            SELECT 1 FROM settled s
+            WHERE s.drive_id = files.drive_id AND s.relative_path = files.relative_path
+         )",
+        duplicate_candidate_filter("")
+    );
+    let probable_group_count: i64 = connection
+        .query_row(
+            &format!(
+                "WITH {shared}
+                 SELECT COUNT(*) FROM (
+                    SELECT 1
+                    FROM files
+                    WHERE {unsettled}
+                    GROUP BY mm_name_key(name), size_bytes
+                    HAVING COUNT(*) > 1
+                 )"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to count probable duplicates: {error}"))?;
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH {shared},
+             candidates AS MATERIALIZED (
+                SELECT drive_id, relative_path, name, size_bytes, modified_at,
+                       mm_name_key(name) AS name_key
+                FROM files
+                WHERE {unsettled}
+             ),
+             duplicate_groups AS MATERIALIZED (
+                SELECT name_key,
+                       size_bytes,
+                       MIN(name) AS display_name,
+                       COUNT(*) AS copies
+                FROM candidates
+                GROUP BY name_key, size_bytes
+                HAVING COUNT(*) > 1
+                ORDER BY (size_bytes * (COUNT(*) - 1)) DESC,
+                         size_bytes DESC,
+                         name_key
+                LIMIT ?1
+             )
+             SELECT CAST(g.name_key AS BLOB),
+                    g.size_bytes,
+                    g.display_name,
+                    g.copies,
+                    NULL,
+                    c.drive_id,
+                    d.name,
+                    c.relative_path,
+                    c.name,
+                    c.modified_at
+             FROM candidates c
+             JOIN duplicate_groups g
+               ON g.name_key = c.name_key
+              AND g.size_bytes = c.size_bytes
+             JOIN drives d ON d.persistent_identifier = c.drive_id
+             ORDER BY (g.size_bytes * (g.copies - 1)) DESC,
+                      g.size_bytes DESC,
+                      g.name_key,
+                      lower(d.name),
+                      lower(c.relative_path)"
+        ))
+        .map_err(|error| format!("Unable to query probable duplicates: {error}"))?;
+    collect_duplicate_rows(&mut statement, DuplicateKind::Probable, &mut groups)?;
+
+    Ok(DuplicateOverview {
+        groups,
+        identical_group_count,
+        identical_extra_bytes,
+        probable_group_count,
+    })
 }
 
 #[tauri::command]
-async fn probable_duplicates(app: tauri::AppHandle) -> Result<Vec<DuplicateGroup>, String> {
-    run_blocking(move || {
+async fn list_duplicates(app: tauri::AppHandle) -> Result<DuplicateOverview, String> {
+    run_command("find duplicates", move || {
         let connection = open_database(&database_path(&app)?)?;
-        find_probable_duplicates(&connection)
+        find_duplicates(&connection)
+    })
+    .await
+}
+
+// ---- Checking duplicate candidates' contents ----
+//
+// Finds files that are byte-for-byte identical without comparing every file
+// with every other. Only files that share a size with another can match;
+// a hash of each one's size and first and last 64 KB separates almost all
+// unrelated files cheaply; and only files whose samples match another's are
+// read in full. The check only ever reads. It runs by hand, holds the same
+// lock as scans and copies, and records what it learns in `content_checks`.
+
+// Files smaller than this are only ever shown as probable duplicates.
+const CONTENT_CHECK_MIN_BYTES: i64 = 1_000_000;
+// Read from each end of a file for its sample.
+const CONTENT_SAMPLE_BYTES: u64 = 64 * 1024;
+
+const CONTENT_CHECK_BUSY: &str =
+    "A copy or scan is running. Wait for it to finish, then check contents.";
+
+// Set by Cancel and checked as each file is started and each chunk is
+// read, keyed to the check's run like a copy's cancel.
+static CANCELLED_CONTENT_CHECK_RUN: AtomicU64 = AtomicU64::new(0);
+
+fn request_content_check_cancel(run_id: u64) {
+    CANCELLED_CONTENT_CHECK_RUN.store(run_id, Ordering::SeqCst);
+}
+
+fn content_check_run_cancelled(run_id: u64) -> bool {
+    run_id != 0 && CANCELLED_CONTENT_CHECK_RUN.load(Ordering::SeqCst) == run_id
+}
+
+// One catalogued file that shares its size with another, and what is
+// already known about its contents.
+#[derive(Clone, Debug)]
+struct ContentCandidate {
+    drive_id: String,
+    relative_path: String,
+    size_bytes: i64,
+    modified_at: Option<i64>,
+    // From a check that still matches the catalogue entry.
+    sample_hash: Option<Vec<u8>>,
+    full_hash: Option<Vec<u8>>,
+}
+
+// Files of at least CONTENT_CHECK_MIN_BYTES, not hidden, that share their
+// size with another such file on any drive, offline or not.
+fn content_candidates(connection: &Connection) -> Result<Vec<ContentCandidate>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "WITH sizes AS MATERIALIZED (
+                SELECT size_bytes
+                FROM files
+                WHERE {}
+                  AND size_bytes >= ?1
+                GROUP BY size_bytes
+                HAVING COUNT(*) > 1
+             )
+             SELECT f.drive_id,
+                    f.relative_path,
+                    f.size_bytes,
+                    f.modified_at,
+                    c.sample_hash,
+                    c.full_hash
+             FROM files f
+             JOIN sizes s ON s.size_bytes = f.size_bytes
+             LEFT JOIN content_checks c
+               ON c.drive_id = f.drive_id
+              AND c.relative_path = f.relative_path
+              AND c.size_bytes = f.size_bytes
+              AND c.modified_at IS f.modified_at
+             WHERE {}
+             ORDER BY f.size_bytes DESC, f.drive_id, f.relative_path",
+            duplicate_candidate_filter(""),
+            duplicate_candidate_filter("f.")
+        ))
+        .map_err(|error| format!("Unable to find files to check: {error}"))?;
+    let candidates = statement
+        .query_map(params![CONTENT_CHECK_MIN_BYTES], |row| {
+            Ok(ContentCandidate {
+                drive_id: row.get(0)?,
+                relative_path: row.get(1)?,
+                size_bytes: row.get(2)?,
+                modified_at: row.get(3)?,
+                sample_hash: row.get(4)?,
+                full_hash: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("Unable to find files to check: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read files to check: {error}"))?;
+    Ok(candidates)
+}
+
+// What a check would read on one connected drive, at most: every candidate
+// there that hasn't been checked in full. Usually far less is read, as most
+// files are settled by their samples.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckEstimate {
+    drive_id: String,
+    drive_name: String,
+    file_count: i64,
+    max_bytes: i64,
+}
+
+fn estimate_content_check_for(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+) -> Result<Vec<ContentCheckEstimate>, String> {
+    let mut estimates: Vec<ContentCheckEstimate> = Vec::new();
+    for candidate in content_candidates(connection)? {
+        if candidate.full_hash.is_some() {
+            continue;
+        }
+        let Some(drive) = connected_drives
+            .iter()
+            .find(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+        else {
+            continue;
+        };
+        match estimates
+            .iter_mut()
+            .find(|estimate| estimate.drive_id == candidate.drive_id)
+        {
+            Some(estimate) => {
+                estimate.file_count += 1;
+                estimate.max_bytes += candidate.size_bytes;
+            }
+            None => estimates.push(ContentCheckEstimate {
+                drive_id: candidate.drive_id.clone(),
+                drive_name: drive.name.clone(),
+                file_count: 1,
+                max_bytes: candidate.size_bytes,
+            }),
+        }
+    }
+    estimates.sort_by(|left, right| {
+        left.drive_name
+            .to_lowercase()
+            .cmp(&right.drive_name.to_lowercase())
+    });
+    Ok(estimates)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ContentCheckStage {
+    // Reading the start and end of each candidate.
+    Sampling,
+    // Reading in full the candidates whose samples match.
+    Comparing,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckProgress {
+    stage: ContentCheckStage,
+    files_done: usize,
+    files_total: usize,
+}
+
+// What a finished or cancelled check did.
+#[derive(Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentCheckSummary {
+    // Files whose contents were read and recorded.
+    files_checked: usize,
+    // Files that have changed since the last scan, so were left unchecked
+    // until the drive is rescanned.
+    files_changed: usize,
+    // Files that couldn't be read, such as missing ones.
+    files_unreadable: usize,
+    cancelled: bool,
+}
+
+// Why one file couldn't be checked. Cancelled stops the whole check.
+enum FileCheckError {
+    Changed,
+    Unreadable(String),
+    Cancelled,
+}
+
+// Opens a candidate for reading, if its drive is connected and the file is
+// still the one the catalogue describes: a regular file on that drive, not
+// through a link, with the catalogued size and date.
+fn open_candidate(
+    candidate: &ContentCandidate,
+    connected_drives: &[DriveInfo],
+) -> Result<Option<fs::File>, FileCheckError> {
+    let Some(drive) = connected_drives
+        .iter()
+        .find(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+    else {
+        return Ok(None);
+    };
+    let path = resolve_catalogued_file(Path::new(&drive.mount_point), &candidate.relative_path)
+        .map_err(FileCheckError::Unreadable)?;
+    let file = open_regular_file(&path)
+        .map_err(|error| FileCheckError::Unreadable(error.to_string()))?
+        .ok_or_else(|| FileCheckError::Unreadable("not a regular file".to_string()))?;
+    if !candidate_unchanged(candidate, &file) {
+        return Err(FileCheckError::Changed);
+    }
+    // Reading these files once shouldn't push everything else out of memory.
+    bypass_cache(&file).map_err(FileCheckError::Unreadable)?;
+    Ok(Some(file))
+}
+
+// Whether an open file still has its catalogued size and date.
+fn candidate_unchanged(candidate: &ContentCandidate, file: &fs::File) -> bool {
+    match file.metadata() {
+        Ok(metadata) => {
+            i64::try_from(metadata.len()).ok() == Some(candidate.size_bytes)
+                && system_time_unix(metadata.modified()) == candidate.modified_at
+        }
+        Err(_) => false,
+    }
+}
+
+// SHA-256 of a file's size and its first and last CONTENT_SAMPLE_BYTES.
+fn sample_hash_of(file: &mut fs::File, size: u64) -> std::io::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    let mut buffer = vec![0_u8; CONTENT_SAMPLE_BYTES as usize];
+    for offset in [0, size.saturating_sub(CONTENT_SAMPLE_BYTES)] {
+        file.seek(SeekFrom::Start(offset))?;
+        let length = CONTENT_SAMPLE_BYTES.min(size - offset) as usize;
+        file.read_exact(&mut buffer[..length])?;
+        hasher.update(&buffer[..length]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+// SHA-256 of a whole file. Stops if `is_cancelled` turns true.
+fn full_hash_of(
+    file: &mut fs::File,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, FileCheckError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        if is_cancelled() {
+            return Err(FileCheckError::Cancelled);
+        }
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+        if count == 0 {
+            return Ok(hasher.finalize().to_vec());
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
+fn record_file_check_error(
+    summary: &mut ContentCheckSummary,
+    candidate: &ContentCandidate,
+    error: FileCheckError,
+) -> bool {
+    match error {
+        FileCheckError::Changed => summary.files_changed += 1,
+        FileCheckError::Unreadable(detail) => {
+            log_diagnostic(&format!(
+                "Content check couldn't read {} on {}: {detail}",
+                candidate.relative_path, candidate.drive_id
+            ));
+            summary.files_unreadable += 1;
+        }
+        FileCheckError::Cancelled => return true,
+    }
+    false
+}
+
+// Runs a content check on the connected drives. Each file's result is saved
+// as soon as it is known, so a cancel keeps everything checked before it.
+fn run_content_check(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+    report: &dyn Fn(&ContentCheckProgress),
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ContentCheckSummary, String> {
+    let Some(_lock) = try_lock_transfers(connection)? else {
+        return Err(CONTENT_CHECK_BUSY.to_string());
+    };
+    connection
+        .busy_timeout(TRANSFER_BUSY_TIMEOUT)
+        .map_err(|error| format!("Unable to configure the catalogue: {error}"))?;
+
+    // Checks of files no longer in the catalogue can never count again.
+    connection
+        .execute(
+            "DELETE FROM content_checks
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM files f
+                 WHERE f.drive_id = content_checks.drive_id
+                   AND f.relative_path = content_checks.relative_path
+             )",
+            [],
+        )
+        .map_err(|error| format!("Unable to tidy content checks: {error}"))?;
+
+    let mut summary = ContentCheckSummary::default();
+    let connected = |candidate: &ContentCandidate| {
+        connected_drives
+            .iter()
+            .any(|drive| drive.persistent_identifier.as_deref() == Some(&candidate.drive_id))
+    };
+    let mut last_report: Option<Instant> = None;
+    let mut progress = |stage: ContentCheckStage, files_done: usize, files_total: usize| {
+        let due = last_report.is_none_or(|at| at.elapsed() >= Duration::from_millis(150));
+        if due || files_done == files_total {
+            report(&ContentCheckProgress {
+                stage,
+                files_done,
+                files_total,
+            });
+            last_report = Some(Instant::now());
+        }
+    };
+
+    // Stage 2: samples.
+    let mut candidates = content_candidates(connection)?;
+    let to_sample: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.sample_hash.is_none() && connected(candidate))
+        .map(|(index, _)| index)
+        .collect();
+    progress(ContentCheckStage::Sampling, 0, to_sample.len());
+    for (done, &index) in to_sample.iter().enumerate() {
+        if is_cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let candidate = candidates[index].clone();
+        let sampled = (|| -> Result<Option<Vec<u8>>, FileCheckError> {
+            let Some(mut file) = open_candidate(&candidate, connected_drives)? else {
+                return Ok(None);
+            };
+            let hash = sample_hash_of(&mut file, candidate.size_bytes as u64)
+                .map_err(|error| FileCheckError::Unreadable(error.to_string()))?;
+            if !candidate_unchanged(&candidate, &file) {
+                return Err(FileCheckError::Changed);
+            }
+            Ok(Some(hash))
+        })();
+        match sampled {
+            Ok(Some(hash)) => {
+                connection
+                    .execute(
+                        "INSERT INTO content_checks (
+                            drive_id, relative_path, size_bytes, modified_at,
+                            sample_hash, full_hash, checked_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)
+                         ON CONFLICT(drive_id, relative_path) DO UPDATE SET
+                            size_bytes = excluded.size_bytes,
+                            modified_at = excluded.modified_at,
+                            sample_hash = excluded.sample_hash,
+                            full_hash = NULL,
+                            checked_at = excluded.checked_at",
+                        params![
+                            candidate.drive_id,
+                            candidate.relative_path,
+                            candidate.size_bytes,
+                            candidate.modified_at,
+                            hash,
+                            now_unix()
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to save a content check: {error}"))?;
+                candidates[index].sample_hash = Some(hash);
+                candidates[index].full_hash = None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if record_file_check_error(&mut summary, &candidate, error) {
+                    summary.cancelled = true;
+                    return Ok(summary);
+                }
+            }
+        }
+        progress(ContentCheckStage::Sampling, done + 1, to_sample.len());
+    }
+
+    // Stage 3: full contents, only where samples match another file's.
+    let mut sample_counts: HashMap<(i64, Vec<u8>), usize> = HashMap::new();
+    for candidate in &candidates {
+        if let Some(sample) = &candidate.sample_hash {
+            *sample_counts
+                .entry((candidate.size_bytes, sample.clone()))
+                .or_default() += 1;
+        }
+    }
+    let to_compare: Vec<&ContentCandidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.full_hash.is_none()
+                && connected(candidate)
+                && candidate.sample_hash.as_ref().is_some_and(|sample| {
+                    sample_counts
+                        .get(&(candidate.size_bytes, sample.clone()))
+                        .is_some_and(|count| *count > 1)
+                })
+        })
+        .collect();
+    progress(ContentCheckStage::Comparing, 0, to_compare.len());
+    for (done, candidate) in to_compare.iter().enumerate() {
+        if is_cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let hashed = (|| -> Result<Option<Vec<u8>>, FileCheckError> {
+            let Some(mut file) = open_candidate(candidate, connected_drives)? else {
+                return Ok(None);
+            };
+            let hash = full_hash_of(&mut file, is_cancelled)?;
+            if !candidate_unchanged(candidate, &file) {
+                return Err(FileCheckError::Changed);
+            }
+            Ok(Some(hash))
+        })();
+        match hashed {
+            Ok(Some(hash)) => {
+                // Only completes the sample this run relied on.
+                connection
+                    .execute(
+                        "UPDATE content_checks
+                         SET full_hash = ?1, checked_at = ?2
+                         WHERE drive_id = ?3
+                           AND relative_path = ?4
+                           AND size_bytes = ?5
+                           AND modified_at IS ?6
+                           AND sample_hash = ?7",
+                        params![
+                            hash,
+                            now_unix(),
+                            candidate.drive_id,
+                            candidate.relative_path,
+                            candidate.size_bytes,
+                            candidate.modified_at,
+                            candidate.sample_hash
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to save a content check: {error}"))?;
+                summary.files_checked += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if record_file_check_error(&mut summary, candidate, error) {
+                    summary.cancelled = true;
+                    return Ok(summary);
+                }
+            }
+        }
+        progress(ContentCheckStage::Comparing, done + 1, to_compare.len());
+    }
+
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn estimate_content_check(
+    app: tauri::AppHandle,
+) -> Result<Vec<ContentCheckEstimate>, String> {
+    run_command("estimate the content check", move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        estimate_content_check_for(&connection, &drives)
     })
     .await
 }
 
 #[tauri::command]
+async fn check_duplicate_contents(
+    app: tauri::AppHandle,
+    run_id: u64,
+) -> Result<ContentCheckSummary, String> {
+    run_command("check duplicate contents", move || {
+        let drives = external_drives()?;
+        let connection = open_database(&database_path(&app)?)?;
+        run_content_check(
+            &connection,
+            &drives,
+            &|progress| {
+                let _ = app.emit("duplicate-check-progress", progress);
+            },
+            &|| content_check_run_cancelled(run_id),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+fn cancel_duplicate_check(run_id: u64) {
+    request_content_check_cancel(run_id);
+}
+
+#[tauri::command]
 async fn largest_files(app: tauri::AppHandle) -> Result<Vec<LargestFile>, String> {
-    run_blocking(move || {
+    run_command("list the largest files", move || {
         let connection = open_database(&database_path(&app)?)?;
 
         let mut statement = connection
@@ -3294,16 +4517,14 @@ fn validate_catalogue_relative_path(path: &str) -> Result<(), String> {
             .split('/')
             .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
-        return Err(
-            "Planned paths must be relative paths without empty, '.' or '..' folders.".to_string(),
-        );
+        return Err("Folder names can't be empty, “.” or “..”. Choose another folder.".to_string());
     }
     Ok(())
 }
 
 #[tauri::command]
 async fn list_locations(app: tauri::AppHandle) -> Result<Vec<Location>, String> {
-    run_blocking(move || {
+    run_command("load your locations", move || {
         let connection = open_database(&database_path(&app)?)?;
         let mut statement = connection
             .prepare(
@@ -3339,7 +4560,7 @@ async fn set_drive_label(
     persistent_identifier: String,
     label: String,
 ) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("save the label", move || {
         let trimmed = label.trim();
 
         // Counted in UTF-16 units, as the label field's maxLength counts them,
@@ -3360,7 +4581,10 @@ async fn set_drive_label(
             .map_err(|error| format!("Unable to save drive label: {error}"))?;
 
         if changed == 0 {
-            return Err("That drive is not in the Media Mapper catalogue.".to_string());
+            return Err(
+                "That drive is no longer in Media Mapper. Scan it again, then add the label."
+                    .to_string(),
+            );
         }
 
         Ok(())
@@ -3380,18 +4604,18 @@ async fn add_local_folder_location(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<Location, String> {
-    run_blocking(move || {
+    run_command("add that folder", move || {
         let candidate = PathBuf::from(path.trim());
 
         if !candidate.is_absolute() {
-            return Err("The selected folder must have an absolute path.".to_string());
+            return Err("Choose a folder on this Mac.".to_string());
         }
 
         let metadata = fs::metadata(&candidate)
             .map_err(|error| format!("Unable to inspect selected folder: {error}"))?;
 
         if !metadata.is_dir() {
-            return Err("The selected location is not a folder.".to_string());
+            return Err("That isn't a folder. Choose a folder on this Mac.".to_string());
         }
 
         let canonical = fs::canonicalize(&candidate)
@@ -3500,14 +4724,14 @@ fn plan_move(
             params![destination_location_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(|_| "The destination location is not available in Media Mapper.".to_string())?;
+        .map_err(|_| {
+            "That destination is no longer in Media Mapper. Choose another location.".to_string()
+        })?;
 
     let same_drive = destination_drive_id.as_deref() == Some(source_drive_id);
 
     if same_drive && source_relative_path == destination_relative_path {
-        return Err(
-            "The planned destination is the same as the current catalogue location.".to_string(),
-        );
+        return Err("That's where it already is. Choose a different destination.".to_string());
     }
 
     let source_is_directory = match transaction.query_row(
@@ -3519,7 +4743,10 @@ fn plan_move(
     ) {
         Ok(value) => value != 0,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Err("The source item is not present in the catalogue.".to_string());
+            return Err(
+                "That item is no longer in the catalogue. Rescan its drive, then try again."
+                    .to_string(),
+            );
         }
         Err(error) => {
             return Err(format!("Unable to validate planned move source: {error}"));
@@ -3532,7 +4759,9 @@ fn plan_move(
             .to_lowercase()
             .starts_with(&format!("{}/", source_relative_path.to_lowercase()))
     {
-        return Err("A folder cannot be planned inside itself.".to_string());
+        return Err(
+            "A folder can't be planned inside itself. Choose a different destination.".to_string(),
+        );
     }
 
     // Planning must not silently target a location that is already occupied.
@@ -3580,7 +4809,7 @@ fn plan_move(
 
             if fs::symlink_metadata(Path::new(local_path).join(destination_relative_path)).is_ok() {
                 return Err(
-                    "That destination already exists in the folder on this Mac.".to_string()
+                    "There's already a file with that name in that folder on this Mac. Media Mapper never replaces existing files, so choose another destination.".to_string()
                 );
             }
         }
@@ -3612,7 +4841,10 @@ fn plan_move(
         .map_err(|error| format!("Unable to check planned destination conflicts: {error}"))?;
 
     if destination_already_planned {
-        return Err("Another planned move already uses that destination.".to_string());
+        return Err(
+            "Another planned file is already going to that destination. Choose a different folder."
+                .to_string(),
+        );
     }
 
     transaction
@@ -3661,7 +4893,7 @@ async fn create_planned_move(
     destination_location_id: String,
     destination_relative_path: String,
 ) -> Result<i64, String> {
-    run_blocking(move || {
+    run_command("add this to the plan", move || {
         let mut connection = open_database(&database_path(&app)?)?;
         plan_move(
             &mut connection,
@@ -3676,7 +4908,7 @@ async fn create_planned_move(
 
 #[tauri::command]
 async fn list_planned_moves(app: tauri::AppHandle) -> Result<Vec<PlannedMove>, String> {
-    run_blocking(move || {
+    run_command("load the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         let mut statement = connection
             .prepare(
@@ -3796,8 +5028,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "missing_destination".to_string(),
                 message: format!(
-                    "The destination for planned move {} is no longer available.",
-                    planned.id
+                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    file_name_of(&planned.source_relative_path)
                 ),
                 move_id: Some(planned.id),
                 location_id: None,
@@ -3839,8 +5071,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "missing_source".to_string(),
                 message: format!(
-                    "{} is no longer present in the catalogue.",
-                    planned.source_relative_path
+                    "{} is no longer in the catalogue. Rescan its drive, or remove it from the plan.",
+                    file_name_of(&planned.source_relative_path)
                 ),
                 move_id: Some(planned.id),
                 location_id: None,
@@ -3863,7 +5095,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "overlapping_source".to_string(),
                 message: format!(
-                    "{} overlaps another planned source. Its files are counted only once.",
+                    "{} overlaps another planned item. Its files are counted only once.",
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
@@ -3942,7 +5174,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
             issues.push(PlanPreflightIssue {
                 code: "unknown_source_size".to_string(),
                 message: format!(
-                    "{} contains files whose size is unknown.",
+                    "{} contains files whose size is unknown. Rescan its drive to measure them.",
                     planned.source_relative_path
                 ),
                 move_id: Some(planned.id),
@@ -3965,7 +5197,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     issues.push(PlanPreflightIssue {
                         code: "insufficient_capacity".to_string(),
                         message: format!(
-                            "{display_name} does not have enough catalogued free space for the known planned data."
+                            "{display_name} didn't have enough free space for the planned files at its last scan. Free some space there, or plan fewer files."
                         ),
                         move_id: None,
                         location_id: Some(location_id.clone()),
@@ -4032,6 +5264,11 @@ fn parse_df_available(text: &str) -> Option<u64> {
 // A validation message naming a destination as the user knows it, never by
 // its path or location id, such as "The destination “Backup” is not
 // currently connected." Without a usable name the destination goes unnamed.
+// The last part of a catalogue path. Messages name the file, not its path.
+fn file_name_of(relative_path: &str) -> &str {
+    relative_path.rsplit('/').next().unwrap_or(relative_path)
+}
+
 fn destination_message(subject: &str, name: Option<&str>, problem: &str) -> String {
     match name {
         Some(name) if !name.is_empty() => format!("{subject} “{name}” {problem}"),
@@ -4087,7 +5324,7 @@ fn validate_plan_live(
         move_id,
         source_drive_id,
         source_relative_path,
-        destination_location_id,
+        _destination_location_id,
         destination_kind,
         destination_drive_id,
         destination_local_path,
@@ -4098,8 +5335,8 @@ fn validate_plan_live(
             None => issues.push(PlanPreflightIssue {
                 code: "source_drive_offline".to_string(),
                 message: format!(
-                    "The source drive for {} is not connected.",
-                    source_relative_path
+                    "The drive that holds {} isn't connected.",
+                    file_name_of(&source_relative_path)
                 ),
                 move_id: Some(move_id),
                 location_id: None,
@@ -4112,8 +5349,8 @@ fn validate_plan_live(
                         issues.push(PlanPreflightIssue {
                             code: "source_missing_on_disk".to_string(),
                             message: format!(
-                                "{} is in the catalogue but is not currently present on the connected source drive.",
-                                source_relative_path
+                                "{} is in the catalogue but no longer on the source drive. Rescan the drive, or remove it from the plan.",
+                                file_name_of(&source_relative_path)
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4123,8 +5360,8 @@ fn validate_plan_live(
                         issues.push(PlanPreflightIssue {
                             code: "source_unreadable_on_disk".to_string(),
                             message: format!(
-                                "{} cannot currently be checked on the source drive.",
-                                source_relative_path
+                                "Media Mapper can't check {} on the source drive right now. Make sure the drive is connected and readable.",
+                                file_name_of(&source_relative_path)
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4162,8 +5399,8 @@ fn validate_plan_live(
                                 issues.push(PlanPreflightIssue {
                                     code: "source_type_changed".to_string(),
                                     message: format!(
-                                        "{} has changed type since it was catalogued.",
-                                        source_relative_path
+                                        "{} has changed type since it was catalogued. Rescan the source drive before copying.",
+                                        file_name_of(&source_relative_path)
                                     ),
                                     move_id: Some(move_id),
                                     location_id: None,
@@ -4179,8 +5416,8 @@ fn validate_plan_live(
                                     issues.push(PlanPreflightIssue {
                                         code: "source_changed".to_string(),
                                         message: format!(
-                                            "{} has changed since it was catalogued. Rescan the source drive before transferring.",
-                                            source_relative_path
+                                            "{} has changed since it was catalogued. Rescan the source drive before copying.",
+                                            file_name_of(&source_relative_path)
                                         ),
                                         move_id: Some(move_id),
                                         location_id: None,
@@ -4223,8 +5460,8 @@ fn validate_plan_live(
                 Ok(_) => issues.push(PlanPreflightIssue {
                     code: "destination_exists".to_string(),
                     message: format!(
-                        "{} already exists at the planned destination.",
-                        relative_path
+                        "{} already exists at the planned destination. Media Mapper never replaces existing files, so remove it from the plan or choose another destination.",
+                        file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4233,8 +5470,8 @@ fn validate_plan_live(
                 Err(_) => issues.push(PlanPreflightIssue {
                     code: "destination_unreadable".to_string(),
                     message: format!(
-                        "Media Mapper cannot confirm whether {} is clear at the planned destination.",
-                        relative_path
+                        "Media Mapper can't check whether {} is free at the destination. Make sure the destination is connected and readable.",
+                        file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4254,7 +5491,7 @@ fn validate_plan_live(
                         message: destination_message(
                             "The destination",
                             destination_name.as_deref(),
-                            "is not currently connected.",
+                            "isn't connected. Connect it to copy.",
                         ),
                         move_id: Some(move_id),
                         location_id: None,
@@ -4270,7 +5507,7 @@ fn validate_plan_live(
                             message: destination_message(
                                 "The destination folder",
                                 destination_name.as_deref(),
-                                "is no longer available.",
+                                "is no longer available. Check that it still exists, or choose another destination.",
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4281,7 +5518,7 @@ fn validate_plan_live(
                             message: destination_message(
                                 "The destination",
                                 destination_name.as_deref(),
-                                "is no longer a folder.",
+                                "is no longer a folder. Choose another destination.",
                             ),
                             move_id: Some(move_id),
                             location_id: None,
@@ -4290,7 +5527,7 @@ fn validate_plan_live(
                 }
                 None => issues.push(PlanPreflightIssue {
                     code: "destination_folder_missing".to_string(),
-                    message: "The planned local destination no longer has a folder path."
+                    message: "The folder on this Mac chosen for these files is no longer set. Remove them from the plan, then add them again."
                         .to_string(),
                     move_id: Some(move_id),
                     location_id: None,
@@ -4299,8 +5536,8 @@ fn validate_plan_live(
             _ => issues.push(PlanPreflightIssue {
                 code: "destination_missing".to_string(),
                 message: format!(
-                    "Destination {} is no longer available.",
-                    destination_location_id
+                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    file_name_of(&source_relative_path)
                 ),
                 move_id: Some(move_id),
                 location_id: None,
@@ -4386,7 +5623,7 @@ fn validate_plan_live(
 
 #[tauri::command]
 async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, String> {
-    run_blocking(move || {
+    run_command("check the plan", move || {
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
         validate_plan_live(&connection, &drives)
@@ -4396,9 +5633,15 @@ async fn validate_plan(app: tauri::AppHandle) -> Result<PlanLiveValidation, Stri
 
 #[tauri::command]
 async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, String> {
-    run_blocking(move || {
+    run_command("load transfer history", move || {
         let connection = open_database(&database_path(&app)?)?;
-        list_transfer_records(&connection)
+        let mut records = list_transfer_records(&connection)?;
+        for record in &mut records {
+            if let Some(error) = &record.error_message {
+                record.error_message = Some(present_transfer_error(error));
+            }
+        }
+        Ok(records)
     })
     .await
 }
@@ -4407,11 +5650,9 @@ async fn list_transfers(app: tauri::AppHandle) -> Result<Vec<TransferRecord>, St
 async fn execute_planned_move(
     app: tauri::AppHandle,
     planned_move_id: i64,
+    run_id: u64,
 ) -> Result<TransferRecord, String> {
-    // A cancel requested before this copy began belongs to an earlier one.
-    TRANSFER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-
-    run_blocking(move || {
+    run_command("copy the file", move || {
         // Discover the physical drives immediately before execution. This is
         // deliberately inside the blocking worker because diskutil and file
         // verification must never block the window thread.
@@ -4425,7 +5666,7 @@ async fn execute_planned_move(
             &|progress| {
                 let _ = app.emit("transfer-progress", progress);
             },
-            &|| TRANSFER_CANCEL_REQUESTED.load(Ordering::SeqCst),
+            &|| transfer_run_cancelled(run_id),
         )
     })
     .await
@@ -4433,7 +5674,7 @@ async fn execute_planned_move(
 
 #[tauri::command]
 async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
-    run_blocking(move || {
+    run_command("check the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         plan_preflight(&connection)
     })
@@ -4477,7 +5718,7 @@ async fn list_planned_folder_entries(
     destination_location_id: String,
     parent_path: String,
 ) -> Result<Vec<PlannedFolderEntry>, String> {
-    run_blocking(move || {
+    run_command("show the planned organisation", move || {
         if !parent_path.is_empty() {
             validate_catalogue_relative_path(&parent_path)?;
         }
@@ -4665,13 +5906,13 @@ async fn list_planned_folder_entries(
 
 #[tauri::command]
 async fn remove_planned_move(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("remove this from the plan", move || {
         let connection = open_database(&database_path(&app)?)?;
         let changed = connection
             .execute("DELETE FROM planned_moves WHERE id = ?1", params![id])
             .map_err(|error| format!("Unable to remove planned move: {error}"))?;
         if changed == 0 {
-            return Err("That planned move no longer exists.".to_string());
+            return Err("That item is no longer in the plan.".to_string());
         }
         Ok(())
     })
@@ -4684,7 +5925,7 @@ async fn open_catalogued_file(
     drive_id: String,
     relative_path: String,
 ) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("open the file", move || {
         validate_catalogue_relative_path(&relative_path)?;
 
         let connection = open_database(&database_path(&app)?)?;
@@ -4699,8 +5940,13 @@ async fn open_catalogued_file(
 
         match is_directory {
             Some(0) => {}
-            Some(_) => return Err("That catalogue entry is a folder.".to_string()),
-            None => return Err("That file is no longer in the catalogue.".to_string()),
+            Some(_) => return Err("That's a folder, not a file.".to_string()),
+            None => {
+                return Err(
+                    "That file is no longer in the catalogue. Rescan its drive to update the catalogue."
+                        .to_string(),
+                )
+            }
         }
 
         let drives = external_drives()?;
@@ -4717,7 +5963,7 @@ async fn open_catalogued_file(
         let output = std::process::Command::new("/usr/bin/open")
             .arg(&path)
             .output()
-            .map_err(|_| "Unable to ask macOS to open the file.".to_string())?;
+            .map_err(|_| "macOS couldn't open the file. Try opening it from Finder.".to_string())?;
         if !output.status.success() {
             return Err(open_failure_message(&String::from_utf8_lossy(
                 &output.stderr,
@@ -4733,8 +5979,9 @@ async fn open_catalogued_file(
 // symlinks and requiring the result to stay on the drive means a link inside
 // the catalogue cannot hand the opener a file somewhere else.
 fn resolve_catalogued_file(mount_point: &Path, relative_path: &str) -> Result<PathBuf, String> {
-    let unavailable =
-        || "The file is not currently available at its catalogued location.".to_string();
+    let unavailable = || {
+        "The file isn't where the catalogue says. It may have been moved or deleted since the last scan. Rescan the drive to update the catalogue.".to_string()
+    };
     let mount = fs::canonicalize(mount_point).map_err(|_| unavailable())?;
     let path = fs::canonicalize(mount.join(relative_path)).map_err(|_| unavailable())?;
     if !path.starts_with(&mount) {
@@ -4822,7 +6069,7 @@ fn completed_transfer_file(
 
 #[tauri::command]
 async fn reveal_transferred_file(app: tauri::AppHandle, transfer_id: i64) -> Result<(), String> {
-    run_blocking(move || {
+    run_command("show the file in Finder", move || {
         let drives = external_drives()?;
         let connection = open_database(&database_path(&app)?)?;
         let path = completed_transfer_file(&connection, transfer_id, &drives)?;
@@ -4832,7 +6079,7 @@ async fn reveal_transferred_file(app: tauri::AppHandle, transfer_id: i64) -> Res
             .arg("-R")
             .arg(&path)
             .spawn()
-            .map_err(|_| "Unable to show the file in Finder.".to_string())?;
+            .map_err(|_| "Finder couldn't show the file. It may have been moved or renamed since it was copied.".to_string())?;
 
         Ok(())
     })
@@ -4844,14 +6091,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            if let Ok(directory) = app.path().app_log_dir() {
+                if fs::create_dir_all(&directory).is_ok() {
+                    let _ = LOG_FILE.set(directory.join("media-mapper.log"));
+                }
+            }
+
             // A failure here must not stop the app from opening. Commands
             // open the database themselves and will report the same error.
             if let Err(error) = initialise_database(app.handle()) {
-                eprintln!("Media Mapper database initialisation failed: {error}");
+                log_diagnostic(&format!("Catalogue initialisation failed: {error}"));
             }
 
             if let Err(error) = recover_transfers_at_startup(app.handle()) {
-                eprintln!("Media Mapper transfer recovery failed: {error}");
+                log_diagnostic(&format!("Transfer recovery failed: {error}"));
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -4870,7 +6123,10 @@ pub fn run() {
             search_catalogue,
             search_all_catalogues,
             largest_files,
-            probable_duplicates,
+            list_duplicates,
+            estimate_content_check,
+            check_duplicate_contents,
+            cancel_duplicate_check,
             list_locations,
             set_drive_label,
             add_local_folder_location,
@@ -4908,10 +6164,12 @@ mod tests {
         }
 
         fn remove_files(&self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = self.0.clone().into_os_string();
-                file.push(suffix);
-                let _ = fs::remove_file(file);
+            for path in [self.0.clone(), schema_backup_path(&self.0)] {
+                for suffix in ["", "-wal", "-shm"] {
+                    let mut file = path.clone().into_os_string();
+                    file.push(suffix);
+                    let _ = fs::remove_file(file);
+                }
             }
         }
     }
@@ -5216,6 +6474,892 @@ mod tests {
         assert_planned_moves_migrated(&database.0);
     }
 
+    // Catalogues as each historical build left them on disk. Each is the
+    // schema that build created for a new catalogue, with the same data, so
+    // every upgrade path to the current schema is exercised.
+    //
+    // 6e7d838: the first catalogue. No summary totals or parent paths.
+    const FIXTURE_6E7D838: &str = "
+        PRAGMA journal_mode = WAL;
+
+        CREATE TABLE drives (
+            persistent_identifier TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            filesystem TEXT,
+            total_bytes INTEGER,
+            available_bytes INTEGER,
+            last_mount_point TEXT,
+            last_seen_at INTEGER NOT NULL,
+            last_scanned_at INTEGER
+        );
+
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            is_directory INTEGER NOT NULL,
+            size_bytes INTEGER,
+            modified_at INTEGER,
+            UNIQUE(drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_files_drive_path ON files(drive_id, relative_path);
+
+        INSERT INTO drives VALUES
+            ('UUID-A', 'Source', 'apfs', 500000000000, 200000000000, '/Volumes/Source', 900, 1000),
+            ('UUID-B', 'Archive', 'exfat', 2000000000000, 1500000000000, '/Volumes/Archive', 1900, 2000);
+
+        INSERT INTO files (drive_id, relative_path, name, is_directory, size_bytes, modified_at) VALUES
+            ('UUID-A', 'Films', 'Films', 1, NULL, 10),
+            ('UUID-A', 'Films/Été 2024', 'Été 2024', 1, NULL, 20),
+            ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov', 0, 100, 50),
+            ('UUID-A', 'notes.txt', 'notes.txt', 0, 7, 60),
+            ('UUID-B', 'Backup', 'Backup', 1, NULL, 70);
+    ";
+
+    // a66b9e3: summary totals on drives and parent paths on files, with the
+    // name and parent indexes.
+    const FIXTURE_A66B9E3: &str = "
+        PRAGMA journal_mode = WAL;
+
+        CREATE TABLE drives (
+            persistent_identifier TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            filesystem TEXT,
+            total_bytes INTEGER,
+            available_bytes INTEGER,
+            last_mount_point TEXT,
+            last_seen_at INTEGER NOT NULL,
+            last_scanned_at INTEGER,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            directory_count INTEGER NOT NULL DEFAULT 0,
+            catalogued_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent_path TEXT NOT NULL DEFAULT '',
+            is_directory INTEGER NOT NULL,
+            size_bytes INTEGER,
+            modified_at INTEGER,
+            UNIQUE(drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_files_drive_path ON files(drive_id, relative_path);
+        CREATE INDEX idx_files_drive_name ON files(drive_id, name COLLATE NOCASE);
+        CREATE INDEX idx_files_drive_parent ON files(drive_id, parent_path);
+
+        INSERT INTO drives VALUES
+            ('UUID-A', 'Source', 'apfs', 500000000000, 200000000000, '/Volumes/Source', 900, 1000, 2, 2, 107),
+            ('UUID-B', 'Archive', 'exfat', 2000000000000, 1500000000000, '/Volumes/Archive', 1900, 2000, 0, 1, 0);
+
+        INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at) VALUES
+            ('UUID-A', 'Films', 'Films', '', 1, NULL, 10),
+            ('UUID-A', 'Films/Été 2024', 'Été 2024', 'Films', 1, NULL, 20),
+            ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov', 'Films/Été 2024', 0, 100, 50),
+            ('UUID-A', 'notes.txt', 'notes.txt', '', 0, 7, 60),
+            ('UUID-B', 'Backup', 'Backup', '', 1, NULL, 70);
+    ";
+
+    // 7b80a78: planned moves pointing straight at a destination drive.
+    const FIXTURE_7B80A78_PLAN: &str = "
+        CREATE TABLE planned_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_drive_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(source_drive_id, source_relative_path),
+            FOREIGN KEY(source_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            FOREIGN KEY(destination_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_planned_moves_destination
+            ON planned_moves(destination_drive_id, destination_relative_path);
+
+        INSERT INTO planned_moves VALUES
+            (7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'UUID-B', 'Video/Café clip.mov', 123);
+    ";
+
+    // c77c108: a locations table, without user labels, beside the
+    // drive-based planned moves.
+    const FIXTURE_C77C108_LOCATIONS: &str = "
+        CREATE TABLE locations (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('external_drive', 'local_folder')),
+            display_name TEXT NOT NULL,
+            drive_id TEXT,
+            local_path TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            CHECK(
+                (kind = 'external_drive' AND drive_id IS NOT NULL AND local_path IS NULL)
+                OR
+                (kind = 'local_folder' AND drive_id IS NULL AND local_path IS NOT NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX idx_locations_drive ON locations(drive_id) WHERE drive_id IS NOT NULL;
+        CREATE UNIQUE INDEX idx_locations_local_path ON locations(local_path) WHERE local_path IS NOT NULL;
+
+        INSERT INTO locations VALUES
+            ('drive:UUID-A', 'external_drive', 'Source', 'UUID-A', NULL, 0),
+            ('drive:UUID-B', 'external_drive', 'Archive', 'UUID-B', NULL, 0);
+    ";
+
+    // e46eacb: planned moves point at locations, which can be folders on
+    // this Mac.
+    const FIXTURE_E46EACB_PLAN: &str = "
+        INSERT INTO locations VALUES
+            ('local:Exports', 'local_folder', 'Exports', NULL, '/Users/test/Exports', 5);
+
+        CREATE TABLE planned_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_location_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(source_drive_id, source_relative_path),
+            FOREIGN KEY(source_drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE,
+            FOREIGN KEY(destination_location_id) REFERENCES locations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_planned_moves_destination
+            ON planned_moves(destination_location_id, destination_relative_path);
+
+        INSERT INTO planned_moves VALUES
+            (7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 123),
+            (8, 'UUID-A', 'notes.txt', 'local:Exports', 'notes.txt', 124);
+    ";
+
+    // 5a6f81a: user labels on locations.
+    const FIXTURE_5A6F81A_LABELS: &str = "
+        ALTER TABLE locations ADD COLUMN user_label TEXT;
+        UPDATE locations SET user_label = 'Mars' WHERE id = 'drive:UUID-B';
+    ";
+
+    // 759b5aa: unreadable folders recorded by scans.
+    const FIXTURE_759B5AA_UNREADABLE: &str = "
+        ALTER TABLE drives ADD COLUMN unreadable_folder_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE files ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0;
+        UPDATE files SET unreadable = 1 WHERE relative_path = 'Backup';
+        UPDATE drives SET unreadable_folder_count = 1 WHERE persistent_identifier = 'UUID-B';
+    ";
+
+    // a180b23 to 66426ad (main before schema versions): transfer history.
+    // It holds every outcome history can show, including a cancel and a
+    // record left `verifying` by a crash.
+    const FIXTURE_66426AD_TRANSFERS: &str = "
+        CREATE TABLE transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            planned_move_id INTEGER,
+            source_drive_id TEXT NOT NULL,
+            source_relative_path TEXT NOT NULL,
+            destination_location_id TEXT NOT NULL,
+            destination_relative_path TEXT NOT NULL,
+            total_bytes INTEGER,
+            copied_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL
+                CHECK(status IN ('pending', 'copying', 'verifying', 'completed', 'failed')),
+            error_message TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER
+        );
+
+        CREATE INDEX idx_transfers_status ON transfers(status);
+        CREATE INDEX idx_transfers_created ON transfers(created_at);
+
+        INSERT INTO transfers VALUES
+            (1, 3, 'UUID-A', 'old.mov', 'drive:UUID-B', 'old.mov', 9, 9, 'completed', NULL, 300, 301, 302),
+            (2, 7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 100, 40, 'failed', 'Copy cancelled.', 400, 401, 402),
+            (3, 7, 'UUID-A', 'Films/Été 2024/Café clip.mov', 'drive:UUID-B', 'Video/Café clip.mov', 100, 100, 'verifying', NULL, 500, 501, NULL);
+    ";
+
+    // What a catalogue held at each historical build, so the checks know
+    // what must have survived.
+    #[derive(Clone, Copy)]
+    struct Holds {
+        planned_moves: bool,
+        local_folder: bool,
+        labels: bool,
+        unreadable: bool,
+        transfers: bool,
+    }
+
+    fn historical_fixtures() -> Vec<(&'static str, String, Holds)> {
+        let nothing = Holds {
+            planned_moves: false,
+            local_folder: false,
+            labels: false,
+            unreadable: false,
+            transfers: false,
+        };
+        let e46eacb = format!("{FIXTURE_A66B9E3}{FIXTURE_C77C108_LOCATIONS}{FIXTURE_E46EACB_PLAN}");
+        let labels = format!("{e46eacb}{FIXTURE_5A6F81A_LABELS}");
+        let unreadable = format!("{labels}{FIXTURE_759B5AA_UNREADABLE}");
+        let main = format!("{unreadable}{FIXTURE_66426AD_TRANSFERS}");
+        let with_plan = Holds {
+            planned_moves: true,
+            ..nothing
+        };
+        let with_local = Holds {
+            local_folder: true,
+            ..with_plan
+        };
+        let with_labels = Holds {
+            labels: true,
+            ..with_local
+        };
+        let with_unreadable = Holds {
+            unreadable: true,
+            ..with_labels
+        };
+        vec![
+            ("6e7d838", FIXTURE_6E7D838.to_string(), nothing),
+            ("a66b9e3", FIXTURE_A66B9E3.to_string(), nothing),
+            (
+                "7b80a78",
+                format!("{FIXTURE_A66B9E3}{FIXTURE_7B80A78_PLAN}"),
+                with_plan,
+            ),
+            (
+                "c77c108",
+                format!("{FIXTURE_A66B9E3}{FIXTURE_7B80A78_PLAN}{FIXTURE_C77C108_LOCATIONS}"),
+                with_plan,
+            ),
+            ("e46eacb", e46eacb, with_local),
+            ("5a6f81a", labels, with_labels),
+            ("759b5aa", unreadable, with_unreadable),
+            (
+                "66426ad",
+                main.clone(),
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
+            // Version 1 is the 66426ad schema with its version stamped.
+            (
+                "ed3f730 (version 1)",
+                format!("{main}PRAGMA user_version = 1;"),
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
+        ]
+    }
+
+    fn create_fixture(path: &Path, sql: &str) {
+        Connection::open(path).unwrap().execute_batch(sql).unwrap();
+    }
+
+    // What a launch does to the catalogue: `initialise_database` upgrades
+    // it, then gives every drive a location.
+    fn launch(path: &Path) -> Result<Connection, String> {
+        let connection = open_database(path)?;
+        sync_drive_locations(&connection)?;
+        Ok(connection)
+    }
+
+    // Each table's columns as (name, type, not null, default, primary key),
+    // and the catalogue's indexes. Column order is left out: columns added
+    // by ALTER TABLE come last, which no query depends on.
+    fn schema_shape(connection: &Connection) -> (Vec<(String, Vec<String>)>, Vec<String>) {
+        let tables: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let columns = tables
+            .into_iter()
+            .map(|table| {
+                let mut columns: Vec<String> = connection
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "{} {} notnull={} default={:?} pk={}",
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                columns.sort();
+                (table, columns)
+            })
+            .collect();
+        let indexes = connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (columns, indexes)
+    }
+
+    fn assert_catalogue_survived(connection: &Connection, holds: Holds, fixture: &str) {
+        let context = format!("upgrading the {fixture} catalogue");
+
+        // Drives: identity, names, capacity, last mount point, scan times and
+        // totals.
+        let drives: Vec<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        )> = connection
+            .prepare(
+                "SELECT persistent_identifier, name, filesystem, total_bytes,
+                            available_bytes, last_mount_point, last_seen_at,
+                            last_scanned_at, file_count, directory_count,
+                            catalogued_bytes, unreadable_folder_count
+                     FROM drives ORDER BY persistent_identifier",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let archive_unreadable = i64::from(holds.unreadable);
+        assert_eq!(
+            drives,
+            [
+                (
+                    "UUID-A".to_string(),
+                    "Source".to_string(),
+                    "apfs".to_string(),
+                    500_000_000_000,
+                    200_000_000_000,
+                    "/Volumes/Source".to_string(),
+                    900,
+                    1000,
+                    2,
+                    2,
+                    107,
+                    0
+                ),
+                (
+                    "UUID-B".to_string(),
+                    "Archive".to_string(),
+                    "exfat".to_string(),
+                    2_000_000_000_000,
+                    1_500_000_000_000,
+                    "/Volumes/Archive".to_string(),
+                    1900,
+                    2000,
+                    0,
+                    1,
+                    0,
+                    archive_unreadable
+                ),
+            ],
+            "{context}"
+        );
+
+        // The same view the Drives screen reads.
+        let catalogued = catalogued_drives(connection).unwrap();
+        let source = catalogued
+            .iter()
+            .find(|drive| drive.persistent_identifier == "UUID-A")
+            .unwrap();
+        assert_eq!(source.last_scanned_at, Some(1000), "{context}");
+        assert_eq!(source.last_connected_at, Some(900), "{context}");
+
+        // Every catalogue entry, with exact names and parent folders.
+        let files: Vec<(String, String, String, String, bool, Option<i64>, i64, bool)> = connection
+            .prepare(
+                "SELECT drive_id, relative_path, name, parent_path, is_directory,
+                        size_bytes, modified_at, unreadable
+                 FROM files ORDER BY drive_id, relative_path",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let entry = |drive: &str,
+                     path: &str,
+                     name: &str,
+                     parent: &str,
+                     folder: bool,
+                     size: Option<i64>,
+                     modified: i64,
+                     unreadable: bool| {
+            (
+                drive.to_string(),
+                path.to_string(),
+                name.to_string(),
+                parent.to_string(),
+                folder,
+                size,
+                modified,
+                unreadable,
+            )
+        };
+        assert_eq!(
+            files,
+            [
+                entry("UUID-A", "Films", "Films", "", true, None, 10, false),
+                entry(
+                    "UUID-A",
+                    "Films/Été 2024",
+                    "Été 2024",
+                    "Films",
+                    true,
+                    None,
+                    20,
+                    false
+                ),
+                entry(
+                    "UUID-A",
+                    "Films/Été 2024/Café clip.mov",
+                    "Café clip.mov",
+                    "Films/Été 2024",
+                    false,
+                    Some(100),
+                    50,
+                    false
+                ),
+                entry(
+                    "UUID-A",
+                    "notes.txt",
+                    "notes.txt",
+                    "",
+                    false,
+                    Some(7),
+                    60,
+                    false
+                ),
+                entry(
+                    "UUID-B",
+                    "Backup",
+                    "Backup",
+                    "",
+                    true,
+                    None,
+                    70,
+                    holds.unreadable
+                ),
+            ],
+            "{context}"
+        );
+
+        // Locations: one per drive, plus any folder on this Mac, with labels.
+        let locations: Vec<(String, String, Option<String>, Option<String>)> = connection
+            .prepare("SELECT id, display_name, user_label, local_path FROM locations ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_locations = vec![
+            ("drive:UUID-A".to_string(), "Source".to_string(), None, None),
+            (
+                "drive:UUID-B".to_string(),
+                "Archive".to_string(),
+                holds.labels.then(|| "Mars".to_string()),
+                None,
+            ),
+        ];
+        if holds.local_folder {
+            expected_locations.push((
+                "local:Exports".to_string(),
+                "Exports".to_string(),
+                None,
+                Some("/Users/test/Exports".to_string()),
+            ));
+        }
+        assert_eq!(locations, expected_locations, "{context}");
+
+        // Planned moves keep their ids, sources, destinations and dates.
+        let plans: Vec<(i64, String, String, String, String, i64)> = connection
+            .prepare(
+                "SELECT id, source_drive_id, source_relative_path,
+                        destination_location_id, destination_relative_path, created_at
+                 FROM planned_moves ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_plans = Vec::new();
+        if holds.planned_moves {
+            expected_plans.push((
+                7,
+                "UUID-A".to_string(),
+                "Films/Été 2024/Café clip.mov".to_string(),
+                "drive:UUID-B".to_string(),
+                "Video/Café clip.mov".to_string(),
+                123,
+            ));
+        }
+        if holds.local_folder {
+            expected_plans.push((
+                8,
+                "UUID-A".to_string(),
+                "notes.txt".to_string(),
+                "local:Exports".to_string(),
+                "notes.txt".to_string(),
+                124,
+            ));
+        }
+        assert_eq!(plans, expected_plans, "{context}");
+        // The plan is readable the way the Plan screen reads it.
+        assert_eq!(
+            plan_preflight(connection).unwrap().move_count,
+            expected_plans.len() as i64,
+            "{context}"
+        );
+
+        // Transfer history is kept exactly, including unfinished records,
+        // which recovery (not migration) resolves.
+        let transfers: Vec<(i64, String, Option<String>)> = list_transfer_records(connection)
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.id, record.status, record.error_message))
+            .collect();
+        let mut expected_transfers = Vec::new();
+        if holds.transfers {
+            expected_transfers = vec![
+                (3, "verifying".to_string(), None),
+                (2, "failed".to_string(), Some("Copy cancelled.".to_string())),
+                (1, "completed".to_string(), None),
+            ];
+        }
+        let mut sorted = transfers.clone();
+        sorted.sort_by_key(|record| std::cmp::Reverse(record.0));
+        assert_eq!(sorted, expected_transfers, "{context}");
+
+        let broken: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0, "{context}");
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "{context}");
+    }
+
+    #[test]
+    fn every_historical_catalogue_upgrades_keeping_its_data() {
+        let current = TestDatabase::new("schema-current");
+        let current_shape = schema_shape(&open_database(&current.0).unwrap());
+
+        for (commit, sql, holds) in historical_fixtures() {
+            let database = TestDatabase::new(&format!("schema-{commit}"));
+            create_fixture(&database.0, &sql);
+
+            let connection = launch(&database.0)
+                .unwrap_or_else(|error| panic!("the {commit} catalogue must upgrade: {error}"));
+
+            assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+            assert_eq!(
+                schema_shape(&connection),
+                current_shape,
+                "the {commit} catalogue must end with the current schema"
+            );
+            assert_catalogue_survived(&connection, holds, commit);
+
+            // Reopening, as the next launch does, changes nothing.
+            drop(connection);
+            let mut again = Connection::open(&database.0).unwrap();
+            migrate_database(&mut again, &database.0).unwrap();
+            sync_drive_locations(&again).unwrap();
+            assert_catalogue_survived(&again, holds, commit);
+        }
+    }
+
+    #[test]
+    fn content_checks_belong_to_their_drive() {
+        let database = TestDatabase::new("content-checks-table");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        connection
+            .execute(
+                "INSERT INTO content_checks
+                    (drive_id, relative_path, size_bytes, modified_at, sample_hash, full_hash, checked_at)
+                 VALUES ('UUID-A', 'film.mov', 10, 5, x'01', NULL, 7)",
+                [],
+            )
+            .unwrap();
+
+        // A check names a catalogued drive, and goes when the drive does.
+        assert!(connection
+            .execute(
+                "INSERT INTO content_checks
+                    (drive_id, relative_path, size_bytes, modified_at, sample_hash, checked_at)
+                 VALUES ('UUID-GONE', 'film.mov', 10, 5, x'01', 7)",
+                [],
+            )
+            .is_err());
+        connection
+            .execute(
+                "DELETE FROM drives WHERE persistent_identifier = 'UUID-A'",
+                [],
+            )
+            .unwrap();
+        let checks: i64 = connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(checks, 0);
+    }
+
+    #[test]
+    fn a_failed_upgrade_leaves_the_catalogue_exactly_as_it_was() {
+        let database = TestDatabase::new("schema-atomic");
+        // The first catalogue, plus a drive-based planned move whose source
+        // drive is missing. The rebuilt plan table refuses that row, so the
+        // upgrade fails at its last step, after the earlier steps have
+        // added columns and filled in parent paths. A real catalogue can't
+        // reach this state; it stands in for any failure part way.
+        create_fixture(
+            &database.0,
+            &format!(
+                "{FIXTURE_6E7D838}
+                 PRAGMA foreign_keys = OFF;
+                 {FIXTURE_7B80A78_PLAN}
+                 INSERT INTO planned_moves VALUES (9, 'UUID-GONE', 'x.mov', 'UUID-B', 'x.mov', 1);"
+            ),
+        );
+        let before = schema_shape(&Connection::open(&database.0).unwrap());
+
+        assert!(open_database(&database.0).is_err());
+
+        let connection = Connection::open(&database.0).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 0);
+        assert_eq!(
+            schema_shape(&connection),
+            before,
+            "no step of a failed upgrade may be kept"
+        );
+        let plans: i64 = connection
+            .query_row("SELECT COUNT(*) FROM planned_moves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(plans, 2);
+
+        // Once the cause is gone, the next open upgrades it in full,
+        // including the parent paths an earlier partial attempt would have
+        // left blank.
+        connection
+            .execute("DELETE FROM planned_moves WHERE id = 9", [])
+            .unwrap();
+        drop(connection);
+        let connection = launch(&database.0).unwrap();
+        assert_catalogue_survived(
+            &connection,
+            Holds {
+                planned_moves: true,
+                local_folder: false,
+                labels: false,
+                unreadable: false,
+                transfers: false,
+            },
+            "6e7d838 after a failed upgrade",
+        );
+    }
+
+    #[test]
+    fn two_app_instances_upgrading_at_once_both_succeed() {
+        // `open_database` serialises upgrades within one app. A second copy
+        // of the app (`open -n`) shares only the file, so each thread here
+        // calls the migration directly on its own connection.
+        let database = TestDatabase::new("schema-two-instances");
+        create_fixture(
+            &database.0,
+            &format!("{FIXTURE_6E7D838}{FIXTURE_7B80A78_PLAN}"),
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                let path = database.0.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut connection = Connection::open(&path).unwrap();
+                    connection.busy_timeout(Duration::from_secs(20)).unwrap();
+                    connection
+                        .execute_batch("PRAGMA foreign_keys = ON;")
+                        .unwrap();
+                    barrier.wait();
+                    migrate_database(&mut connection, &path)
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread
+                .join()
+                .unwrap()
+                .expect("every instance must open the catalogue");
+        }
+
+        let connection = launch(&database.0).unwrap();
+        assert_catalogue_survived(
+            &connection,
+            Holds {
+                planned_moves: true,
+                local_folder: false,
+                labels: false,
+                unreadable: false,
+                transfers: false,
+            },
+            "6e7d838 by two instances",
+        );
+    }
+
+    #[test]
+    fn a_catalogue_from_a_newer_version_is_left_untouched() {
+        let database = TestDatabase::new("schema-newer");
+        open_database(&database.0).unwrap();
+        Connection::open(&database.0)
+            .unwrap()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let before = schema_shape(&Connection::open(&database.0).unwrap());
+
+        let mut connection = Connection::open(&database.0).unwrap();
+        assert_eq!(
+            migrate_database(&mut connection, &database.0).unwrap_err(),
+            NEWER_CATALOGUE_MESSAGE
+        );
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION + 1);
+        assert_eq!(schema_shape(&connection), before);
+        assert!(!schema_backup_path(&database.0).exists());
+    }
+
+    #[test]
+    fn an_existing_catalogue_is_backed_up_once_before_its_upgrade() {
+        let database = TestDatabase::new("schema-backup");
+        create_fixture(&database.0, FIXTURE_6E7D838);
+
+        open_database(&database.0).unwrap();
+
+        // The backup is the catalogue as it was: old schema, same data.
+        let backup_path = schema_backup_path(&database.0);
+        let backup = Connection::open(&backup_path).unwrap();
+        assert_eq!(schema_version(&backup).unwrap(), 0);
+        let reference = TestDatabase::new("schema-backup-reference");
+        create_fixture(&reference.0, FIXTURE_6E7D838);
+        assert_eq!(
+            schema_shape(&backup),
+            schema_shape(&Connection::open(&reference.0).unwrap())
+        );
+        let files: i64 = backup
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(files, 5);
+        drop(backup);
+
+        // No stray temporary files are left beside it.
+        let directory = database.0.parent().unwrap();
+        let stem = database
+            .0
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let leftovers: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&stem) && name.ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // An existing backup is never replaced by a later attempt.
+        let other = TestDatabase::new("schema-backup-kept");
+        create_fixture(&other.0, FIXTURE_6E7D838);
+        fs::write(schema_backup_path(&other.0), b"earlier backup").unwrap();
+        open_database(&other.0).unwrap();
+        assert_eq!(
+            fs::read(schema_backup_path(&other.0)).unwrap(),
+            b"earlier backup"
+        );
+    }
+
+    #[test]
+    fn a_new_or_current_catalogue_is_not_backed_up() {
+        let database = TestDatabase::new("schema-no-backup");
+        open_database(&database.0).unwrap();
+        assert!(!schema_backup_path(&database.0).exists());
+
+        // Opening a current catalogue in a later run doesn't back it up.
+        let mut connection = Connection::open(&database.0).unwrap();
+        migrate_database(&mut connection, &database.0).unwrap();
+        assert!(!schema_backup_path(&database.0).exists());
+    }
+
     // A temporary folder standing in for a mounted volume.
     struct TestVolume(PathBuf);
 
@@ -5256,7 +7400,7 @@ mod tests {
         for unavailable in ["Films", "Films/missing.mov"] {
             assert_eq!(
                 resolve_catalogued_file(&volume, unavailable).unwrap_err(),
-                "The file is not currently available at its catalogued location."
+                "The file isn't where the catalogue says. It may have been moved or deleted since the last scan. Rescan the drive to update the catalogue."
             );
         }
     }
@@ -5397,7 +7541,7 @@ mod tests {
 
         // Another source cannot claim the same destination in other case.
         let error = plan("Folder/clip.mp4", "drive:UUID-B", "VIDEO/NEW.mp4").unwrap_err();
-        assert!(error.contains("Another planned move"), "{error}");
+        assert!(error.contains("Another planned file"), "{error}");
 
         // The same source can still re-plan, keeping its id.
         assert_eq!(
@@ -5513,6 +7657,26 @@ mod tests {
         );
     }
 
+    // Each group as (name, size, copies, ["Drive:path", ...]).
+    fn duplicate_summary(overview: &DuplicateOverview) -> Vec<(String, i64, i64, Vec<String>)> {
+        overview
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.name.clone(),
+                    group.size_bytes,
+                    group.copies,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn probable_duplicates_are_grouped_by_name_ignoring_case_and_size() {
         let database = TestDatabase::new("duplicates");
@@ -5535,41 +7699,23 @@ mod tests {
             )
             .unwrap();
 
-        let groups = find_probable_duplicates(&connection).unwrap();
-        let summary: Vec<(String, i64, i64, i64, Vec<String>)> = groups
-            .iter()
-            .map(|group| {
-                (
-                    group.name.clone(),
-                    group.size_bytes,
-                    group.copies,
-                    group.potential_wasted_bytes,
-                    group
-                        .files
-                        .iter()
-                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
-                        .collect(),
-                )
-            })
-            .collect();
+        let overview = find_duplicates(&connection).unwrap();
 
         // Largest saving first; each group lists copies by drive, then path.
         // Different sizes, empty files and folders are never duplicates.
         assert_eq!(
-            summary,
+            duplicate_summary(&overview),
             [
                 (
                     "Film.mp4".to_string(),
                     100,
                     2,
-                    100,
                     vec!["Alpha:Film.mp4".to_string(), "Beta:x/film.MP4".to_string()]
                 ),
                 (
                     "clip.mov".to_string(),
                     10,
                     2,
-                    10,
                     vec![
                         "Alpha:clip.mov".to_string(),
                         "Alpha:sub/clip.mov".to_string()
@@ -5577,6 +7723,106 @@ mod tests {
                 ),
             ]
         );
+        assert!(overview
+            .groups
+            .iter()
+            .all(|group| group.kind == DuplicateKind::Probable));
+        assert_eq!(overview.probable_group_count, 2);
+    }
+
+    #[test]
+    fn probable_duplicates_match_names_across_unicode_forms_and_case() {
+        let database = TestDatabase::new("duplicates-unicode");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', ?1, ?1, '', 0, 500),
+                        ('UUID-B', ?2, ?2, '', 0, 500),
+                        ('UUID-B', 'cafe.mov', 'cafe.mov', '', 0, 500),
+                        ('UUID-A', 'a_b.mov', 'a_b.mov', '', 0, 9),
+                        ('UUID-B', 'a b.mov', 'a b.mov', '', 0, 9)",
+                // Composed é, then e followed by a combining accent.
+                params!["Caf\u{e9}.MOV", "cafe\u{301}.mov"],
+            )
+            .unwrap();
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        // The accented names match each other but not the unaccented one,
+        // and separators are not treated as the same character.
+        assert_eq!(overview.groups.len(), 1);
+        let files: Vec<&str> = overview.groups[0]
+            .files
+            .iter()
+            .map(|file| file.drive_name.as_str())
+            .collect();
+        assert_eq!(files, ["Alpha", "Beta"]);
+        assert_eq!(overview.groups[0].copies, 2);
+    }
+
+    #[test]
+    fn hidden_files_are_never_duplicates() {
+        let database = TestDatabase::new("duplicates-hidden");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', '._film.mov', '._film.mov', '', 0, 4096),
+                        ('UUID-B', '._film.mov', '._film.mov', '', 0, 4096),
+                        ('UUID-A', '.hidden/film.mov', 'film.mov', '.hidden', 0, 70),
+                        ('UUID-B', 'Films/.cache/film.mov', 'film.mov', 'Films/.cache', 0, 70),
+                        ('UUID-A', 'Films/film.mov', 'film.mov', 'Films', 0, 70),
+                        ('UUID-B', 'Backup.film/film.mov', 'film.mov', 'Backup.film', 0, 70);",
+            )
+            .unwrap();
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        // Only the two visible copies; a dot inside a name is not hidden.
+        assert_eq!(
+            duplicate_summary(&overview),
+            [(
+                "film.mov".to_string(),
+                70,
+                2,
+                vec![
+                    "Alpha:Films/film.mov".to_string(),
+                    "Beta:Backup.film/film.mov".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn duplicate_groups_are_limited_but_all_are_counted() {
+        let database = TestDatabase::new("duplicates-limit");
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        let groups = DUPLICATE_GROUP_LIMIT + 5;
+        for index in 0..groups {
+            for drive in ["UUID-A", "UUID-B"] {
+                connection
+                    .execute(
+                        "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                         VALUES (?1, ?2, ?2, '', 0, ?3)",
+                        params![drive, format!("file-{index}.bin"), 1_000 + index],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let overview = find_duplicates(&connection).unwrap();
+
+        assert_eq!(overview.groups.len() as i64, DUPLICATE_GROUP_LIMIT);
+        assert_eq!(overview.probable_group_count, groups);
+        // The largest are kept.
+        assert_eq!(overview.groups[0].name, format!("file-{}.bin", groups - 1));
     }
 
     #[test]
@@ -5901,7 +8147,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             offline.message,
-            "The destination “Backup” is not currently connected."
+            "The destination “Backup” isn't connected. Connect it to copy."
         );
     }
 
@@ -6033,7 +8279,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             issue.message,
-            "The destination folder “Local” is no longer available."
+            "The destination folder “Local” is no longer available. Check that it still exists, or choose another destination."
         );
 
         fs::write(&local_path, b"not a folder").unwrap();
@@ -6045,7 +8291,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             issue.message,
-            "The destination “Local” is no longer a folder."
+            "The destination “Local” is no longer a folder. Choose another destination."
         );
         fs::remove_file(&local_path).unwrap();
 
@@ -6055,6 +8301,274 @@ mod tests {
         assert!(valid.ready, "{:?}", valid.issues);
 
         fs::remove_dir_all(&local_path).unwrap();
+    }
+
+    // Technical words that must never reach the window.
+    fn assert_plain(message: &str) {
+        for leak in [
+            "os error",
+            "SQLite",
+            "sqlite",
+            "rusqlite",
+            "database",
+            "Unable to",
+            "/Volumes",
+            "/Users",
+            "drive:",
+            "local:",
+            "UUID",
+            "panicked",
+        ] {
+            assert!(!message.contains(leak), "{message:?} contains {leak:?}");
+        }
+    }
+
+    #[test]
+    fn internal_errors_become_plain_messages() {
+        let cases = [
+            // Catalogue states.
+            (
+                "Unable to query catalogue: database is locked",
+                "open this folder",
+                CATALOGUE_BUSY,
+            ),
+            (
+                "Unable to open catalogue database: database disk image is malformed",
+                "load your drives",
+                CATALOGUE_DAMAGED,
+            ),
+            (
+                "Unable to save planned move: file is not a database",
+                "add this to the plan",
+                CATALOGUE_DAMAGED,
+            ),
+            (
+                "Unable to save drive label: database or disk is full",
+                "save the label",
+                MAC_FULL,
+            ),
+            // Copy failures name the side that failed.
+            (
+                "Unable to write the copy: No space left on device (os error 28)",
+                "copy the file",
+                "The destination ran out of space during the copy. Free some space there, then copy again.",
+            ),
+            (
+                "Unable to create temporary destination file: Read-only file system (os error 30)",
+                "copy the file",
+                "The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to.",
+            ),
+            (
+                "Unable to create temporary destination file: Permission denied (os error 13)",
+                "copy the file",
+                "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again.",
+            ),
+            (
+                "Unable to open source file: Operation not permitted (os error 1)",
+                "copy the file",
+                "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again.",
+            ),
+            (
+                "Unable to read the source file: Input/output error (os error 5)",
+                "copy the file",
+                "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to verify source file: Device not configured (os error 6)",
+                "copy the file",
+                "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to open source file: No such file or directory (os error 2)",
+                "copy the file",
+                "The source file is no longer there. Rescan the source drive to update the catalogue.",
+            ),
+            (
+                "Unable to sync copied file: Input/output error (os error 5)",
+                "copy the file",
+                "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            (
+                "Unable to create destination folder: No such file or directory (os error 2)",
+                "copy the file",
+                "The destination stopped responding or was disconnected during the copy. Reconnect it, then copy again.",
+            ),
+            // Anything else says what couldn't be done.
+            (
+                "Unable to create transfer record: constraint failed",
+                "copy the file",
+                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Destination location drive:UUID-B has no drive identity.",
+                "copy the file",
+                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Unable to inspect selected folder: Operation not permitted (os error 1)",
+                "add that folder",
+                "macOS didn't let Media Mapper add that folder. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again.",
+            ),
+            (
+                "Unable to read /Volumes: Input/output error (os error 5)",
+                "check which drives are connected",
+                "Media Mapper couldn't check which drives are connected. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+            (
+                "Background task failed: task 7 panicked",
+                "load the plan",
+                "Media Mapper couldn't load the plan. Try again. If it keeps happening, quit and reopen Media Mapper.",
+            ),
+        ];
+        for (internal, action, expected) in cases {
+            let shown = present_error(internal, action);
+            assert_eq!(shown, expected, "for {internal:?}");
+            assert_plain(&shown);
+        }
+    }
+
+    #[test]
+    fn messages_written_for_the_window_pass_through() {
+        for message in [
+            TRANSFER_CANCELLED,
+            COPIED_NOT_RECORDED,
+            DESTINATION_UNAVAILABLE,
+            DESTINATION_EXISTS,
+            DESTINATION_APPEARED,
+            VERIFICATION_FAILED,
+            SOURCE_NOT_A_FILE,
+            NEWER_CATALOGUE_MESSAGE,
+            DRIVE_WITHOUT_IDENTITY,
+            "Scan cancelled.",
+            "A transfer is running. Wait for it to finish, then scan the drive.",
+            "That file points outside its drive, so it was not opened.",
+        ] {
+            assert_eq!(present_error(message, "copy the file"), message);
+            assert_plain(message);
+        }
+        // The window recognises these by their wording.
+        assert_eq!(TRANSFER_CANCELLED, "Copy cancelled.");
+        assert!(COPIED_NOT_RECORDED.starts_with(
+            "The file was copied and verified, but Media Mapper couldn't save that it finished."
+        ));
+        assert_eq!(
+            DESTINATION_UNAVAILABLE,
+            "The destination became unavailable during the copy."
+        );
+    }
+
+    #[test]
+    fn transfer_history_shows_failures_in_plain_words() {
+        assert_eq!(
+            present_transfer_error(INTERRUPTED_TRANSFER_MESSAGE),
+            "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+        );
+        assert_eq!(
+            present_transfer_error("Unable to copy file: Input/output error (os error 5)"),
+            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+        );
+        assert_eq!(
+            present_transfer_error("Unable to read the source file: Input/output error (os error 5)"),
+            "The source drive stopped responding or was disconnected during the copy. Reconnect it, then copy again."
+        );
+        assert_eq!(
+            present_transfer_error(TRANSFER_CANCELLED),
+            TRANSFER_CANCELLED
+        );
+        assert_eq!(
+            present_transfer_error(DESTINATION_EXISTS),
+            DESTINATION_EXISTS
+        );
+    }
+
+    #[test]
+    fn plan_issues_name_files_not_paths_or_ids() {
+        let database = TestDatabase::new("issue-wording");
+        let mut connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Source");
+        insert_drive(&connection, "UUID-B", "Backup");
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'Films/Été 2024/Café clip.mov', 'Café clip.mov',
+                         'Films/Été 2024', 0, 100)",
+                [],
+            )
+            .unwrap();
+        plan_move(
+            &mut connection,
+            "UUID-A",
+            "Films/Été 2024/Café clip.mov",
+            "drive:UUID-B",
+            "Video/Café clip.mov",
+        )
+        .unwrap();
+
+        let live = validate_plan_live(&connection, &[]).unwrap();
+        let source = live
+            .issues
+            .iter()
+            .find(|issue| issue.code == "source_drive_offline")
+            .unwrap();
+        assert_eq!(
+            source.message,
+            "The drive that holds Café clip.mov isn't connected."
+        );
+
+        // A source that has left the catalogue.
+        connection
+            .execute("DELETE FROM files WHERE drive_id = 'UUID-A'", [])
+            .unwrap();
+        let preflight = plan_preflight(&connection).unwrap();
+        let missing = preflight
+            .issues
+            .iter()
+            .find(|issue| issue.code == "missing_source")
+            .unwrap();
+        assert_eq!(
+            missing.message,
+            "Café clip.mov is no longer in the catalogue. Rescan its drive, or remove it from the plan."
+        );
+
+        for issue in live.issues.iter().chain(&preflight.issues) {
+            assert_plain(&issue.message);
+            assert!(!issue.message.contains("Films/"), "{}", issue.message);
+        }
+    }
+
+    #[test]
+    fn the_diagnostics_log_appends_and_rolls_over() {
+        let directory = std::env::temp_dir().join(format!(
+            "media-mapper-log-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("media-mapper.log");
+
+        append_log(&log, "Couldn't copy the file: first");
+        append_log(&log, "Couldn't copy the file: second");
+        let text = fs::read_to_string(&log).unwrap();
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+
+        // Past the limit, the log moves aside and a new one starts.
+        fs::write(&log, vec![b'x'; LOG_LIMIT_BYTES as usize + 1]).unwrap();
+        append_log(&log, "after rollover");
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .trim_end()
+                .split_once(' ')
+                .unwrap()
+                .1,
+            "after rollover"
+        );
+        assert!(directory.join("media-mapper.log.1").exists());
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -6410,7 +8924,7 @@ mod tests {
 
         let error = rename_exclusive(&temporary, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_APPEARED);
         assert_eq!(fs::read(&destination).unwrap(), b"existing contents");
         assert_eq!(fs::read(&temporary).unwrap(), b"new contents");
     }
@@ -6433,7 +8947,7 @@ mod tests {
 
         let error = copy_file_verified(&source, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_EXISTS);
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
     }
@@ -7531,7 +10045,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let error =
             execute_transfer_paths(&connection, move_id, &source, &destination).unwrap_err();
 
-        assert!(error.contains("Destination already exists"), "{error}");
+        assert_eq!(error, DESTINATION_EXISTS);
 
         assert_eq!(fs::read(&source).unwrap(), b"new source");
         assert_eq!(fs::read(&destination).unwrap(), b"existing destination");
@@ -7556,7 +10070,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             .error_message
             .as_deref()
             .unwrap_or("")
-            .contains("Destination already exists"));
+            .contains(DESTINATION_EXISTS));
         assert!(source.exists());
     }
 
@@ -7774,7 +10288,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
 
         let error = create_transfer_record(&connection, 999).unwrap_err();
 
-        assert!(error.contains("planned move no longer exists"), "{error}");
+        assert_eq!(error, "That file is no longer in the plan.");
         assert!(list_transfer_records(&connection).unwrap().is_empty());
     }
 
@@ -8059,12 +10573,26 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         source: PathBuf,
         destination: PathBuf,
         contents: Vec<u8>,
-        _source_volume: TestVolume,
+        source_volume: TestVolume,
         destination_volume: TestVolume,
         database: TestDatabase,
     }
 
     fn transfer_fixture(name: &str) -> TransferFixture {
+        let contents: Vec<u8> = (0..256 * 1024 + 7)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        transfer_fixture_with(name, "film.mov", "Archive/film.mov", contents)
+    }
+
+    // As transfer_fixture, with the source's path, its planned destination
+    // and its contents chosen by the test.
+    fn transfer_fixture_with(
+        name: &str,
+        source_relative_path: &str,
+        destination_relative_path: &str,
+        contents: Vec<u8>,
+    ) -> TransferFixture {
         let database = TestDatabase::new(name);
         let unique = format!("{name}-{}-{}", std::process::id(), now_unix());
         let source_volume =
@@ -8076,31 +10604,22 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         fs::create_dir_all(&source_volume.0).unwrap();
         fs::create_dir_all(&destination_volume.0).unwrap();
 
-        let source = source_volume.0.join("film.mov");
-        let contents: Vec<u8> = (0..256 * 1024 + 7)
-            .map(|index| (index % 251) as u8)
-            .collect();
-        fs::write(&source, &contents).unwrap();
-        let modified_at = system_time_unix(fs::metadata(&source).unwrap().modified());
-
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-A", "Source");
         insert_drive(&connection, "UUID-B", "Backup");
         sync_drive_locations(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO files (
-                    drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
-                 ) VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, ?1, ?2)",
-                params![contents.len() as i64, modified_at],
-            )
-            .unwrap();
+        let source = catalogue_test_file(
+            &connection,
+            &source_volume.0,
+            source_relative_path,
+            &contents,
+        );
         let move_id = plan_move(
             &mut connection,
             "UUID-A",
-            "film.mov",
+            source_relative_path,
             "drive:UUID-B",
-            "Archive/film.mov",
+            destination_relative_path,
         )
         .unwrap();
 
@@ -8108,7 +10627,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             test_drive("UUID-A", "Source", &source_volume.0, 1_000_000_000),
             test_drive("UUID-B", "Backup", &destination_volume.0, 1_000_000_000),
         ];
-        let destination = destination_volume.0.join("Archive/film.mov");
+        let destination = destination_volume.0.join(destination_relative_path);
 
         TransferFixture {
             connection,
@@ -8117,10 +10636,64 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             source,
             destination,
             contents,
-            _source_volume: source_volume,
+            source_volume: source_volume,
             destination_volume,
             database,
         }
+    }
+
+    // Writes a file on the test source drive `UUID-A` and catalogues it, with
+    // any folders above it, as a scan would. Returns its path.
+    fn catalogue_test_file(
+        connection: &Connection,
+        volume: &Path,
+        relative_path: &str,
+        contents: &[u8],
+    ) -> PathBuf {
+        let path = volume.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        let modified_at = system_time_unix(fs::metadata(&path).unwrap().modified());
+
+        let mut folder = Path::new(relative_path).parent();
+        while let Some(current) = folder.filter(|folder| !folder.as_os_str().is_empty()) {
+            let parent = current
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned());
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO files (
+                        drive_id, relative_path, name, parent_path, is_directory
+                     ) VALUES ('UUID-A', ?1, ?2, ?3, 1)",
+                    params![
+                        current.to_string_lossy(),
+                        current.file_name().unwrap().to_string_lossy(),
+                        parent.unwrap_or_default()
+                    ],
+                )
+                .unwrap();
+            folder = current.parent();
+        }
+
+        let relative = Path::new(relative_path);
+        connection
+            .execute(
+                "INSERT INTO files (
+                    drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
+                 ) VALUES ('UUID-A', ?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    relative_path,
+                    relative.file_name().unwrap().to_string_lossy(),
+                    relative
+                        .parent()
+                        .map(|parent| parent.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    contents.len() as i64,
+                    modified_at
+                ],
+            )
+            .unwrap();
+        path
     }
 
     // Leaves the database and disk as a process killed mid-transfer would: a
@@ -8546,6 +11119,37 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
     }
 
+    // A process started while the lock is held briefly inherits the lock
+    // file, so the lock can still look held just after it is released. The
+    // app starts diskutil every two seconds, which must never make the next
+    // copy in a run look like it clashes with another transfer.
+    #[test]
+    fn a_released_lock_is_available_while_processes_are_being_started() {
+        let fixture = transfer_fixture("transfer-lock-spawn");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("/usr/bin/true").status();
+                }
+            })
+        };
+
+        let mut refused = 0;
+        for _ in 0..2_000 {
+            let held = try_lock_transfers(&fixture.connection).unwrap();
+            if held.is_none() {
+                refused += 1;
+            }
+            drop(held);
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+
+        assert_eq!(refused, 0);
+    }
+
     #[test]
     fn transfer_lock_rejects_a_second_transfer() {
         let fixture = transfer_fixture("transfer-lock");
@@ -8813,7 +11417,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
             .unwrap_err();
 
-        assert!(error.contains("not currently present"), "{error}");
+        assert!(error.contains("no longer on the source drive"), "{error}");
         assert!(list_transfer_records(&fixture.connection)
             .unwrap()
             .is_empty());
@@ -8891,7 +11495,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         )
         .unwrap_err();
 
-        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(error, DESTINATION_APPEARED);
         assert_eq!(fs::read(&fixture.destination).unwrap(), b"arrived mid-copy");
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
         assert_eq!(
@@ -8903,5 +11507,1479 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, "failed");
         assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    // ---- Safety and recovery matrix (SAFETY-MATRIX.md) ----
+    //
+    // Every case checks the same promises: the source is unchanged, nothing
+    // is at the destination unless the transfer completed and matches the
+    // source, no temporary file of ours is left behind, and the plan item
+    // remains unless the move completed.
+
+    // The transfer temporary files left in a folder.
+    fn partial_files(folder: &Path) -> Vec<String> {
+        match fs::read_dir(folder) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".mediamapper-transfer-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn assert_nothing_copied(fixture: &TransferFixture) {
+        assert!(
+            fs::symlink_metadata(&fixture.destination).is_err(),
+            "nothing may be at the destination"
+        );
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    fn assert_copied_and_verified(fixture: &TransferFixture, transfer: &TransferRecord) {
+        assert_eq!(transfer.status, "completed");
+        assert_eq!(transfer.copied_bytes, fixture.contents.len() as i64);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[test]
+    fn zero_byte_file_is_copied_and_verified() {
+        let fixture =
+            transfer_fixture_with("matrix-zero-byte", "empty.txt", "Archive/empty.txt", vec![]);
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn names_with_spaces_and_unicode_are_copied_exactly() {
+        // Composed (NFC) and decomposed (NFD) accents, spaces and non-Latin
+        // script, in both folder and file names.
+        let cases = [
+            ("Été 2024/Café clip.mov", "Archive/Été 2024/Café clip.mov"),
+            (
+                "E\u{301}te\u{301}/cafe\u{301}.mov",
+                "Archive/E\u{301}te\u{301}/cafe\u{301}.mov",
+            ),
+            ("写真/家族 旅行.jpg", "Archive/写真/家族 旅行.jpg"),
+        ];
+        for (index, (source, destination)) in cases.iter().enumerate() {
+            let fixture = transfer_fixture_with(
+                &format!("matrix-unicode-{index}"),
+                source,
+                destination,
+                b"named carefully".to_vec(),
+            );
+
+            let transfer =
+                execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                    .unwrap();
+
+            assert_copied_and_verified(&fixture, &transfer);
+            assert_eq!(transfer.destination_relative_path, *destination);
+        }
+    }
+
+    #[test]
+    fn file_is_copied_into_a_folder_on_this_mac() {
+        let mut fixture = transfer_fixture("matrix-local-folder");
+        let folder = fixture.destination_volume.0.join("Mac folder");
+        fs::create_dir_all(&folder).unwrap();
+        fixture
+            .connection
+            .execute(
+                "INSERT INTO locations (id, kind, display_name, local_path, created_at)
+                 VALUES ('local:test', 'local_folder', 'Mac folder', ?1, 1)",
+                params![folder.to_string_lossy()],
+            )
+            .unwrap();
+        fixture
+            .connection
+            .execute("DELETE FROM planned_moves", [])
+            .unwrap();
+        fixture.move_id = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            "film.mov",
+            "local:test",
+            "Archive/film.mov",
+        )
+        .unwrap();
+        fixture.destination = folder.join("Archive/film.mov");
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+        assert_eq!(transfer.destination_location_id, "local:test");
+    }
+
+    #[test]
+    fn deeply_nested_new_folders_are_created_for_the_copy() {
+        let fixture = transfer_fixture_with(
+            "matrix-nested",
+            "film.mov",
+            "Archive/2024/Summer/Day 1/Camera A/film.mov",
+            b"nested".to_vec(),
+        );
+        assert!(!fixture.destination_volume.0.join("Archive").exists());
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn large_file_is_copied_and_verified_across_many_chunks() {
+        // Several 1 MB chunks plus a partial one.
+        let contents: Vec<u8> = (0..(7 * 1024 * 1024 + 123) as u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let fixture =
+            transfer_fixture_with("matrix-large", "large.mov", "Archive/large.mov", contents);
+
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    // Adds a second planned file from the fixture's source drive to its
+    // destination drive. Returns the move id, source and destination.
+    fn plan_second_file(
+        fixture: &mut TransferFixture,
+        name: &str,
+        contents: &[u8],
+    ) -> (i64, PathBuf, PathBuf) {
+        let source = catalogue_test_file(
+            &fixture.connection,
+            &fixture.source_volume.0,
+            name,
+            contents,
+        );
+        let destination_relative = format!("Archive/{name}");
+        let move_id = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            name,
+            "drive:UUID-B",
+            &destination_relative,
+        )
+        .unwrap();
+        (
+            move_id,
+            source,
+            fixture.destination_volume.0.join(destination_relative),
+        )
+    }
+
+    #[test]
+    fn several_planned_files_copy_one_after_another() {
+        let mut fixture = transfer_fixture("matrix-multi");
+        let (second_id, second_source, second_destination) =
+            plan_second_file(&mut fixture, "second.mov", b"second file");
+
+        let first = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        let second =
+            execute_planned_transfer(&fixture.connection, second_id, &fixture.drives).unwrap();
+
+        assert_copied_and_verified(&fixture, &first);
+        assert_eq!(second.status, "completed");
+        assert_eq!(fs::read(&second_destination).unwrap(), b"second file");
+        assert_eq!(fs::read(&second_source).unwrap(), b"second file");
+        assert!(!planned_move_exists(&fixture.connection, second_id));
+        assert_eq!(
+            folder_names(fixture.destination.parent().unwrap()),
+            vec!["film.mov", "second.mov"]
+        );
+    }
+
+    #[test]
+    fn destination_space_must_cover_the_file_exactly() {
+        let mut fixture = transfer_fixture("matrix-capacity");
+        let size = fixture.contents.len() as u64;
+
+        fixture.drives[1].available_bytes = Some(size - 1);
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+        assert!(error.contains("enough free space"), "{error}");
+        assert_nothing_copied(&fixture);
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+
+        fixture.drives[1].available_bytes = Some(size);
+        let transfer =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+                .unwrap();
+        assert_copied_and_verified(&fixture, &transfer);
+    }
+
+    #[test]
+    fn cancel_before_the_first_chunk_copies_nothing() {
+        let fixture = transfer_fixture("matrix-cancel-first");
+
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.drives,
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_nothing_copied(&fixture);
+        // Any record made says cancelled, never failed or completed.
+        for transfer in list_transfer_records(&fixture.connection).unwrap() {
+            assert!(is_cancelled_record(&transfer), "{transfer:?}");
+        }
+    }
+
+    fn is_cancelled_record(transfer: &TransferRecord) -> bool {
+        transfer.status == "failed" && transfer.error_message.as_deref() == Some(TRANSFER_CANCELLED)
+    }
+
+    #[test]
+    fn cancel_during_verification_leaves_no_copy_and_keeps_the_plan() {
+        let fixture = progress_fixture("matrix-cancel-verifying");
+        let verifying = std::cell::Cell::new(false);
+
+        let error = execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| {
+                if progress.stage == TransferStage::Verifying {
+                    verifying.set(true);
+                }
+            },
+            &|| verifying.get(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert!(verifying.get(), "the cancel arrived during verification");
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(is_cancelled_record(&history[0]));
+        let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn cancel_after_some_files_keeps_completed_copies_and_remaining_plans() {
+        let mut fixture = transfer_fixture("matrix-cancel-later");
+        let (second_id, second_source, second_destination) =
+            plan_second_file(&mut fixture, "second.mov", b"second file");
+
+        let first = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            second_id,
+            &fixture.drives,
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_copied_and_verified(&fixture, &first);
+        assert!(!second_destination.exists());
+        assert_eq!(fs::read(&second_source).unwrap(), b"second file");
+        assert!(planned_move_exists(&fixture.connection, second_id));
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|transfer| transfer.status == "completed")
+                .count(),
+            1
+        );
+        assert!(history
+            .iter()
+            .filter(|transfer| transfer.status != "completed")
+            .all(is_cancelled_record));
+    }
+
+    // Runs the progress fixture's transfer, calling `change` with the source
+    // at the first progress report of `stage`.
+    fn transfer_changing_source(
+        fixture: &ProgressFixture,
+        stage: TransferStage,
+        change: &dyn Fn(&Path),
+    ) -> String {
+        let changed = std::cell::Cell::new(false);
+        execute_transfer_paths_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+            &|progress| {
+                if progress.stage == stage && !changed.get() {
+                    changed.set(true);
+                    change(&fixture.source);
+                }
+            },
+            &|| false,
+        )
+        .unwrap_err()
+    }
+
+    fn assert_failed_without_copy(fixture: &ProgressFixture) {
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+        let _ = (&fixture.database, &fixture.volume);
+    }
+
+    #[test]
+    fn source_changed_during_the_copy_fails_verification() {
+        let fixture = progress_fixture("matrix-source-changed-copying");
+        let changed: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+
+        let error = transfer_changing_source(&fixture, TransferStage::Copying, &|source| {
+            fs::write(source, &changed).unwrap()
+        });
+
+        assert!(error == VERIFICATION_FAILED, "{error}");
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[test]
+    fn source_changed_during_verification_fails_verification() {
+        let fixture = progress_fixture("matrix-source-changed-verifying");
+        let changed: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+
+        let error = transfer_changing_source(&fixture, TransferStage::Verifying, &|source| {
+            fs::write(source, &changed).unwrap()
+        });
+
+        assert!(error == VERIFICATION_FAILED, "{error}");
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[test]
+    fn source_deleted_during_the_copy_is_never_completed() {
+        let fixture = progress_fixture("matrix-source-deleted");
+
+        // The open file can still be read to the end, but the copy can no
+        // longer be confirmed against the source.
+        transfer_changing_source(&fixture, TransferStage::Copying, &|source| {
+            fs::remove_file(source).unwrap()
+        });
+
+        assert_failed_without_copy(&fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_destination_folder_fails_without_leaving_anything() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = transfer_fixture("matrix-read-only");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result =
+            execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives);
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert_nothing_copied(&fixture);
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_or_link_at_the_temporary_path_is_never_touched() {
+        let fixture = transfer_fixture("matrix-temporary-occupied");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+
+        // A folder holding someone's file.
+        let folder = transfer_temporary_path(&fixture.destination, 1, 1).unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("keep.txt"), b"keep").unwrap();
+        let error =
+            copy_file_verified_with_stage(&fixture.source, &fixture.destination, &folder, |_| {
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert_eq!(fs::read(folder.join("keep.txt")).unwrap(), b"keep");
+
+        // A link to a file elsewhere: neither the link nor its target change.
+        let target = fixture.destination_volume.0.join("target.txt");
+        fs::write(&target, b"target").unwrap();
+        let link = transfer_temporary_path(&fixture.destination, 2, 2).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error =
+            copy_file_verified_with_stage(&fixture.source, &fixture.destination, &link, |_| Ok(()))
+                .unwrap_err();
+        assert!(
+            error.contains("Unable to create temporary destination file"),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+
+        assert!(!fixture.destination.exists());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_at_the_destination_is_never_replaced() {
+        let fixture = transfer_fixture("matrix-dangling-destination");
+        let archive = fixture.destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&archive).unwrap();
+        let missing = fixture.destination_volume.0.join("missing.mov");
+        std::os::unix::fs::symlink(&missing, &fixture.destination).unwrap();
+
+        // Final validation refuses it before any record is made.
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+
+        // So does the copy itself, if it is ever reached, before copying.
+        let temporary = transfer_temporary_path(&fixture.destination, 1, 1).unwrap();
+        let error = copy_file_verified_with_progress(
+            &fixture.source,
+            &fixture.destination,
+            &temporary,
+            |_| Ok(()),
+            &mut |_, _| panic!("nothing may be copied"),
+        )
+        .unwrap_err();
+        assert_eq!(error, DESTINATION_EXISTS);
+
+        assert_eq!(fs::read_link(&fixture.destination).unwrap(), missing);
+        assert!(!missing.exists());
+        assert!(partial_files(&archive).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    #[test]
+    fn planned_folder_is_refused_before_any_record_is_made() {
+        let mut fixture = transfer_fixture_with(
+            "matrix-folder-move",
+            "Films/film.mov",
+            "Archive/film.mov",
+            b"inside a folder".to_vec(),
+        );
+        // Plan the folder itself instead of the file inside it.
+        fixture
+            .connection
+            .execute("DELETE FROM planned_moves", [])
+            .unwrap();
+        let folder_move = plan_move(
+            &mut fixture.connection,
+            "UUID-A",
+            "Films",
+            "drive:UUID-B",
+            "Archive/Films",
+        )
+        .unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, folder_move, &fixture.drives)
+            .unwrap_err();
+
+        assert_eq!(error, FOLDER_TRANSFER_UNSUPPORTED);
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.destination_volume.0.join("Archive").exists());
+        assert!(planned_move_exists(&fixture.connection, folder_move));
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+    }
+
+    // Validation refuses a source that is a link, but the source could be
+    // swapped for one after validation. The copy must not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn copy_never_follows_a_source_replaced_by_a_link() {
+        let fixture = progress_fixture("matrix-source-link-race");
+        let elsewhere = fixture.volume.0.join("elsewhere.mov");
+        fs::write(&elsewhere, b"not the planned file").unwrap();
+        fs::remove_file(&fixture.source).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &fixture.source).unwrap();
+
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, SOURCE_NOT_A_FILE);
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"not the planned file");
+        assert!(fs::symlink_metadata(&fixture.source)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let _ = &fixture.database;
+    }
+
+    // A named pipe would block an ordinary open until something wrote to it.
+    #[cfg(unix)]
+    #[test]
+    fn copy_refuses_a_source_that_is_not_a_regular_file() {
+        let fixture = progress_fixture("matrix-source-fifo");
+        fs::remove_file(&fixture.source).unwrap();
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fixture.source)
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &fixture.destination,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, SOURCE_NOT_A_FILE);
+        assert!(!fixture.destination.exists());
+        assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
+        let _ = &fixture.database;
+    }
+
+    #[test]
+    fn copy_finalised_but_not_recorded_is_reported_truthfully() {
+        let fixture = transfer_fixture("matrix-bookkeeping-fails");
+        // The database refuses to record the completion, as it would if it
+        // stayed locked past the busy timeout or the disk filled.
+        fixture
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse_completion
+                 BEFORE UPDATE OF status ON transfers
+                 WHEN NEW.status = 'completed'
+                 BEGIN SELECT RAISE(ABORT, 'database is locked'); END;",
+            )
+            .unwrap();
+
+        let error = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap_err();
+
+        // The copy is in place and verified, so the error must not suggest
+        // nothing was copied, and must never claim it completed.
+        assert_eq!(error, COPIED_NOT_RECORDED);
+        assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "verifying");
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+
+        // Once the database recovers, the next retry confirms the copy
+        // against the source and completes it without copying again.
+        fixture
+            .connection
+            .execute_batch("DROP TRIGGER refuse_completion;")
+            .unwrap();
+        let retry = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        assert_eq!(retry.id, history[0].id);
+        assert_copied_and_verified(&fixture, &retry);
+        assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
+    }
+
+    // A cancel that arrives as the next file's copy is starting belongs to
+    // the same run, so that file must not be copied.
+    #[test]
+    fn cancel_requested_before_a_file_starts_copies_and_records_nothing() {
+        let fixture = transfer_fixture("matrix-cancel-between");
+
+        let error = execute_planned_transfer_reporting(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.drives,
+            &|_| panic!("no progress may be reported"),
+            &|| true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, TRANSFER_CANCELLED);
+        assert_nothing_copied(&fixture);
+        assert!(!fixture.destination.parent().unwrap().exists());
+        assert!(list_transfer_records(&fixture.connection)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_cancel_applies_to_its_whole_run_and_only_to_it() {
+        request_transfer_cancel(41);
+
+        // Still cancelled for every later file of run 41; nothing resets it
+        // as a file starts.
+        assert!(transfer_run_cancelled(41));
+        assert!(transfer_run_cancelled(41));
+        // A new run is not affected by an earlier run's cancel.
+        assert!(!transfer_run_cancelled(42));
+        // Run id 0 is never treated as cancelled.
+        assert!(!transfer_run_cancelled(0));
+    }
+
+    #[test]
+    fn interrupted_pending_record_is_recovered_and_retried() {
+        let fixture = transfer_fixture("matrix-recover-pending");
+        // Killed after the record was written, before the copy began.
+        let transfer = create_transfer_record(&fixture.connection, fixture.move_id).unwrap();
+
+        let recovery = recover_interrupted_transfers(&fixture.connection, None, None).unwrap();
+        assert_eq!(recovery.interrupted, 1);
+        assert_eq!(
+            transfer_status(&fixture.connection, transfer.id),
+            (
+                "failed".to_string(),
+                Some(INTERRUPTED_TRANSFER_MESSAGE.to_string())
+            )
+        );
+        assert_nothing_copied(&fixture);
+
+        let retry = execute_planned_transfer(&fixture.connection, fixture.move_id, &fixture.drives)
+            .unwrap();
+        assert_copied_and_verified(&fixture, &retry);
+    }
+
+    // Each state a crash or force-quit can leave a transfer in, and the
+    // status relaunch must then give it.
+    #[derive(Clone, Copy, Debug)]
+    enum Interruption {
+        Pending,
+        Copying,
+        // Every byte copied, verification not finished.
+        Verifying,
+        // Verified and renamed into place, but `completed` not recorded.
+        Finalised,
+        // As Finalised, then something else changed the destination.
+        FinalisedThenReplaced,
+    }
+
+    #[test]
+    fn every_interrupted_state_is_recovered_truthfully_after_relaunch() {
+        let cases = [
+            (Interruption::Pending, "failed"),
+            (Interruption::Copying, "failed"),
+            (Interruption::Verifying, "failed"),
+            (Interruption::Finalised, "completed"),
+            (Interruption::FinalisedThenReplaced, "failed"),
+        ];
+
+        for (case, expected_status) in cases {
+            let fixture = transfer_fixture(&format!("matrix-relaunch-{case:?}"));
+            let replaced: Vec<u8> = fixture.contents.iter().map(|byte| !byte).collect();
+            let transfer = match case {
+                Interruption::Pending => {
+                    create_transfer_record(&fixture.connection, fixture.move_id).unwrap()
+                }
+                Interruption::Copying => {
+                    simulate_interrupted_transfer(&fixture, "copying", 1_000).0
+                }
+                Interruption::Verifying => {
+                    simulate_interrupted_transfer(&fixture, "verifying", fixture.contents.len()).0
+                }
+                Interruption::Finalised => simulate_crash_after_rename(&fixture),
+                Interruption::FinalisedThenReplaced => {
+                    let transfer = simulate_crash_after_rename(&fixture);
+                    fs::remove_file(&fixture.destination).unwrap();
+                    fs::write(&fixture.destination, &replaced).unwrap();
+                    transfer
+                }
+            };
+            let temporary =
+                transfer_temporary_path(&fixture.destination, transfer.id, transfer.created_at)
+                    .unwrap();
+
+            // Relaunch: records without drives, then with them.
+            {
+                let _lock = try_lock_transfers(&fixture.connection).unwrap().unwrap();
+                recover_interrupted_transfers(&fixture.connection, None, None).unwrap();
+                recover_interrupted_transfers(&fixture.connection, Some(&fixture.drives), None)
+                    .unwrap();
+            }
+
+            let (status, _) = transfer_status(&fixture.connection, transfer.id);
+            assert_eq!(status, expected_status, "{case:?}");
+            assert!(!temporary.exists(), "{case:?}: partial removed");
+            assert_eq!(
+                fs::read(&fixture.source).unwrap(),
+                fixture.contents,
+                "{case:?}"
+            );
+
+            match case {
+                Interruption::Finalised => {
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), fixture.contents);
+                    assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+                    // Nothing is left to retry, and nothing is copied again.
+                    let error = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error, "That file is no longer in the plan.");
+                    assert_eq!(list_transfer_records(&fixture.connection).unwrap().len(), 1);
+                }
+                Interruption::FinalisedThenReplaced => {
+                    // Never trusted, never removed, never overwritten.
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
+                    assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+                    let error = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("already exists"), "{error}");
+                    assert_eq!(fs::read(&fixture.destination).unwrap(), replaced);
+                }
+                _ => {
+                    assert!(!fixture.destination.exists(), "{case:?}");
+                    assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+                    let retry = execute_planned_transfer(
+                        &fixture.connection,
+                        fixture.move_id,
+                        &fixture.drives,
+                    )
+                    .unwrap();
+                    assert_copied_and_verified(&fixture, &retry);
+                }
+            }
+
+            let completed = list_transfer_records(&fixture.connection)
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.status == "completed")
+                .count();
+            assert!(completed <= 1, "{case:?}: completed at most once");
+            for record in list_transfer_records(&fixture.connection).unwrap() {
+                assert!(
+                    record.status == "completed" || record.status == "failed",
+                    "{case:?}: {record:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scan_is_refused_while_a_transfer_is_running() {
+        let fixture = transfer_fixture("matrix-scan-during-transfer");
+        let other = open_database(&fixture.database.0).unwrap();
+        let held = try_lock_transfers(&other).unwrap().expect("lock is free");
+
+        let scan = scan_drive_job(
+            fixture.database.0.clone(),
+            fixture.drives[0].clone(),
+            |_, _, _| {},
+        );
+        let error = scan().unwrap_err();
+
+        assert!(error.contains("A transfer is running"), "{error}");
+        drop(held);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    // Detaches a disk image when the test ends, even if it fails.
+    struct AttachedImage(PathBuf);
+
+    impl Drop for AttachedImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.0)
+                .output();
+        }
+    }
+
+    // Fills a real, tiny volume. Opt in with `cargo test -- --ignored`: it
+    // creates and mounts a disk image with hdiutil.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn copy_that_runs_out_of_space_fails_and_cleans_up() {
+        let fixture = progress_fixture("matrix-out-of-space");
+        let image = fixture.volume.0.join("full.dmg");
+        let mount = fixture.volume.0.join("Full");
+        let created = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["create", "-size", "3m", "-fs", "HFS+", "-volname", "MMFull"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+        fs::create_dir_all(&mount).unwrap();
+        let attached = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "{attached:?}");
+        let _detach = AttachedImage(mount.clone());
+
+        // The 5 MB source cannot fit on a 3 MB volume.
+        let destination = mount.join("Archive/clip.mov");
+        let error = execute_transfer_paths(
+            &fixture.connection,
+            fixture.move_id,
+            &fixture.source,
+            &destination,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            present_error(&error, "copy the file"),
+            "The destination ran out of space during the copy. Free some space there, then copy again."
+        );
+        assert!(!destination.exists());
+        assert!(partial_files(destination.parent().unwrap()).is_empty());
+        assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
+        assert!(planned_move_exists(&fixture.connection, fixture.move_id));
+        let history = list_transfer_records(&fixture.connection).unwrap();
+        assert_eq!(history[0].status, "failed");
+        let _ = &fixture.database;
+    }
+
+    // ---- Content checks ----
+
+    // Two temporary drives, Alpha and Beta, with a catalogue to fill.
+    struct CheckFixture {
+        connection: Connection,
+        drives: Vec<DriveInfo>,
+        alpha: TestVolume,
+        beta: TestVolume,
+        _database: TestDatabase,
+    }
+
+    fn check_fixture(name: &str) -> CheckFixture {
+        let database = TestDatabase::new(name);
+        let unique = format!("{name}-{}-{}", std::process::id(), now_unix());
+        let alpha = TestVolume(std::env::temp_dir().join(format!("media-mapper-{unique}-alpha")));
+        let beta = TestVolume(std::env::temp_dir().join(format!("media-mapper-{unique}-beta")));
+        for volume in [&alpha, &beta] {
+            let _ = fs::remove_dir_all(&volume.0);
+            fs::create_dir_all(&volume.0).unwrap();
+        }
+        let connection = open_database(&database.0).unwrap();
+        insert_drive(&connection, "UUID-A", "Alpha");
+        insert_drive(&connection, "UUID-B", "Beta");
+        let drives = vec![
+            test_drive("UUID-A", "Alpha", &alpha.0, 1_000_000_000),
+            test_drive("UUID-B", "Beta", &beta.0, 1_000_000_000),
+        ];
+        CheckFixture {
+            connection,
+            drives,
+            alpha,
+            beta,
+            _database: database,
+        }
+    }
+
+    impl CheckFixture {
+        // Writes a file on a drive and catalogues it as a scan would.
+        fn add(&self, drive_id: &str, relative_path: &str, contents: &[u8]) -> PathBuf {
+            let volume = if drive_id == "UUID-A" {
+                &self.alpha
+            } else {
+                &self.beta
+            };
+            let path = volume.0.join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            let modified_at = system_time_unix(fs::metadata(&path).unwrap().modified());
+            let relative = Path::new(relative_path);
+            self.connection
+                .execute(
+                    "INSERT INTO files (
+                        drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at
+                     ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                    params![
+                        drive_id,
+                        relative_path,
+                        relative.file_name().unwrap().to_string_lossy(),
+                        relative
+                            .parent()
+                            .map(|parent| parent.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        contents.len() as i64,
+                        modified_at
+                    ],
+                )
+                .unwrap();
+            path
+        }
+
+        fn check(&self) -> ContentCheckSummary {
+            run_content_check(&self.connection, &self.drives, &|_| {}, &|| false).unwrap()
+        }
+
+        // The stored (sample, full) hashes of one file, if it was checked.
+        fn hashes(
+            &self,
+            drive_id: &str,
+            relative_path: &str,
+        ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+            self.connection
+                .query_row(
+                    "SELECT sample_hash, full_hash FROM content_checks
+                     WHERE drive_id = ?1 AND relative_path = ?2",
+                    params![drive_id, relative_path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .unwrap()
+        }
+    }
+
+    // 1.2 MB of bytes that differ from one position to the next.
+    fn content(seed: u8) -> Vec<u8> {
+        (0..1_200_000_u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8 ^ seed)
+            .collect()
+    }
+
+    #[test]
+    fn identical_files_are_found_whatever_their_names() {
+        let fixture = check_fixture("check-identical");
+        let original = content(1);
+        fixture.add("UUID-A", "Films/holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/renamed copy.mov", &original);
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_checked, 2);
+        assert!(!summary.cancelled);
+        let first = fixture.hashes("UUID-A", "Films/holiday.mov").unwrap();
+        let second = fixture.hashes("UUID-B", "Backup/renamed copy.mov").unwrap();
+        assert!(first.1.is_some());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn same_size_with_different_contents_is_never_identical() {
+        let fixture = check_fixture("check-different");
+        let original = content(2);
+        let mut at_start = original.clone();
+        at_start[10] ^= 0xFF;
+        let mut in_middle = original.clone();
+        in_middle[600_000] ^= 0xFF;
+        let mut at_end = original.clone();
+        let last = at_end.len() - 3;
+        at_end[last] ^= 0xFF;
+        fixture.add("UUID-A", "original.mov", &original);
+        fixture.add("UUID-B", "start.mov", &at_start);
+        fixture.add("UUID-B", "middle.mov", &in_middle);
+        fixture.add("UUID-B", "end.mov", &at_end);
+
+        fixture.check();
+
+        let original_hashes = fixture.hashes("UUID-A", "original.mov").unwrap();
+        // A change at either end is settled by the sample, without a full read.
+        for name in ["start.mov", "end.mov"] {
+            let (sample, full) = fixture.hashes("UUID-B", name).unwrap();
+            assert_ne!(sample, original_hashes.0, "{name}");
+            assert_eq!(full, None, "{name} needs no full read");
+        }
+        // A change in the middle shares the sample, so is read in full.
+        let middle = fixture.hashes("UUID-B", "middle.mov").unwrap();
+        assert_eq!(middle.0, original_hashes.0);
+        assert!(middle.1.is_some() && original_hashes.1.is_some());
+        assert_ne!(middle.1, original_hashes.1);
+    }
+
+    #[test]
+    fn a_check_counts_only_while_the_catalogue_entry_is_unchanged() {
+        let fixture = check_fixture("check-stale");
+        let original = content(3);
+        fixture.add("UUID-A", "a.mov", &original);
+        fixture.add("UUID-B", "b.mov", &original);
+        fixture.check();
+        assert!(content_candidates(&fixture.connection)
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.full_hash.is_some()));
+
+        // A rescan finds b.mov with a new date.
+        fixture
+            .connection
+            .execute(
+                "UPDATE files SET modified_at = modified_at + 60 WHERE relative_path = 'b.mov'",
+                [],
+            )
+            .unwrap();
+
+        let candidates = content_candidates(&fixture.connection).unwrap();
+        let b = candidates
+            .iter()
+            .find(|candidate| candidate.relative_path == "b.mov")
+            .unwrap();
+        assert_eq!(b.sample_hash, None);
+        assert_eq!(b.full_hash, None);
+    }
+
+    #[test]
+    fn a_file_changed_since_the_scan_is_left_unchecked() {
+        let fixture = check_fixture("check-changed-on-disk");
+        let original = content(4);
+        fixture.add("UUID-A", "a.mov", &original);
+        let b = fixture.add("UUID-B", "b.mov", &original);
+        // Rewritten after the scan, with a different date.
+        let later = std::time::SystemTime::now() + Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(fixture.hashes("UUID-B", "b.mov"), None);
+    }
+
+    #[test]
+    fn checks_of_an_offline_drive_are_kept() {
+        let fixture = check_fixture("check-offline");
+        let original = content(5);
+        fixture.add("UUID-A", "a.mov", &original);
+        fixture.add("UUID-B", "b.mov", &original);
+        fixture.check();
+
+        // Beta is disconnected: its check still stands, nothing is lost and
+        // a new check has nothing to read there.
+        let alpha_only = vec![fixture.drives[0].clone()];
+        let summary =
+            run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+        assert_eq!(summary, ContentCheckSummary::default());
+        assert!(fixture.hashes("UUID-B", "b.mov").unwrap().1.is_some());
+        assert!(estimate_content_check_for(&fixture.connection, &alpha_only)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_and_pipes_are_never_read() {
+        let fixture = check_fixture("check-links");
+        let original = content(6);
+        fixture.add("UUID-A", "a.mov", &original);
+        let link = fixture.add("UUID-B", "link.mov", &original);
+        let pipe = fixture.add("UUID-B", "pipe.mov", &original);
+        // After the scan, one becomes a link to the real file, the other a pipe.
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(fixture.alpha.0.join("a.mov"), &link).unwrap();
+        fs::remove_file(&pipe).unwrap();
+        assert!(std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success());
+
+        let summary = fixture.check();
+
+        assert_eq!(summary.files_unreadable, 2);
+        assert_eq!(fixture.hashes("UUID-B", "link.mov"), None);
+        assert_eq!(fixture.hashes("UUID-B", "pipe.mov"), None);
+    }
+
+    #[test]
+    fn a_cancelled_check_keeps_what_it_finished_and_records_nothing_more() {
+        let fixture = check_fixture("check-cancel");
+        for index in 0..4 {
+            fixture.add("UUID-A", &format!("a{index}.mov"), &content(10 + index));
+            fixture.add("UUID-B", &format!("b{index}.mov"), &content(10 + index));
+        }
+        // Cancel after a few files.
+        let calls = std::cell::Cell::new(0);
+        let summary = run_content_check(&fixture.connection, &fixture.drives, &|_| {}, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 3
+        })
+        .unwrap();
+
+        assert!(summary.cancelled);
+        let recorded: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recorded, 3, "the three files sampled before the cancel");
+
+        // The next check carries on and finishes.
+        let summary = fixture.check();
+        assert!(!summary.cancelled);
+        assert_eq!(summary.files_checked, 8);
+    }
+
+    #[test]
+    fn a_check_never_changes_any_file() {
+        let fixture = check_fixture("check-read-only");
+        let original = content(7);
+        let paths = [
+            fixture.add("UUID-A", "a.mov", &original),
+            fixture.add("UUID-B", "b.mov", &original),
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.created().ok(),
+                )
+            })
+            .collect();
+
+        fixture.check();
+
+        let after: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.modified().unwrap(),
+                    metadata.created().ok(),
+                )
+            })
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(folder_names(&fixture.alpha.0), ["a.mov"]);
+        assert_eq!(folder_names(&fixture.beta.0), ["b.mov"]);
+    }
+
+    #[test]
+    fn small_and_hidden_files_are_never_read() {
+        let fixture = check_fixture("check-small-hidden");
+        fixture.add("UUID-A", "small.jpg", &[1_u8; 999_999]);
+        fixture.add("UUID-B", "small.jpg", &[1_u8; 999_999]);
+        fixture.add("UUID-A", ".hidden/big.mov", &content(8));
+        fixture.add("UUID-B", "._big.mov", &content(8));
+
+        let summary = fixture.check();
+
+        assert_eq!(summary, ContentCheckSummary::default());
+        let recorded: i64 = fixture
+            .connection
+            .query_row("SELECT COUNT(*) FROM content_checks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    #[test]
+    fn a_check_waits_for_copies_and_scans() {
+        let fixture = check_fixture("check-locked");
+        fixture.add("UUID-A", "a.mov", &content(9));
+        fixture.add("UUID-B", "b.mov", &content(9));
+        let other = open_database(&fixture._database.0).unwrap();
+        let held = try_lock_transfers(&other).unwrap().expect("lock is free");
+
+        let error = run_content_check(&fixture.connection, &fixture.drives, &|_| {}, &|| false)
+            .unwrap_err();
+
+        assert_eq!(error, CONTENT_CHECK_BUSY);
+        assert_eq!(fixture.hashes("UUID-A", "a.mov"), None);
+        drop(held);
+        assert_eq!(fixture.check().files_checked, 2);
+    }
+
+    #[test]
+    fn the_estimate_counts_unchecked_candidates_on_connected_drives() {
+        let fixture = check_fixture("check-estimate");
+        fixture.add("UUID-A", "a.mov", &content(11));
+        fixture.add("UUID-B", "b.mov", &content(11));
+        fixture.add("UUID-B", "c.mov", &content(12));
+        fixture.add("UUID-B", "lonely.mov", &[0_u8; 1_500_000]);
+
+        let estimate = estimate_content_check_for(&fixture.connection, &fixture.drives).unwrap();
+        assert_eq!(
+            estimate,
+            [
+                ContentCheckEstimate {
+                    drive_id: "UUID-A".to_string(),
+                    drive_name: "Alpha".to_string(),
+                    file_count: 1,
+                    max_bytes: 1_200_000
+                },
+                ContentCheckEstimate {
+                    drive_id: "UUID-B".to_string(),
+                    drive_name: "Beta".to_string(),
+                    file_count: 2,
+                    max_bytes: 2_400_000
+                },
+            ]
+        );
+
+        // Once checked in full, nothing is left to estimate.
+        fixture.check();
+        let remaining = estimate_content_check_for(&fixture.connection, &fixture.drives).unwrap();
+        // c.mov's sample differs, so it was never read in full and stays
+        // in the estimate as an upper bound.
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].file_count, 1);
+    }
+
+    // Groups as (kind, name, copies, ["Drive:path", ...]).
+    fn duplicate_kinds(
+        overview: &DuplicateOverview,
+    ) -> Vec<(DuplicateKind, String, i64, Vec<String>)> {
+        overview
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.kind,
+                    group.name.clone(),
+                    group.copies,
+                    group
+                        .files
+                        .iter()
+                        .map(|file| format!("{}:{}", file.drive_name, file.relative_path))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checked_copies_are_listed_as_identical_with_their_extra_space() {
+        let fixture = check_fixture("identical-listed");
+        let original = content(20);
+        fixture.add("UUID-A", "Films/holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/holiday.mov", &original);
+        fixture.add("UUID-B", "Other/renamed.mov", &original);
+        // Probable before the check, by name; the renamed copy isn't.
+        let before = find_duplicates(&fixture.connection).unwrap();
+        assert_eq!(before.probable_group_count, 1);
+        assert_eq!(before.identical_group_count, 0);
+        assert_eq!(before.identical_extra_bytes, 0);
+
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(
+            duplicate_kinds(&after),
+            [(
+                DuplicateKind::Identical,
+                "holiday.mov".to_string(),
+                3,
+                vec![
+                    "Alpha:Films/holiday.mov".to_string(),
+                    "Beta:Backup/holiday.mov".to_string(),
+                    "Beta:Other/renamed.mov".to_string()
+                ]
+            )]
+        );
+        assert!(after.groups[0].checked_at.is_some());
+        assert_eq!(after.identical_group_count, 1);
+        assert_eq!(after.identical_extra_bytes, 2 * original.len() as i64);
+        // Settled files are no longer probable.
+        assert_eq!(after.probable_group_count, 0);
+    }
+
+    #[test]
+    fn a_probable_pair_with_different_contents_disappears_once_checked() {
+        let fixture = check_fixture("identical-differ");
+        let original = content(21);
+        let mut changed = original.clone();
+        changed[5] ^= 0xFF;
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &changed);
+        assert_eq!(
+            find_duplicates(&fixture.connection)
+                .unwrap()
+                .probable_group_count,
+            1
+        );
+
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert!(after.groups.is_empty());
+        assert_eq!(after.probable_group_count, 0);
+        assert_eq!(after.identical_extra_bytes, 0);
+    }
+
+    #[test]
+    fn a_probable_pair_stays_probable_until_both_copies_are_checked() {
+        let fixture = check_fixture("identical-half-checked");
+        let original = content(22);
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &original);
+
+        // Only Alpha is connected: its copy is sampled, Beta's can't be.
+        let alpha_only = vec![fixture.drives[0].clone()];
+        run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(
+            duplicate_kinds(&after),
+            [(
+                DuplicateKind::Probable,
+                "clip.mov".to_string(),
+                2,
+                vec!["Alpha:clip.mov".to_string(), "Beta:clip.mov".to_string()]
+            )]
+        );
+
+        // With both connected it is settled as identical.
+        fixture.check();
+        let after = find_duplicates(&fixture.connection).unwrap();
+        assert_eq!(after.identical_group_count, 1);
+        assert_eq!(after.probable_group_count, 0);
+    }
+
+    #[test]
+    fn an_identical_group_goes_back_to_probable_when_a_copy_changes() {
+        let fixture = check_fixture("identical-stale");
+        let original = content(23);
+        fixture.add("UUID-A", "clip.mov", &original);
+        fixture.add("UUID-B", "clip.mov", &original);
+        fixture.check();
+        assert_eq!(
+            find_duplicates(&fixture.connection)
+                .unwrap()
+                .identical_group_count,
+            1
+        );
+
+        // A rescan finds Beta's copy with a new date.
+        fixture
+            .connection
+            .execute(
+                "UPDATE files SET modified_at = modified_at + 60 WHERE drive_id = 'UUID-B'",
+                [],
+            )
+            .unwrap();
+        let after = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(after.identical_group_count, 0);
+        assert_eq!(after.identical_extra_bytes, 0);
+        assert_eq!(after.probable_group_count, 1);
+    }
+
+    #[test]
+    fn identical_groups_come_first_and_only_they_count_towards_extra_space() {
+        let fixture = check_fixture("identical-order");
+        let big = content(24);
+        fixture.add("UUID-A", "same.mov", &big);
+        fixture.add("UUID-B", "same.mov", &big);
+        // Small files are only ever probable, however large the group.
+        for drive in ["UUID-A", "UUID-B"] {
+            fixture.add(drive, "small.jpg", &[7_u8; 500_000]);
+        }
+        fixture.check();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+        let kinds: Vec<DuplicateKind> = overview.groups.iter().map(|group| group.kind).collect();
+
+        assert_eq!(kinds, [DuplicateKind::Identical, DuplicateKind::Probable]);
+        assert_eq!(overview.identical_extra_bytes, big.len() as i64);
+        assert_eq!(overview.probable_group_count, 1);
+    }
+
+    #[test]
+    fn an_unchecked_copy_keeps_its_group_probable_beside_the_identical_ones() {
+        let fixture = check_fixture("identical-plus-unchecked");
+        let original = content(25);
+        fixture.add("UUID-A", "a/clip.mov", &original);
+        fixture.add("UUID-A", "b/clip.mov", &original);
+        // A third copy, on Beta, which is offline during the check.
+        fixture.add("UUID-B", "clip.mov", &original);
+        let alpha_only = vec![fixture.drives[0].clone()];
+        run_content_check(&fixture.connection, &alpha_only, &|_| {}, &|| false).unwrap();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+
+        // Alpha's copies are known to be identical; Beta's may match them.
+        assert_eq!(
+            duplicate_kinds(&overview),
+            [
+                (
+                    DuplicateKind::Identical,
+                    "clip.mov".to_string(),
+                    2,
+                    vec![
+                        "Alpha:a/clip.mov".to_string(),
+                        "Alpha:b/clip.mov".to_string()
+                    ]
+                ),
+                (
+                    DuplicateKind::Probable,
+                    "clip.mov".to_string(),
+                    3,
+                    vec![
+                        "Alpha:a/clip.mov".to_string(),
+                        "Alpha:b/clip.mov".to_string(),
+                        "Beta:clip.mov".to_string()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_identical_group_is_named_after_the_name_most_copies_share() {
+        let fixture = check_fixture("identical-name");
+        let original = content(26);
+        fixture.add("UUID-A", "holiday.mov", &original);
+        fixture.add("UUID-B", "holiday.mov", &original);
+        fixture.add("UUID-B", "Backup/a copy.mov", &original);
+        fixture.check();
+
+        let overview = find_duplicates(&fixture.connection).unwrap();
+
+        assert_eq!(overview.groups[0].kind, DuplicateKind::Identical);
+        assert_eq!(overview.groups[0].name, "holiday.mov");
     }
 }
