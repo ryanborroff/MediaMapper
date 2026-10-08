@@ -1908,7 +1908,93 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Unable to locate Media Mapper data directory: {error}"))?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("Unable to create Media Mapper data directory: {error}"))?;
-    Ok(directory.join("catalogue.sqlite3"))
+    let path = directory.join("catalogue.sqlite3");
+    if !LEGACY_CATALOGUE_CHECKED.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(legacy) = directory
+            .parent()
+            .map(|parent| parent.join(LEGACY_IDENTIFIER).join("catalogue.sqlite3"))
+        {
+            bring_legacy_catalogue_across(&legacy, &path)?;
+        }
+        LEGACY_CATALOGUE_CHECKED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(path)
+}
+
+// The bundle identifier before 1.0. Its data folder may hold a catalogue
+// from a development or test build.
+const LEGACY_IDENTIFIER: &str = "com.mediamapper.app";
+
+// Set once the legacy catalogue has been brought across or found not to need
+// it, so later commands skip the check.
+static LEGACY_CATALOGUE_CHECKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Copies a catalogue from the pre-1.0 identifier's folder into the current
+// one, the first time the current folder has no catalogue. The old folder is
+// only read, and is left as it was.
+//
+// The copy is written under a temporary name, checked, and then linked into
+// place, which never replaces an existing file. If it can't be made, this
+// fails rather than letting the app start an empty catalogue, which would
+// stop the old one from ever being brought across.
+fn bring_legacy_catalogue_across(legacy: &Path, path: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok()
+        || !fs::symlink_metadata(legacy).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Ok(());
+    }
+
+    let mut temporary = path.to_path_buf().into_os_string();
+    temporary.push(format!(
+        ".{}-{}.partial",
+        std::process::id(),
+        BACKUP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let temporary = PathBuf::from(temporary);
+
+    let result = Connection::open_with_flags(legacy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|connection| {
+            connection.busy_timeout(DATABASE_BUSY_TIMEOUT)?;
+            connection.execute("VACUUM INTO ?1", params![temporary.to_string_lossy()])
+        })
+        .map_err(|error| error.to_string())
+        .and_then(|_| {
+            let integrity: String =
+                Connection::open_with_flags(&temporary, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .and_then(|copy| copy.query_row("PRAGMA integrity_check", [], |row| row.get(0)))
+                    .map_err(|error| error.to_string())?;
+            if integrity == "ok" {
+                Ok(())
+            } else {
+                Err(format!("integrity check of the copy failed: {integrity}"))
+            }
+        })
+        .and_then(|_| match fs::hard_link(&temporary, path) {
+            Ok(()) => Ok(()),
+            // Another copy of the app brought it across first.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.to_string()),
+        });
+    // Only ever this attempt's own temporary file.
+    let _ = fs::remove_file(&temporary);
+
+    match result {
+        Ok(()) => {
+            log_diagnostic(&format!(
+                "Brought the catalogue across from {}",
+                legacy.display()
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            log_diagnostic(&format!(
+                "Bringing the catalogue across from {} failed: {error}",
+                legacy.display()
+            ));
+            Err("Media Mapper couldn't move your catalogue to its new folder, so it was left where it was. Check that this Mac has free space, then reopen Media Mapper.".to_string())
+        }
+    }
 }
 
 // How long a connection waits for another connection's write lock before
@@ -2748,7 +2834,7 @@ const DESTINATION_STEPS: &[&str] = &[
 
 const CATALOGUE_BUSY: &str =
     "Media Mapper is still finishing another task, such as a scan. Try again in a moment.";
-const CATALOGUE_DAMAGED: &str = "Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.mediamapper.app) before trying anything else.";
+const CATALOGUE_DAMAGED: &str = "Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.ryanborroff.mediamapper) before trying anything else.";
 const MAC_FULL: &str =
     "This Mac is out of space, so Media Mapper couldn't save its catalogue. Free some space, then try again.";
 
@@ -2858,7 +2944,7 @@ fn present_transfer_error(error: &str) -> String {
     user_message(error, "copy the file").unwrap_or_else(|| error.to_string())
 }
 
-// The diagnostics log: `~/Library/Logs/com.mediamapper.app/media-mapper.log`.
+// The diagnostics log: `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`.
 // Set at startup. stderr alone is lost when the app is opened from Finder.
 static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -6178,6 +6264,122 @@ mod tests {
         fn drop(&mut self) {
             self.remove_files();
         }
+    }
+
+    // Old and new data folders for the identifier change, side by side as
+    // they are under Application Support.
+    struct DataFolders(PathBuf);
+
+    impl DataFolders {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "media-mapper-{name}-{}-{}",
+                std::process::id(),
+                now_unix()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("old")).unwrap();
+            fs::create_dir_all(root.join("new")).unwrap();
+            DataFolders(root)
+        }
+
+        fn legacy(&self) -> PathBuf {
+            self.0.join("old").join("catalogue.sqlite3")
+        }
+
+        fn current(&self) -> PathBuf {
+            self.0.join("new").join("catalogue.sqlite3")
+        }
+
+        fn new_folder_entries(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.0.join("new"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for DataFolders {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn drive_names(path: &Path) -> Vec<String> {
+        let connection = open_database(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT name FROM drives ORDER BY name")
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        names
+    }
+
+    #[test]
+    fn legacy_catalogue_is_brought_across_and_left_unchanged() {
+        let folders = DataFolders::new("legacy-across");
+        {
+            let connection = open_database(&folders.legacy()).unwrap();
+            insert_drive(&connection, "mars-id", "Mars");
+        }
+        let before = fs::read(folders.legacy()).unwrap();
+
+        bring_legacy_catalogue_across(&folders.legacy(), &folders.current()).unwrap();
+
+        assert_eq!(drive_names(&folders.current()), vec!["Mars"]);
+        assert_eq!(fs::read(folders.legacy()).unwrap(), before);
+        assert_eq!(drive_names(&folders.legacy()), vec!["Mars"]);
+    }
+
+    #[test]
+    fn legacy_catalogue_includes_writes_not_yet_checkpointed() {
+        let folders = DataFolders::new("legacy-wal");
+        let writer = open_database(&folders.legacy()).unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        insert_drive(&writer, "venus-id", "Venus");
+
+        bring_legacy_catalogue_across(&folders.legacy(), &folders.current()).unwrap();
+        drop(writer);
+
+        assert_eq!(drive_names(&folders.current()), vec!["Venus"]);
+    }
+
+    #[test]
+    fn existing_catalogue_is_never_replaced_by_the_legacy_one() {
+        let folders = DataFolders::new("legacy-existing");
+        insert_drive(&open_database(&folders.legacy()).unwrap(), "old-id", "Old");
+        insert_drive(&open_database(&folders.current()).unwrap(), "new-id", "New");
+
+        bring_legacy_catalogue_across(&folders.legacy(), &folders.current()).unwrap();
+
+        assert_eq!(drive_names(&folders.current()), vec!["New"]);
+    }
+
+    #[test]
+    fn nothing_is_created_without_a_legacy_catalogue() {
+        let folders = DataFolders::new("legacy-none");
+
+        bring_legacy_catalogue_across(&folders.legacy(), &folders.current()).unwrap();
+
+        assert!(folders.new_folder_entries().is_empty());
+    }
+
+    #[test]
+    fn damaged_legacy_catalogue_is_refused_without_creating_one() {
+        let folders = DataFolders::new("legacy-damaged");
+        fs::write(folders.legacy(), b"not a database").unwrap();
+
+        let error =
+            bring_legacy_catalogue_across(&folders.legacy(), &folders.current()).unwrap_err();
+
+        assert!(error.contains("couldn't move your catalogue"), "{error}");
+        assert!(folders.new_folder_entries().is_empty());
+        assert_eq!(fs::read(folders.legacy()).unwrap(), b"not a database");
     }
 
     fn insert_drive(connection: &Connection, id: &str, name: &str) {

@@ -18,7 +18,7 @@ What it produces:
 - `src-tauri/target/release/bundle/macos/Media Mapper.app`
 - `src-tauri/target/release/bundle/dmg/Media Mapper_<version>_<arch>.dmg`
 
-Expected output: one warning, that the bundle identifier `com.mediamapper.app` ends with `.app`. See [HARDENING.md](HARDENING.md) gap 12. Nothing else should warn or fail.
+Expected output: no warnings or failures. (Before the identifier changed, the Tauri CLI warned that it ended in `.app`.)
 
 ## 2. Inspect the bundle
 
@@ -34,7 +34,7 @@ hdiutil verify "$DMG"
 
 | Check | Expected now (unsigned build) | Expected once Phase 8 is done |
 |---|---|---|
-| `CFBundleIdentifier` | `com.mediamapper.app` | A decided, permanent identifier |
+| `CFBundleIdentifier` | `com.ryanborroff.mediamapper` | The same. It is permanent. |
 | `CFBundleShortVersionString` / `CFBundleVersion` | Both `0.1.0` | The version, plus a separate, increasing build number |
 | `LSMinimumSystemVersion` | `10.13`, which is lower than Tauri 2 supports | `10.15` or later |
 | Architecture | `arm64` only | Decided: arm64 only, or universal |
@@ -62,7 +62,7 @@ dd if=/dev/urandom of=/Volumes/MMSmokeLarge/huge.bin bs=1m count=2048
 shasum -a 256 /Volumes/MMSmokeSource/Films/big.bin /Volumes/MMSmokeLarge/huge.bin > "$T/sources.sha"
 ```
 
-Launch the release app with the separate home folder. The catalogue then lives at `$T/home/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`, and your real one is never opened:
+Launch the release app with the separate home folder. The catalogue then lives at `$T/home/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`, and your real one is never opened:
 
 ```bash
 HOME="$T/home" "$APP/Contents/MacOS/media-mapper"
@@ -73,7 +73,7 @@ Started this way, the app inherits Terminal's privacy permissions, so macOS asks
 To read the test catalogue:
 
 ```bash
-sqlite3 "$T/home/Library/Application Support/com.mediamapper.app/catalogue.sqlite3" "SELECT id, status, copied_bytes, error_message FROM transfers"
+sqlite3 "$T/home/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3" "SELECT id, status, copied_bytes, error_message FROM transfers"
 ```
 
 Use plain `sqlite3`, not `-readonly`. The database is in WAL mode, and a read-only open fails when the app has no connection open.
@@ -122,7 +122,7 @@ These can't be automated. They need a person at the Mac, because macOS shows pri
 Before you start, quit Media Mapper and back up the real catalogue. A Finder launch can't be pointed at another home folder:
 
 ```bash
-cp ~/Library/Application\ Support/com.mediamapper.app/catalogue.sqlite3 ~/Desktop/catalogue-backup.sqlite3
+cp ~/Library/Application\ Support/com.ryanborroff.mediamapper/catalogue.sqlite3 ~/Desktop/catalogue-backup.sqlite3
 ```
 
 1. Copy `Media Mapper.app` to `/Applications` and open it from Finder.
@@ -163,11 +163,11 @@ Run with disk images and a separate home folder, driving the bundled app through
 
 | # | Finding | Class |
 |---|---|---|
-| P3-1 | The bundle identifier ends in `.app`, and the catalogue folder is named after it. This is gap 12 in [HARDENING.md](HARDENING.md). | Blocker |
+| P3-1 | The bundle identifier ends in `.app`, and the catalogue folder is named after it. This is gap 12 in [HARDENING.md](HARDENING.md). | Fixed: `com.ryanborroff.mediamapper`, and the old catalogue is brought across on first use |
 | P3-2 | The bundle signature is invalid (linker ad-hoc only). Fine on the building Mac. On any other Mac it's reported as damaged. To fix in Phase 8 with Developer ID signing and notarisation. | Blocker for distribution (Phase 8) |
 | P3-3 | arm64-only build: Intel Macs can't run it. Universal or arm64-only is a decision for Phase 8. | Should fix before V1 (decision) |
 | P3-4 | No `NSRemovableVolumesUsageDescription` or Documents, Desktop and Downloads usage strings. Development never shows these prompts, so they are untested: see section 5. | Fixed in `761706c` (SHIPPING.md) |
-| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.mediamapper.app/media-mapper.log` |
+| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log` |
 | P3-6 | Plan's "Space after transfer" uses the free space stored at the last scan, while readiness uses current free space. The two can contradict each other on one screen, and the planned-data figure is the truthful one to show. | Should fix before V1 |
 | P3-7 | Plan readiness isn't rechecked when free space changes on a drive that stays connected. It refreshes on connect, disconnect and user actions. Execution always rechecks, so this is never unsafe. | Safe to defer |
 | P3-8 | `LSMinimumSystemVersion` is 10.13, lower than Tauri 2 supports (10.15). | Should fix before V1 (Phase 8) |
