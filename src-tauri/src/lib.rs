@@ -270,6 +270,9 @@ struct PlanPreflightDestination {
     available_bytes: Option<i64>,
     projected_available_bytes: Option<i64>,
     capacity_sufficient: Option<bool>,
+    // True when `available_bytes` is the free space stored at the drive's
+    // last scan, because the drive isn't connected now.
+    available_at_last_scan: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -1015,7 +1018,7 @@ fn execute_planned_transfer_reporting(
     // Only issues that concern this move stop it. A problem with another
     // planned move, such as its drive being disconnected, does not.
     let validation = validate_plan_live(connection, connected_drives)?;
-    let preflight = plan_preflight(connection)?;
+    let preflight = plan_preflight(connection, connected_drives)?;
     if let Some(issue) = validation
         .issues
         .iter()
@@ -4972,10 +4975,18 @@ struct PreflightMove {
     destination_display_name: Option<String>,
     destination_kind: Option<String>,
     destination_local_path: Option<String>,
+    destination_drive_id: Option<String>,
     destination_available_bytes: Option<i64>,
 }
 
-fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
+// Totals the plan per destination. Free space is current wherever it can be:
+// `df` for folders on this Mac, and diskutil (via `connected_drives`) for
+// connected drives. Only a drive that isn't connected falls back to the free
+// space stored at its last scan.
+fn plan_preflight(
+    connection: &Connection,
+    connected_drives: &[DriveInfo],
+) -> Result<PlanPreflight, String> {
     let moves = {
         let mut statement = connection
             .prepare(
@@ -4986,6 +4997,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                         COALESCE(NULLIF(l.user_label, ''), l.display_name),
                         l.kind,
                         l.local_path,
+                        l.drive_id,
                         CASE WHEN l.kind = 'external_drive' THEN d.available_bytes ELSE NULL END
                  FROM planned_moves p
                  LEFT JOIN locations l ON l.id = p.destination_location_id
@@ -5004,7 +5016,8 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     destination_display_name: row.get(4)?,
                     destination_kind: row.get(5)?,
                     destination_local_path: row.get(6)?,
-                    destination_available_bytes: row.get(7)?,
+                    destination_drive_id: row.get(7)?,
+                    destination_available_bytes: row.get(8)?,
                 })
             })
             .map_err(|error| format!("Unable to read plan preflight: {error}"))?;
@@ -5019,8 +5032,10 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
         HashMap::new();
     let mut known_bytes = 0_i64;
     let mut unknown_size_count = 0_i64;
-    let mut destination_totals: HashMap<String, (String, String, i64, i64, i64, Option<i64>)> =
-        HashMap::new();
+    let mut destination_totals: HashMap<
+        String,
+        (String, String, i64, i64, i64, Option<i64>, bool),
+    > = HashMap::new();
     let mut source_roots: Vec<(i64, String, String, bool)> = Vec::new();
 
     for planned in &moves {
@@ -5043,16 +5058,40 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
         let destination = destination_totals
             .entry(planned.destination_location_id.clone())
             .or_insert_with(|| {
-                let available_bytes = match destination_kind.as_str() {
-                    "local_folder" => planned
-                        .destination_local_path
-                        .as_deref()
-                        .and_then(|path| free_bytes_at(Path::new(path)).ok())
-                        .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
-                        .map(|free| free.min(i64::MAX as u64) as i64),
-                    _ => planned.destination_available_bytes,
+                let connected = planned.destination_drive_id.as_deref().and_then(|id| {
+                    connected_drives
+                        .iter()
+                        .find(|drive| drive.persistent_identifier.as_deref() == Some(id))
+                });
+                let (available_bytes, at_last_scan) = match destination_kind.as_str() {
+                    "local_folder" => (
+                        planned
+                            .destination_local_path
+                            .as_deref()
+                            .and_then(|path| free_bytes_at(Path::new(path)).ok())
+                            .map(|free| free.saturating_sub(LOCAL_FOLDER_FREE_SPACE_RESERVE))
+                            .map(|free| free.min(i64::MAX as u64) as i64),
+                        false,
+                    ),
+                    _ => match connected {
+                        Some(drive) => (
+                            drive
+                                .available_bytes
+                                .map(|free| free.min(i64::MAX as u64) as i64),
+                            false,
+                        ),
+                        None => (planned.destination_available_bytes, true),
+                    },
                 };
-                (destination_name, destination_kind, 0, 0, 0, available_bytes)
+                (
+                    destination_name,
+                    destination_kind,
+                    0,
+                    0,
+                    0,
+                    available_bytes,
+                    at_last_scan,
+                )
             });
         destination.2 += 1;
 
@@ -5186,14 +5225,20 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
     let mut destinations: Vec<PlanPreflightDestination> = destination_totals
         .into_iter()
         .map(
-            |(location_id, (display_name, kind, move_count, bytes, unknown, available))| {
+            |(
+                location_id,
+                (display_name, kind, move_count, bytes, unknown, available, at_last_scan),
+            )| {
                 let projected = available.map(|free| free.saturating_sub(bytes).max(0));
                 let sufficient = if unknown > 0 {
                     None
                 } else {
                     available.map(|free| bytes <= free)
                 };
-                if available.is_some_and(|free| bytes > free) {
+                // Current free space is checked by `validate_plan_live`, which
+                // reports a shortfall itself, so only a last-scan figure is
+                // reported here.
+                if at_last_scan && available.is_some_and(|free| bytes > free) {
                     issues.push(PlanPreflightIssue {
                         code: "insufficient_capacity".to_string(),
                         message: format!(
@@ -5213,6 +5258,7 @@ fn plan_preflight(connection: &Connection) -> Result<PlanPreflight, String> {
                     available_bytes: available,
                     projected_available_bytes: projected,
                     capacity_sufficient: sufficient,
+                    available_at_last_scan: at_last_scan,
                 }
             },
         )
@@ -5548,7 +5594,7 @@ fn validate_plan_live(
     // Capacity is checked once per destination using current free space,
     // rather than the value stored at the last catalogue scan: diskutil for
     // external drives, df for folders on this Mac.
-    let preflight = plan_preflight(connection)?;
+    let preflight = plan_preflight(connection, connected_drives)?;
     for destination in &preflight.destinations {
         let local_folder = destination.kind == "local_folder";
         let available = match destination.kind.as_str() {
@@ -5675,8 +5721,11 @@ async fn execute_planned_move(
 #[tauri::command]
 async fn get_plan_preflight(app: tauri::AppHandle) -> Result<PlanPreflight, String> {
     run_command("check the plan", move || {
+        // Without drive discovery, connected drives fall back to their
+        // last-scan free space rather than the plan failing to load.
+        let drives = external_drives().unwrap_or_default();
         let connection = open_database(&database_path(&app)?)?;
-        plan_preflight(&connection)
+        plan_preflight(&connection, &drives)
     })
     .await
 }
@@ -7076,7 +7125,7 @@ mod tests {
         assert_eq!(plans, expected_plans, "{context}");
         // The plan is readable the way the Plan screen reads it.
         assert_eq!(
-            plan_preflight(connection).unwrap().move_count,
+            plan_preflight(connection, &[]).unwrap().move_count,
             expected_plans.len() as i64,
             "{context}"
         );
@@ -7893,7 +7942,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = plan_preflight(&connection).unwrap();
+        let result = plan_preflight(&connection, &[]).unwrap();
         assert_eq!(result.move_count, 2);
         assert_eq!(result.known_bytes, 100);
         assert_eq!(result.unknown_size_count, 1);
@@ -7955,7 +8004,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = plan_preflight(&connection).unwrap();
+        let result = plan_preflight(&connection, &[]).unwrap();
 
         assert_eq!(result.move_count, 2);
         assert_eq!(result.known_bytes, 100);
@@ -8015,7 +8064,7 @@ mod tests {
             )
             .unwrap();
 
-        let stale = plan_preflight(&connection).unwrap();
+        let stale = plan_preflight(&connection, &[]).unwrap();
         assert_eq!(stale.move_count, 1);
         assert_eq!(stale.known_bytes, 0);
         assert!(stale
@@ -8031,7 +8080,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let capacity = plan_preflight(&connection).unwrap();
+        let capacity = plan_preflight(&connection, &[]).unwrap();
         assert_eq!(capacity.known_bytes, 100);
         assert_eq!(capacity.destinations[0].capacity_sufficient, Some(false));
         assert_eq!(capacity.destinations[0].projected_available_bytes, Some(0));
@@ -8041,6 +8090,81 @@ mod tests {
             .any(|issue| issue.code == "insufficient_capacity"));
     }
 
+    // A 100-byte file planned to Backup, whose last scan recorded
+    // `stored_free` bytes free.
+    fn plan_to_backup_with_stored_free_space(connection: &mut Connection, stored_free: i64) {
+        insert_drive(connection, "UUID-A", "Source");
+        insert_drive(connection, "UUID-B", "Backup");
+        connection
+            .execute(
+                "UPDATE drives SET available_bytes = ?1 WHERE persistent_identifier = 'UUID-B'",
+                params![stored_free],
+            )
+            .unwrap();
+        sync_drive_locations(connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO files
+                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-A', 'film.mov', 'film.mov', '', 0, 100)",
+                [],
+            )
+            .unwrap();
+        plan_move(connection, "UUID-A", "film.mov", "drive:UUID-B", "film.mov").unwrap();
+    }
+
+    #[test]
+    fn preflight_uses_current_free_space_of_a_connected_destination() {
+        let database = TestDatabase::new("preflight-live-more");
+        let mut connection = open_database(&database.0).unwrap();
+        // The last scan saw too little space; some has been freed since.
+        plan_to_backup_with_stored_free_space(&mut connection, 50);
+        let mount = std::env::temp_dir();
+        let drives = vec![test_drive("UUID-B", "Backup", &mount, 400)];
+
+        let offline = plan_preflight(&connection, &[]).unwrap();
+        assert_eq!(offline.destinations[0].available_bytes, Some(50));
+        assert!(offline.destinations[0].available_at_last_scan);
+        assert!(offline
+            .issues
+            .iter()
+            .any(|issue| issue.code == "insufficient_capacity"));
+
+        let connected = plan_preflight(&connection, &drives).unwrap();
+        let destination = &connected.destinations[0];
+        assert_eq!(destination.available_bytes, Some(400));
+        assert_eq!(destination.projected_available_bytes, Some(300));
+        assert_eq!(destination.capacity_sufficient, Some(true));
+        assert!(!destination.available_at_last_scan);
+        assert!(connected.issues.is_empty());
+    }
+
+    #[test]
+    fn preflight_and_live_validation_agree_when_space_has_shrunk() {
+        let database = TestDatabase::new("preflight-live-less");
+        let mut connection = open_database(&database.0).unwrap();
+        // The last scan saw plenty of space; most has been used since.
+        plan_to_backup_with_stored_free_space(&mut connection, 1_000);
+        let mount = std::env::temp_dir();
+        let drives = vec![test_drive("UUID-B", "Backup", &mount, 60)];
+
+        let preflight = plan_preflight(&connection, &drives).unwrap();
+        let destination = &preflight.destinations[0];
+        assert_eq!(destination.available_bytes, Some(60));
+        assert_eq!(destination.projected_available_bytes, Some(0));
+        assert_eq!(destination.capacity_sufficient, Some(false));
+
+        // The shortfall is reported once, by the live check.
+        let live = validate_plan_live(&connection, &drives).unwrap();
+        let shortfalls = live
+            .issues
+            .iter()
+            .chain(preflight.issues.iter())
+            .filter(|issue| issue.code.ends_with("insufficient_capacity"))
+            .count();
+        assert_eq!(shortfalls, 1);
+    }
+
     #[test]
     fn preflight_handles_empty_plan_and_unknown_local_capacity() {
         let database = TestDatabase::new("preflight-empty-local");
@@ -8048,7 +8172,7 @@ mod tests {
         insert_drive(&connection, "UUID-A", "Source");
         sync_drive_locations(&connection).unwrap();
 
-        let empty = plan_preflight(&connection).unwrap();
+        let empty = plan_preflight(&connection, &[]).unwrap();
         assert_eq!(empty.move_count, 0);
         assert_eq!(empty.known_bytes, 0);
         assert!(empty.destinations.is_empty());
@@ -8073,7 +8197,7 @@ mod tests {
         )
         .unwrap();
 
-        let local = plan_preflight(&connection).unwrap();
+        let local = plan_preflight(&connection, &[]).unwrap();
         assert_eq!(local.known_bytes, 25);
         assert_eq!(local.destinations[0].kind, "local_folder");
         match local.destinations[0].available_bytes {
@@ -8521,7 +8645,7 @@ mod tests {
         connection
             .execute("DELETE FROM files WHERE drive_id = 'UUID-A'", [])
             .unwrap();
-        let preflight = plan_preflight(&connection).unwrap();
+        let preflight = plan_preflight(&connection, &[]).unwrap();
         let missing = preflight
             .issues
             .iter()
