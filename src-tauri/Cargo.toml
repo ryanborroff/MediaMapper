@@ -1,6 +1,6 @@
 [package]
 name = "media-mapper"
-version = "0.1.0"
+version = "1.0.0"
 description = "Catalogue external drives and plan where files should live"
 authors = ["ryanborroff"]
 edition = "2021"

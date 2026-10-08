@@ -10,23 +10,23 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 |---|---|---|---|
 | D1 | **Bundle identifier** | *Decided: `com.ryanborroff.mediamapper`.* | It can never change after the first public build. The catalogue's folder is named after it. |
 | D2 | **App icon** | A 1024 × 1024 PNG, made into every size with `npx tauri icon <file>` | The bundle still uses Tauri's default icon |
-| D3 | **Apple silicon only, or universal** | Universal, unless you are sure every user has Apple silicon | The build is arm64 only, so Intel Macs can't run it |
-| D4 | **Minimum macOS** | The oldest version you can actually test, for example macOS 13 | The bundle declares 10.13, which nobody has tested and which is older than Tauri 2 supports |
-| D5 | **Product name in the window** | "Media Mapper", which the bundle, window title, README and every message already use | The sidebar says "MediaMapper" |
-| D6 | **Version and build number** | V1 is `1.0.0`. The build number is a separate integer that rises with every build. | `CFBundleVersion` currently repeats the version |
+| D3 | **Apple silicon only, or universal** | *Decided: universal.* `npm run build:release` builds it. | An arm64-only build can't run on Intel Macs |
+| D4 | **Minimum macOS** | *Decided: macOS 27.0,* the version that can be tested. Lower it only after testing on an older version. | Anyone on an older macOS can't open it |
+| D5 | **Product name in the window** | *Decided: "Media Mapper"* everywhere, including the sidebar | |
+| D6 | **Version and build number** | *Decided:* V1 is `1.0.0`, build `1`. Raise `bundle.macOS.bundleVersion` by one for every build anyone else receives. | |
 | D7 | **Updates** | No automatic updater in V1. See [Updates](#updates). | An updater is a security-critical channel and needs its own keys and hosting |
 
 ## Application identity
 
 | Item | Now | Needed |
 |---|---|---|
-| Product name | `Media Mapper` (`productName`); the sidebar says "MediaMapper" | One spelling (D5) |
+| Product name | `Media Mapper` everywhere | Done (D5) |
 | Bundle identifier | `com.ryanborroff.mediamapper` (was `com.mediamapper.app`) | Done, with existing catalogues brought across (below) |
-| Version | `0.1.0` in `tauri.conf.json`, `package.json` and `Cargo.toml` | `1.0.0` for V1, set in all three |
-| Build number | `CFBundleVersion` = `0.1.0` | `bundle.macOS.bundleVersion`, an increasing integer (D6) |
+| Version | `1.0.0` in `tauri.conf.json`, `package.json` and `Cargo.toml` | Done |
+| Build number | `bundle.macOS.bundleVersion` = `1` | Done (D6); raise it for every build |
 | Icon | Tauri's default placeholder | D2 |
-| Metadata | Description in `Cargo.toml` only. No copyright and no category. | `bundle.copyright` (for example "© 2026 Ryan Borroff") and `bundle.category` (`Utility`) |
-| Minimum macOS | `LSMinimumSystemVersion` 10.13, Tauri's default | `bundle.macOS.minimumSystemVersion` (D4) |
+| Metadata | `bundle.category` is `Utility`; `bundle.copyright` is "© 2026 Kind Enough Studio" | Done |
+| Minimum macOS | `bundle.macOS.minimumSystemVersion` = `27.0` | Done (D4) |
 
 ### Changing the identifier without losing catalogues
 
@@ -101,12 +101,14 @@ spctl -a -vv -t open --context context:primary-signature "Media Mapper_1.0.0_uni
 
 A DMG is the right format: a signed, notarised and stapled DMG holding the app and an Applications link. A ZIP works too, but a DMG is the familiar install for a Mac utility.
 
-For a universal build:
+The release build is universal. Once per Mac, add the Intel target, then build:
 
 ```bash
 rustup target add x86_64-apple-darwin
-npm run tauri build -- --target universal-apple-darwin
+npm run build:release
 ```
+
+It produces `src-tauri/target/universal-apple-darwin/release/bundle/macos/Media Mapper.app` and `.../bundle/dmg/Media Mapper_<version>_universal.dmg`.
 
 ## Permissions
 
@@ -151,13 +153,13 @@ The flow is Drives → connect a drive → **Scan** → **Browse**, and it is ex
 
 ## Release checklist
 
-Use this once D2–D6 are decided.
+Use this once the icon (D2) is in place.
 
-1. **Identity:** set the version, build number, minimum macOS, copyright, category and icon. The identifier is already set.
+1. **Identity:** add the icon. The identifier, version, build number, minimum macOS, copyright and category are already set. Raise the build number for every build anyone else receives.
 2. **Certificate:** create the Developer ID Application certificate and an App Store Connect API key.
 3. **Build:**
    ```bash
-   npm run tauri build -- --target universal-apple-darwin
+   npm run build:release
    ```
    Run it with the signing and notarisation variables set.
 4. **DMG:** notarise and staple it, then check it with `spctl`.
@@ -171,11 +173,11 @@ Use this once D2–D6 are decided.
 | S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Fixed: `com.ryanborroff.mediamapper` |
 | S2 | No Developer ID Application certificate, so no signing or notarisation is possible yet | Blocker |
 | S3 | The icon is Tauri's default (D2) | Blocker |
-| S4 | arm64-only build (D3) | Should fix before V1 |
-| S5 | Minimum macOS declared as an untested 10.13 (D4) | Should fix before V1 |
-| S6 | Build number repeats the version (D6) | Should fix before V1 |
-| S7 | "MediaMapper" in the sidebar vs "Media Mapper" everywhere else (D5) | Should fix before V1 |
-| S8 | No copyright or category metadata | Should fix before V1 |
+| S4 | arm64-only build (D3) | Fixed: universal |
+| S5 | Minimum macOS declared as an untested 10.13 (D4) | Fixed: 27.0 |
+| S6 | Build number repeats the version (D6) | Fixed: 1.0.0, build 1 |
+| S7 | "MediaMapper" in the sidebar vs "Media Mapper" everywhere else (D5) | Fixed |
+| S8 | No copyright or category metadata | Fixed |
 | S9 | Privacy prompts not yet seen from a Finder launch (RELEASE-TESTING section 5) | Should fix before V1 |
 | S10 | Privacy usage descriptions | Fixed (`761706c`) |
 | S11 | Plan's empty state named a button that doesn't exist | Fixed (`ab858ee`) |
