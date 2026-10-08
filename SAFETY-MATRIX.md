@@ -166,7 +166,7 @@ Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destin
    Compare against a hash taken before the test.
 7. Optionally, read the raw records. Use plain `sqlite3`: `-readonly` fails on this WAL database when the app has no connection open.
    ```bash
-   sqlite3 ~/Library/Application\ Support/com.mediamapper.app/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
+   sqlite3 ~/Library/Application\ Support/com.ryanborroff.mediamapper/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
    ```
 
 **Cases**

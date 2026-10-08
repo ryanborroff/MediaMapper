@@ -8,7 +8,7 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 
 | # | Decision | Recommendation | Why it matters |
 |---|---|---|---|
-| D1 | **Bundle identifier** | Reverse DNS of a domain you own, such as `com.<yourdomain>.mediamapper`. It must not end in `.app`. | It can never change after the first public build. The catalogue's folder is named after it. |
+| D1 | **Bundle identifier** | *Decided: `com.ryanborroff.mediamapper`.* | It can never change after the first public build. The catalogue's folder is named after it. |
 | D2 | **App icon** | A 1024 × 1024 PNG, made into every size with `npx tauri icon <file>` | The bundle still uses Tauri's default icon |
 | D3 | **Apple silicon only, or universal** | Universal, unless you are sure every user has Apple silicon | The build is arm64 only, so Intel Macs can't run it |
 | D4 | **Minimum macOS** | The oldest version you can actually test, for example macOS 13 | The bundle declares 10.13, which nobody has tested and which is older than Tauri 2 supports |
@@ -21,7 +21,7 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 | Item | Now | Needed |
 |---|---|---|
 | Product name | `Media Mapper` (`productName`); the sidebar says "MediaMapper" | One spelling (D5) |
-| Bundle identifier | `com.mediamapper.app`. The Tauri CLI warns that it ends in `.app`. | D1, plus a way to bring existing catalogues across (below) |
+| Bundle identifier | `com.ryanborroff.mediamapper` (was `com.mediamapper.app`) | Done, with existing catalogues brought across (below) |
 | Version | `0.1.0` in `tauri.conf.json`, `package.json` and `Cargo.toml` | `1.0.0` for V1, set in all three |
 | Build number | `CFBundleVersion` = `0.1.0` | `bundle.macOS.bundleVersion`, an increasing integer (D6) |
 | Icon | Tauri's default placeholder | D2 |
@@ -30,27 +30,16 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 
 ### Changing the identifier without losing catalogues
 
-The catalogue, its pre-upgrade backups and the log all live in folders named after the identifier:
+The catalogue, its pre-upgrade backups and the log all live in folders named after the identifier. Builds before 1.0 used `com.mediamapper.app`; the identifier is now `com.ryanborroff.mediamapper`.
 
-- `~/Library/Application Support/com.mediamapper.app/`
-- `~/Library/Logs/com.mediamapper.app/`
+The first time the app needs its catalogue and the new folder holds none, it brings the old one across (`bring_legacy_catalogue_across`, details in [DATABASE.md](DATABASE.md)):
 
-No public build has shipped, so the only catalogues at risk are your own and any testers'. There are two ways to handle them:
+1. it copies the old catalogue with `VACUUM INTO`, as the schema backups already are;
+2. it runs `PRAGMA integrity_check` on the copy;
+3. only then does it link the copy into place, never replacing an existing catalogue;
+4. it leaves the old folder untouched.
 
-- **Move them by hand once**, with the app closed:
-  ```bash
-  mv ~/Library/Application\ Support/com.mediamapper.app ~/Library/Application\ Support/<new identifier>
-  ```
-  This is enough if only you have run Media Mapper.
-- **Bring them across in code** if testers have catalogues. On launch, when the new folder holds no catalogue and the old one does:
-  1. copy the old catalogue with `VACUUM INTO`, as the schema backups already are;
-  2. run `PRAGMA integrity_check` on the copy;
-  3. only then link it into place;
-  4. leave the old folder untouched.
-
-  That is a small, testable change, using the same never-replace pattern as `back_up_before_migration`.
-
-Either way, change the identifier before the first build anyone else installs. After that, it is permanent.
+The old log isn't moved; a new one starts in `~/Library/Logs/com.ryanborroff.mediamapper/`. The identifier is permanent from the first build anyone else installs.
 
 ## Distribution
 
@@ -162,9 +151,9 @@ The flow is Drives → connect a drive → **Scan** → **Browse**, and it is ex
 
 ## Release checklist
 
-Use this once D1–D6 are decided.
+Use this once D2–D6 are decided.
 
-1. **Identity:** set the identifier, version, build number, minimum macOS, copyright, category and icon. Move your own catalogue folder, or add the copy-on-launch step.
+1. **Identity:** set the version, build number, minimum macOS, copyright, category and icon. The identifier is already set.
 2. **Certificate:** create the Developer ID Application certificate and an App Store Connect API key.
 3. **Build:**
    ```bash
@@ -179,7 +168,7 @@ Use this once D1–D6 are decided.
 
 | # | Finding | Class |
 |---|---|---|
-| S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Blocker |
+| S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Fixed: `com.ryanborroff.mediamapper` |
 | S2 | No Developer ID Application certificate, so no signing or notarisation is possible yet | Blocker |
 | S3 | The icon is Tauri's default (D2) | Blocker |
 | S4 | arm64-only build (D3) | Should fix before V1 |

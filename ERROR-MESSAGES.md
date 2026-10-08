@@ -14,7 +14,7 @@ Internal failures are built as `Unable to <step>: <detail>`, where the detail co
 
 Transfer history keeps the recorded error, so the log and the record agree. It's shown with the same wording as above, through `present_transfer_error`.
 
-**Diagnostics log:** `~/Library/Logs/com.mediamapper.app/media-mapper.log`, plus stderr. Each line is a Unix time and the full technical detail. At 1 MB the log moves to `media-mapper.log.1`, replacing the previous one. Before Phase 6, diagnostics went only to stderr, which is lost when the app is opened from Finder (RELEASE-TESTING P3-5).
+**Diagnostics log:** `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`, plus stderr. Each line is a Unix time and the full technical detail. At 1 MB the log moves to `media-mapper.log.1`, replacing the previous one. Before Phase 6, diagnostics went only to stderr, which is lost when the app is opened from Finder (RELEASE-TESTING P3-5).
 
 ## Messages by category
 
@@ -47,7 +47,7 @@ Transfer history keeps the recorded error, so the log and the record agree. It's
 | | Read-only destination (EROFS) | The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to. |
 | | Anything else | macOS didn't let Media Mapper *do this*. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again. |
 | Catalogue | Busy, for example during a scan | Media Mapper is still finishing another task, such as a scan. Try again in a moment. |
-| | Damaged | Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.mediamapper.app) before trying anything else. |
+| | Damaged | Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.ryanborroff.mediamapper) before trying anything else. |
 | | From a newer version | This catalogue was updated by a newer version of Media Mapper, so this version can't use it. Open it with the newer version of Media Mapper. |
 | | Backup failed before an upgrade | Media Mapper couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Media Mapper. |
 | Scan | A transfer is running | A transfer is running. Wait for it to finish, then scan the drive. |
