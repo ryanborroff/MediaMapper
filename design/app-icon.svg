@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2c2c2b"/><stop offset="1" stop-color="#151515"/></linearGradient>
+    <linearGradient id="drive" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6f6f3"/><stop offset="1" stop-color="#dcdcd6"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="180%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity=".45"/></filter>
+    <filter id="iconShadow" x="-10%" y="-10%" width="120%" height="125%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity=".28"/></filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" filter="url(#iconShadow)"/>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="184.5" fill="none" stroke="#ffffff" stroke-opacity=".08"/>
+  <g filter="url(#shadow)">
+    <rect x="232" y="277" width="560" height="150" rx="38" fill="#9d9d96"/>
+    <rect x="232" y="263" width="560" height="150" rx="38" fill="url(#drive)"/>
+  </g>
+  <rect x="232.5" y="263.5" width="559" height="149" rx="37.5" fill="none" stroke="#ffffff" stroke-opacity=".7"/>
+  <rect x="282" y="319" width="230" height="38" rx="12" fill="#2f8a4e"/>
+  <circle cx="732" cy="338" r="15" fill="#3fae6b"/>
+  <g filter="url(#shadow)">
+    <rect x="232" y="449" width="560" height="150" rx="38" fill="#9d9d96"/>
+    <rect x="232" y="435" width="560" height="150" rx="38" fill="url(#drive)"/>
+  </g>
+  <rect x="232.5" y="435.5" width="559" height="149" rx="37.5" fill="none" stroke="#ffffff" stroke-opacity=".7"/>
+  <rect x="282" y="491" width="160" height="38" rx="12" fill="#b9b9b2"/>
+  <circle cx="732" cy="510" r="15" fill="#8f8f88"/>
+  <g filter="url(#shadow)">
+    <rect x="232" y="621" width="560" height="150" rx="38" fill="#9d9d96"/>
+    <rect x="232" y="607" width="560" height="150" rx="38" fill="url(#drive)"/>
+  </g>
+  <rect x="232.5" y="607.5" width="559" height="149" rx="37.5" fill="none" stroke="#ffffff" stroke-opacity=".7"/>
+  <rect x="282" y="663" width="200" height="38" rx="12" fill="#b9b9b2"/>
+  <circle cx="732" cy="682" r="15" fill="#8f8f88"/>
+</svg>

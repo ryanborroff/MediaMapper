@@ -4,7 +4,6 @@ Where Media Mapper stands for V1, as of 2026-10-07 on `release-hardening` (`e794
 
 **Verdict.** The app itself is ready. The copy pipeline, recovery, database upgrades, error wording, accessibility fixes and duplicate awareness are built, tested and checked in the release build. What stands between it and a public release is mostly not code:
 
-- an icon (D2), the one decision left;
 - a Developer ID certificate;
 - a short round of testing by hand with real drives and a Finder launch.
 
@@ -149,8 +148,7 @@ The Duplicates view follows the same rules: groups are buttons with `aria-expand
 - **The build works.** `npm run build:release` produces a working universal `Media Mapper.app` (13 MB) and a DMG (6.2 MB). The arm64-only build was 6.4 MB and 3.1 MB.
 - **The release CSP, dialogs and macOS tools all work** in the bundled app.
 - **The bundle is unsigned:** only the linker signs it, ad hoc, and `codesign --verify` fails.
-- **It needs a real icon before release.**
-- **Settled:** a universal build (`npm run build:release`), version 1.0.0 build 1, minimum macOS 27.0, category Utility, and "© 2026 Kind Enough Studio".
+- **Settled:** a universal build (`npm run build:release`), version 1.0.0 build 1, minimum macOS 27.0, category Utility, "© 2026 Kind Enough Studio", and the app icon.
 
 ## 10. Signing and notarisation status
 
@@ -174,7 +172,6 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 | Issue | Source |
 |---|---|
 | Get a Developer ID Application certificate, then sign, notarise and staple the app and DMG (you, then a build) | SHIPPING S2, P3-2 |
-| Replace Tauri's default icon (D2, you supply the artwork) | SHIPPING S3 |
 
 ### Should fix before V1
 

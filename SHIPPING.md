@@ -9,7 +9,7 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 | # | Decision | Recommendation | Why it matters |
 |---|---|---|---|
 | D1 | **Bundle identifier** | *Decided: `com.ryanborroff.mediamapper`.* | It can never change after the first public build. The catalogue's folder is named after it. |
-| D2 | **App icon** | A 1024 × 1024 PNG, made into every size with `npx tauri icon <file>` | The bundle still uses Tauri's default icon |
+| D2 | **App icon** | *Decided: three labelled external drives, stacked* (`design/app-icon.svg`). Every size is made with `npx tauri icon design/app-icon.png`. | It's the first thing anyone sees of the app |
 | D3 | **Apple silicon only, or universal** | *Decided: universal.* `npm run build:release` builds it. | An arm64-only build can't run on Intel Macs |
 | D4 | **Minimum macOS** | *Decided: macOS 27.0,* the version that can be tested. Lower it only after testing on an older version. | Anyone on an older macOS can't open it |
 | D5 | **Product name in the window** | *Decided: "Media Mapper"* everywhere, including the sidebar | |
@@ -24,7 +24,7 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 | Bundle identifier | `com.ryanborroff.mediamapper` (was `com.mediamapper.app`) | Done, with existing catalogues brought across (below) |
 | Version | `1.0.0` in `tauri.conf.json`, `package.json` and `Cargo.toml` | Done |
 | Build number | `bundle.macOS.bundleVersion` = `1` | Done (D6); raise it for every build |
-| Icon | Tauri's default placeholder | D2 |
+| Icon | Media Mapper's own, from `design/app-icon.svg` | Done (D2) |
 | Metadata | `bundle.category` is `Utility`; `bundle.copyright` is "© 2026 Kind Enough Studio" | Done |
 | Minimum macOS | `bundle.macOS.minimumSystemVersion` = `27.0` | Done (D4) |
 
@@ -153,9 +153,7 @@ The flow is Drives → connect a drive → **Scan** → **Browse**, and it is ex
 
 ## Release checklist
 
-Use this once the icon (D2) is in place.
-
-1. **Identity:** add the icon. The identifier, version, build number, minimum macOS, copyright and category are already set. Raise the build number for every build anyone else receives.
+1. **Identity:** the identifier, version, build number, minimum macOS, copyright, category and icon are already set. Raise the build number for every build anyone else receives.
 2. **Certificate:** create the Developer ID Application certificate and an App Store Connect API key.
 3. **Build:**
    ```bash
@@ -172,7 +170,7 @@ Use this once the icon (D2) is in place.
 |---|---|---|
 | S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Fixed: `com.ryanborroff.mediamapper` |
 | S2 | No Developer ID Application certificate, so no signing or notarisation is possible yet | Blocker |
-| S3 | The icon is Tauri's default (D2) | Blocker |
+| S3 | The icon is Tauri's default (D2) | Fixed |
 | S4 | arm64-only build (D3) | Fixed: universal |
 | S5 | Minimum macOS declared as an untested 10.13 (D4) | Fixed: 27.0 |
 | S6 | Build number repeats the version (D6) | Fixed: 1.0.0, build 1 |

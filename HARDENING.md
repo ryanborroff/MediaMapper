@@ -227,7 +227,7 @@ The full audit, the decisions it needs, and a release checklist are in [SHIPPING
 - **Blockers:**
   - the bundle identifier (gap 12 / P3-1). *Fixed: `com.ryanborroff.mediamapper`.*
   - no Developer ID Application certificate on this Mac, only Apple Development and App Store distribution certificates;
-  - the icon is still Tauri's default.
+  - the icon is still Tauri's default. *Fixed: Media Mapper's own icon.*
 - **Hardened runtime** (required for notarisation): a copy signed with it and no entitlements launched, detected and scanned a drive, and browsed it. No entitlements are needed.
 - [x] **Privacy usage descriptions** for removable volumes and the Documents, Desktop and Downloads folders (`761706c`). P3-4 is fixed.
 - [x] **Plan's empty state** named a "Plan move" button that doesn't exist (`ab858ee`).
