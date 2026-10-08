@@ -188,7 +188,6 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 | Open the app from Finder and check the privacy prompts | RELEASE-TESTING section 5 |
 | Run the VoiceOver checklist in the app | ACCESSIBILITY.md |
 | Open a file from Browse in the release build (R10) | RELEASE-TESTING |
-| Plan's "Space after transfer" uses free space from the last scan and can contradict the live "not enough space" check on the same screen | P3-6 |
 | Apple silicon only, or universal (D3) | SHIPPING S4 |
 | Declare a tested minimum macOS (D4) | SHIPPING S5 |
 | A build number separate from the version (D6) | SHIPPING S6 |
@@ -225,7 +224,7 @@ Ship what exists today, with nothing added:
 - **Transfers:** truthful history with Show in Finder.
 - **Duplicates:** informational only. Probable, identical once checked, with an estimate before reading, progress and Cancel.
 
-Then close the blockers and the "should fix" items in section 11. P3-6 is the only one that needs code.
+Then close the blockers and the "should fix" items in section 11. None of them needs new code; P3-6 was the last that did, and is fixed.
 
 ## 13. Explicitly deferred features
 

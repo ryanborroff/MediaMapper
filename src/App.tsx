@@ -183,6 +183,8 @@ type PlanPreflightDestination = {
   availableBytes: number | null;
   projectedAvailableBytes: number | null;
   capacitySufficient: boolean | null;
+  // The free space is from the drive's last scan, because it isn't connected.
+  availableAtLastScan: boolean;
 };
 
 // Sent by the backend as a file is copied and then verified.
@@ -2085,6 +2087,9 @@ function App() {
                             <span className="visually-hidden"> (not enough space)</span>
                           )}
                         </strong>
+                        {destination.availableAtLastScan && destination.projectedAvailableBytes !== null && (
+                          <span className="plan-capacity-note">At last scan</span>
+                        )}
                       </div>
                     </div>
                   ))}

@@ -1652,6 +1652,11 @@ dd { margin: 0; overflow-wrap: anywhere; color: var(--text-body); font-size: 13p
   color: var(--error-text);
 }
 
+.plan-capacity-note {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .plan-preview-button {
   width: fit-content;
   padding: 0;
