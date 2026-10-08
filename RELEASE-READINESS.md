@@ -4,9 +4,8 @@ Where Media Mapper stands for V1, as of 2026-10-07 on `release-hardening` (`e794
 
 **Verdict.** The app itself is ready. The copy pipeline, recovery, database upgrades, error wording, accessibility fixes and duplicate awareness are built, tested and checked in the release build. What stands between it and a public release is mostly not code:
 
-- three decisions only you can make;
+- an icon (D2), the one decision left;
 - a Developer ID certificate;
-- an icon;
 - a short round of testing by hand with real drives and a Finder launch.
 
 All remaining issues are classified in [section 11](#11-remaining-blockers).
@@ -19,9 +18,9 @@ Media Mapper is a macOS desktop app built with Tauri 2. The workflow is: browse 
 |---|---|
 | Backend | Rust, in `src-tauri/src/lib.rs`: about 6,100 lines of code and 6,800 of tests. It exposes 26 Tauri commands. |
 | Frontend | React 19 and TypeScript in `src/App.tsx` (3,600 lines), with `App.css`. Built with Vite. |
-| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.mediamapper.app/catalogue.sqlite3`. Schema version 2. See [DATABASE.md](DATABASE.md). |
+| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`. Schema version 2. See [DATABASE.md](DATABASE.md). |
 | macOS tools | `diskutil` (finding drives and their capacity), `df` (free space on this Mac), `open` (opening files, and Show in Finder) |
-| Diagnostics | `~/Library/Logs/com.mediamapper.app/media-mapper.log`, rolling over at 1 MB |
+| Diagnostics | `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`, rolling over at 1 MB |
 | Permissions | Not sandboxed. Tauri capabilities: `core:default`, `core:window:allow-show`, `dialog:default`. Privacy usage descriptions for removable volumes and the Documents, Desktop and Downloads folders. |
 
 Planning is virtual: plans are rows in the catalogue, and nothing on any drive changes until the user chooses **Copy and verify**. Scanning and duplicate checks only read.
@@ -150,9 +149,7 @@ The Duplicates view follows the same rules: groups are buttons with `aria-expand
 - **The build works.** `npm run build:release` produces a working universal `Media Mapper.app` (13 MB) and a DMG (6.2 MB). The arm64-only build was 6.4 MB and 3.1 MB.
 - **The release CSP, dialogs and macOS tools all work** in the bundled app.
 - **The bundle is unsigned:** only the linker signs it, ad hoc, and `codesign --verify` fails.
-- **It needs these before release:**
-  - a permanent identifier;
-  - a real icon;
+- **It needs a real icon before release.**
 - **Settled:** a universal build (`npm run build:release`), version 1.0.0 build 1, minimum macOS 27.0, category Utility, and "© 2026 Kind Enough Studio".
 
 ## 10. Signing and notarisation status
@@ -176,7 +173,6 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 
 | Issue | Source |
 |---|---|
-| Choose the permanent bundle identifier; `com.mediamapper.app` ends in `.app` (D1, you) | SHIPPING S1, gap 12 |
 | Get a Developer ID Application certificate, then sign, notarise and staple the app and DMG (you, then a build) | SHIPPING S2, P3-2 |
 | Replace Tauri's default icon (D2, you supply the artwork) | SHIPPING S3 |
 
