@@ -8,15 +8,17 @@ Run it before every release candidate, and after any change to Tauri configurati
 
 ```bash
 npm ci
-npm run tauri build
+npm run build:release
 ```
+
+`build:release` builds a universal app (`tauri build --target universal-apple-darwin`). It needs the Intel Rust target once per Mac: `rustup target add x86_64-apple-darwin`.
 
 This runs `npm run build` (type check and Vite) first, then builds the Rust app in release mode, which takes about 3–4 minutes from cold.
 
 What it produces:
 
-- `src-tauri/target/release/bundle/macos/Media Mapper.app`
-- `src-tauri/target/release/bundle/dmg/Media Mapper_<version>_<arch>.dmg`
+- `src-tauri/target/universal-apple-darwin/release/bundle/macos/Media Mapper.app`
+- `src-tauri/target/universal-apple-darwin/release/bundle/dmg/Media Mapper_<version>_universal.dmg`
 
 Expected output: one warning, that the bundle identifier `com.mediamapper.app` ends with `.app`. See [HARDENING.md](HARDENING.md) gap 12. Nothing else should warn or fail.
 
@@ -35,9 +37,9 @@ hdiutil verify "$DMG"
 | Check | Expected now (unsigned build) | Expected once Phase 8 is done |
 |---|---|---|
 | `CFBundleIdentifier` | `com.mediamapper.app` | A decided, permanent identifier |
-| `CFBundleShortVersionString` / `CFBundleVersion` | Both `0.1.0` | The version, plus a separate, increasing build number |
-| `LSMinimumSystemVersion` | `10.13`, which is lower than Tauri 2 supports | `10.15` or later |
-| Architecture | `arm64` only | Decided: arm64 only, or universal |
+| `CFBundleShortVersionString` / `CFBundleVersion` | `1.0.0` / `1` | The same, with the build number raised for each build |
+| `LSMinimumSystemVersion` | `27.0` | The same, unless an older macOS has been tested |
+| Architecture | `x86_64` and `arm64` (universal) | The same |
 | Signature | `adhoc,linker-signed`, so `codesign --verify` **fails** ("code has no resources but signature indicates they must be present") | Developer ID, hardened runtime, notarised and stapled |
 | DMG | Checksum VALID; holds `Media Mapper.app` and an `Applications` link | Same, signed |
 | Usage descriptions (`NS…UsageDescription`) | None | See the [permissions](#5-permissions-and-first-launch-from-finder) section |
@@ -165,7 +167,7 @@ Run with disk images and a separate home folder, driving the bundled app through
 |---|---|---|
 | P3-1 | The bundle identifier ends in `.app`, and the catalogue folder is named after it. This is gap 12 in [HARDENING.md](HARDENING.md). | Blocker |
 | P3-2 | The bundle signature is invalid (linker ad-hoc only). Fine on the building Mac. On any other Mac it's reported as damaged. To fix in Phase 8 with Developer ID signing and notarisation. | Blocker for distribution (Phase 8) |
-| P3-3 | arm64-only build: Intel Macs can't run it. Universal or arm64-only is a decision for Phase 8. | Should fix before V1 (decision) |
+| P3-3 | arm64-only build: Intel Macs can't run it. Universal or arm64-only is a decision for Phase 8. | Fixed: universal (`npm run build:release`) |
 | P3-4 | No `NSRemovableVolumesUsageDescription` or Documents, Desktop and Downloads usage strings. Development never shows these prompts, so they are untested: see section 5. | Fixed in `761706c` (SHIPPING.md) |
 | P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.mediamapper.app/media-mapper.log` |
 | P3-6 | Plan's "Space after transfer" uses the free space stored at the last scan, while readiness uses current free space. The two can contradict each other on one screen, and the planned-data figure is the truthful one to show. | Should fix before V1 |

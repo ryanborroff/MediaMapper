@@ -147,15 +147,13 @@ The Duplicates view follows the same rules: groups are buttons with `aria-expand
 
 ## 9. Release-build status
 
-- **The build works.** `npm run tauri build` produces a working `Media Mapper.app` (6.4 MB) and a DMG (3.1 MB).
+- **The build works.** `npm run build:release` produces a working universal `Media Mapper.app` (13 MB) and a DMG (6.2 MB). The arm64-only build was 6.4 MB and 3.1 MB.
 - **The release CSP, dialogs and macOS tools all work** in the bundled app.
 - **The bundle is unsigned:** only the linker signs it, ad hoc, and `codesign --verify` fails.
 - **It needs these before release:**
   - a permanent identifier;
   - a real icon;
-  - a declared minimum macOS that has been tested;
-  - a separate build number;
-  - copyright and category metadata.
+- **Settled:** a universal build (`npm run build:release`), version 1.0.0 build 1, minimum macOS 27.0, category Utility, and "© 2026 Kind Enough Studio".
 
 ## 10. Signing and notarisation status
 
@@ -191,11 +189,6 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 | Run the VoiceOver checklist in the app | ACCESSIBILITY.md |
 | Open a file from Browse in the release build (R10) | RELEASE-TESTING |
 | Plan's "Space after transfer" uses free space from the last scan and can contradict the live "not enough space" check on the same screen | P3-6 |
-| Apple silicon only, or universal (D3) | SHIPPING S4 |
-| Declare a tested minimum macOS (D4) | SHIPPING S5 |
-| A build number separate from the version (D6) | SHIPPING S6 |
-| "MediaMapper" in the sidebar vs "Media Mapper" everywhere else (D5) | SHIPPING S7 |
-| Copyright and category metadata | SHIPPING S8 |
 
 ### Safe to defer
 

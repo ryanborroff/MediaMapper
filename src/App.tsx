@@ -1753,7 +1753,7 @@ function App() {
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">MediaMapper</div>
+          <div className="sidebar-brand">Media Mapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
@@ -1926,7 +1926,7 @@ function App() {
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">MediaMapper</div>
+          <div className="sidebar-brand">Media Mapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
@@ -2268,7 +2268,7 @@ function App() {
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">MediaMapper</div>
+          <div className="sidebar-brand">Media Mapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => leave("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page" onClick={() => leave("browse")}>Browse</button>
@@ -2431,7 +2431,7 @@ function App() {
     return (
       <main className="app-shell app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">MediaMapper</div>
+          <div className="sidebar-brand">Media Mapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
@@ -2651,7 +2651,7 @@ function App() {
     return (
       <main className="app-navigation-shell">
         <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">MediaMapper</div>
+          <div className="sidebar-brand">Media Mapper</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("browse"); }}>Browse</button>
@@ -2994,7 +2994,7 @@ function App() {
   return (
     <main className="app-shell app-navigation-shell">
       <aside className="app-sidebar" aria-label="Media Mapper">
-        <div className="sidebar-brand">MediaMapper</div>
+        <div className="sidebar-brand">Media Mapper</div>
         <nav className="sidebar-navigation" aria-label="Main navigation">
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
