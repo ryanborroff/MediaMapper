@@ -42,6 +42,8 @@ Transfer history keeps the recorded error, so the log and the record agree. It's
 | Insufficient space | Destination full mid-copy (ENOSPC) | The destination ran out of space during the copy. Free some space there, then copy again. |
 | | This Mac full when saving the catalogue | This Mac is out of space, so Tidy Drives couldn't save its catalogue. Free some space, then try again. |
 | | Plan | *name* doesn't currently have enough free space… / didn't have enough free space for the planned files at its last scan. Free some space there, or plan fewer files. |
+| | Plan | *file* is larger than 4 GB, the biggest file “*drive*” can hold because it uses the FAT32 format. Choose another destination for it. |
+| | Plan | Nothing can be copied to “*drive*”, because macOS has it open as read-only. Drives formatted for Windows (NTFS) are read-only on a Mac. Choose another destination. |
 | Permission | Source not readable (EACCES, EPERM) | macOS didn't let Tidy Drives read the source file. Check its permissions in Finder, then copy again. |
 | | Destination not writable | macOS didn't let Tidy Drives add files to the destination. Check that you can add files there in Finder, then copy again. |
 | | Read-only destination (EROFS) | The destination is read-only, so nothing can be copied to it. Choose a destination you can add files to. |

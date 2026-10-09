@@ -5412,6 +5412,96 @@ fn file_name_of(relative_path: &str) -> &str {
     relative_path.rsplit('/').next().unwrap_or(relative_path)
 }
 
+// One mounted volume, as `/sbin/mount` lists it.
+#[derive(Debug, Clone, PartialEq)]
+struct MountedVolume {
+    mount_point: PathBuf,
+    format: String,
+    read_only: bool,
+}
+
+// Parses `/sbin/mount` output, whose lines look like
+// `/dev/disk4s1 on /Volumes/My Drive (exfat, local, nodev, read-only)`.
+// Mount points may contain spaces; the options are always the last
+// parenthesised group.
+fn parse_mount_list(text: &str) -> Vec<MountedVolume> {
+    text.lines()
+        .filter_map(|line| {
+            let (rest, options) = line.trim_end().strip_suffix(')')?.rsplit_once(" (")?;
+            let (_, mount_point) = rest.split_once(" on ")?;
+            let mut options = options.split(", ");
+            let format = options.next()?.trim().to_string();
+            let read_only = options.any(|option| option.trim() == "read-only");
+            Some(MountedVolume {
+                mount_point: PathBuf::from(mount_point),
+                format,
+                read_only,
+            })
+        })
+        .collect()
+}
+
+fn mounted_volumes() -> Vec<MountedVolume> {
+    std::process::Command::new("/sbin/mount")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_mount_list(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+// The volume holding `path`: the mounted volume with the longest mount point
+// that contains it. The startup disk is left out. Its sealed system volume
+// is listed at `/` as read-only, yet folders such as Documents live on its
+// writable data volume, and it is always APFS, which has none of the limits
+// checked here.
+fn volume_holding<'a>(volumes: &'a [MountedVolume], path: &Path) -> Option<&'a MountedVolume> {
+    volumes
+        .iter()
+        .filter(|volume| {
+            volume.mount_point != Path::new("/") && path.starts_with(&volume.mount_point)
+        })
+        .max_by_key(|volume| volume.mount_point.as_os_str().len())
+}
+
+// The largest file a FAT32 volume can hold: 4 GiB less one byte.
+const FAT32_MAX_FILE_BYTES: i64 = 4_294_967_295;
+
+// What the destination's format rules out for one planned file, before any
+// copying starts. `None` when the format allows it.
+fn destination_format_problem(
+    volume: &MountedVolume,
+    destination_name: Option<&str>,
+    relative_path: &str,
+    size_bytes: Option<i64>,
+) -> Option<(&'static str, String)> {
+    let drive = match destination_name {
+        Some(name) if !name.is_empty() => format!("“{name}”"),
+        _ => "the destination".to_string(),
+    };
+    if volume.read_only {
+        return Some((
+            "destination_read_only",
+            format!(
+                "Nothing can be copied to {drive}, because macOS has it open as read-only. Drives formatted for Windows (NTFS) are read-only on a Mac. Choose another destination."
+            ),
+        ));
+    }
+    // FAT32 caps a single file at 4 GB. Names are no problem: macOS stores
+    // characters FAT32 and exFAT reserve, such as `:` and `?`, in a form that
+    // reads back unchanged on a Mac.
+    if volume.format == "msdos" && size_bytes.is_some_and(|size| size > FAT32_MAX_FILE_BYTES) {
+        return Some((
+            "destination_file_too_large",
+            format!(
+                "{} is larger than 4 GB, the biggest file {drive} can hold because it uses the FAT32 format. Choose another destination for it.",
+                file_name_of(relative_path)
+            ),
+        ));
+    }
+    None
+}
+
 fn destination_message(subject: &str, name: Option<&str>, problem: &str) -> String {
     match name {
         Some(name) if !name.is_empty() => format!("{subject} “{name}” {problem}"),
@@ -5424,6 +5514,8 @@ fn validate_plan_live(
     connected_drives: &[DriveInfo],
 ) -> Result<PlanLiveValidation, String> {
     let mut issues = Vec::new();
+    let volumes = mounted_volumes();
+    let mut read_only_reported: HashSet<String> = HashSet::new();
 
     let connected_by_id: HashMap<&str, &DriveInfo> = connected_drives
         .iter()
@@ -5467,7 +5559,7 @@ fn validate_plan_live(
         move_id,
         source_drive_id,
         source_relative_path,
-        _destination_location_id,
+        destination_location_id,
         destination_kind,
         destination_drive_id,
         destination_local_path,
@@ -5598,6 +5690,46 @@ fn validate_plan_live(
             destination_relative_path.as_ref(),
         ) {
             let destination_path = root.join(relative_path);
+
+            // The mount list names real paths (`/private/var`, not `/var`).
+            let resolved_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if let Some(volume) = volume_holding(&volumes, &resolved_root) {
+                let size_bytes: Option<i64> = connection
+                    .query_row(
+                        "SELECT size_bytes FROM files WHERE drive_id = ?1 AND relative_path = ?2",
+                        params![source_drive_id, source_relative_path],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Unable to read planned file size: {error}"))?
+                    .flatten();
+                if let Some((code, message)) = destination_format_problem(
+                    volume,
+                    destination_name.as_deref(),
+                    relative_path,
+                    size_bytes,
+                ) {
+                    if code == "destination_read_only" {
+                        // One problem for the whole destination, which holds
+                        // back every file planned to it.
+                        if read_only_reported.insert(destination_location_id.clone()) {
+                            issues.push(PlanPreflightIssue {
+                                code: code.to_string(),
+                                message,
+                                move_id: None,
+                                location_id: Some(destination_location_id.clone()),
+                            });
+                        }
+                    } else {
+                        issues.push(PlanPreflightIssue {
+                            code: code.to_string(),
+                            message,
+                            move_id: Some(move_id),
+                            location_id: None,
+                        });
+                    }
+                }
+            }
 
             match fs::symlink_metadata(&destination_path) {
                 Ok(_) => issues.push(PlanPreflightIssue {
@@ -8517,6 +8649,229 @@ mod tests {
             offline.message,
             "The destination “Backup” isn't connected. Connect it to copy."
         );
+    }
+
+    #[test]
+    fn mount_list_is_parsed_including_spaces_and_read_only() {
+        let volumes = parse_mount_list(
+            "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+             /dev/disk4s1 on /Volumes/Backup (exfat, local, nodev, nosuid, noowners, noatime, fskit)\n\
+             /dev/disk5s1 on /Volumes/Old (Windows) Drive (ntfs, local, read-only, noowners)\n\
+             /dev/disk6s1 on /Volumes/CARD (msdos, local, nodev, nosuid, noowners)\n\
+             not a mount line\n",
+        );
+        assert_eq!(volumes.len(), 4);
+        assert_eq!(volumes[1].mount_point, PathBuf::from("/Volumes/Backup"));
+        assert_eq!(volumes[1].format, "exfat");
+        assert!(!volumes[1].read_only);
+        assert_eq!(
+            volumes[2].mount_point,
+            PathBuf::from("/Volumes/Old (Windows) Drive")
+        );
+        assert_eq!(volumes[2].format, "ntfs");
+        assert!(volumes[2].read_only);
+        assert_eq!(volumes[3].format, "msdos");
+    }
+
+    #[test]
+    fn volume_holding_picks_the_deepest_mount_and_skips_the_startup_disk() {
+        let volumes = parse_mount_list(
+            "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+             /dev/disk4s1 on /Volumes/Backup (exfat, local)\n\
+             /dev/disk7s1 on /Volumes/Backup/Nested (msdos, local)\n",
+        );
+        let nested = volume_holding(&volumes, Path::new("/Volumes/Backup/Nested/Films")).unwrap();
+        assert_eq!(nested.format, "msdos");
+        let backup = volume_holding(&volumes, Path::new("/Volumes/Backup/Films")).unwrap();
+        assert_eq!(backup.format, "exfat");
+        // A folder on the startup disk matches only the read-only sealed
+        // system volume at `/`, which must not count.
+        assert!(volume_holding(&volumes, Path::new("/Users/me/Documents")).is_none());
+        // `/Volumes/BackupOld` is not inside `/Volumes/Backup`.
+        assert!(volume_holding(&volumes, Path::new("/Volumes/BackupOld/x")).is_none());
+    }
+
+    #[test]
+    fn destination_format_rules_match_each_format() {
+        let volume = |format: &str, read_only: bool| MountedVolume {
+            mount_point: PathBuf::from("/Volumes/Card"),
+            format: format.to_string(),
+            read_only,
+        };
+        let code = |v: &MountedVolume, path: &str, size: Option<i64>| {
+            destination_format_problem(v, Some("Card"), path, size).map(|(code, _)| code)
+        };
+        let fat = volume("msdos", false);
+        let exfat = volume("exfat", false);
+        let apfs = volume("apfs", false);
+
+        assert_eq!(
+            code(&fat, "Films/big.mov", Some(FAT32_MAX_FILE_BYTES)),
+            None
+        );
+        assert_eq!(
+            code(&fat, "Films/big.mov", Some(FAT32_MAX_FILE_BYTES + 1)),
+            Some("destination_file_too_large")
+        );
+        assert_eq!(code(&exfat, "Films/big.mov", Some(50_000_000_000)), None);
+        assert_eq!(code(&fat, "Films/big.mov", None), None);
+
+        // Names FAT32 and exFAT reserve copy fine from a Mac, so they pass.
+        for name in [
+            "a:b.mov",
+            "what?.mov",
+            "x*y",
+            "<tag>",
+            "pipe|d",
+            "Trip: Paris/clip.mov",
+        ] {
+            assert_eq!(code(&fat, name, Some(1)), None, "{name}");
+            assert_eq!(code(&exfat, name, Some(1)), None, "{name}");
+        }
+        assert_eq!(code(&apfs, "Films/big.mov", Some(50_000_000_000)), None);
+
+        let read_only = volume("ntfs", true);
+        let (code_read_only, message) =
+            destination_format_problem(&read_only, Some("Old Drive"), "clip.mov", Some(1)).unwrap();
+        assert_eq!(code_read_only, "destination_read_only");
+        assert!(message.contains("“Old Drive”"), "{message}");
+        assert!(message.contains("read-only"), "{message}");
+    }
+
+    // Opt-in: creates FAT32, exFAT and read-only disk images and checks the
+    // live plan check refuses what each can't take before anything copies,
+    // and lets through what each can.
+    #[test]
+    #[ignore]
+    fn live_validation_refuses_what_the_destination_format_cannot_take() {
+        let database = TestDatabase::new("format-limits");
+        let mut connection = open_database(&database.0).unwrap();
+        let unique = format!("{}-{}", std::process::id(), now_unix());
+        let work = TestVolume(std::env::temp_dir().join(format!("tidy-drives-formats-{unique}")));
+        fs::create_dir_all(&work.0).unwrap();
+        let work_path = fs::canonicalize(&work.0).unwrap();
+        let source = work_path.join("source");
+        fs::create_dir_all(&source).unwrap();
+        for name in [
+            "a:b.mov",
+            "big-fat.mov",
+            "big-exfat.mov",
+            "one.mov",
+            "two.mov",
+        ] {
+            fs::write(source.join(name), b"x").unwrap();
+        }
+
+        insert_drive(&connection, "UUID-SRC", "Source");
+        let mut drives = vec![test_drive("UUID-SRC", "Source", &source, 1_000_000)];
+        let mut attached = Vec::new();
+        for (id, label, fs_name, read_only) in [
+            ("UUID-FAT", "MMFAT", "MS-DOS FAT32", false),
+            ("UUID-EXFAT", "MMEXFAT", "ExFAT", false),
+            ("UUID-RO", "MMRO", "HFS+", true),
+        ] {
+            let image = work_path.join(format!("{label}.dmg"));
+            let mount = work_path.join(label);
+            let created = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["create", "-size", "40m", "-fs", fs_name, "-volname", label])
+                .arg(&image)
+                .output()
+                .unwrap();
+            assert!(created.status.success(), "{created:?}");
+            fs::create_dir_all(&mount).unwrap();
+            let mut attach = std::process::Command::new("/usr/bin/hdiutil");
+            attach
+                .args(["attach", "-nobrowse", "-mountpoint"])
+                .arg(&mount);
+            if read_only {
+                attach.arg("-readonly");
+            }
+            let output = attach.arg(&image).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            attached.push(AttachedImage(mount.clone()));
+            insert_drive(&connection, id, label);
+            drives.push(test_drive(id, label, &mount, 40_000_000));
+        }
+        sync_drive_locations(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes)
+                 VALUES ('UUID-SRC', 'a:b.mov', 'a:b.mov', '', 0, 1),
+                        ('UUID-SRC', 'big-fat.mov', 'big-fat.mov', '', 0, 5000000000),
+                        ('UUID-SRC', 'big-exfat.mov', 'big-exfat.mov', '', 0, 5000000000),
+                        ('UUID-SRC', 'one.mov', 'one.mov', '', 0, 1),
+                        ('UUID-SRC', 'two.mov', 'two.mov', '', 0, 1);",
+            )
+            .unwrap();
+        let fat_name = plan_move(
+            &mut connection,
+            "UUID-SRC",
+            "a:b.mov",
+            "drive:UUID-FAT",
+            "a:b.mov",
+        )
+        .unwrap();
+        let fat_big = plan_move(
+            &mut connection,
+            "UUID-SRC",
+            "big-fat.mov",
+            "drive:UUID-FAT",
+            "big.mov",
+        )
+        .unwrap();
+        let exfat_big = plan_move(
+            &mut connection,
+            "UUID-SRC",
+            "big-exfat.mov",
+            "drive:UUID-EXFAT",
+            "big.mov",
+        )
+        .unwrap();
+        let ro_one = plan_move(
+            &mut connection,
+            "UUID-SRC",
+            "one.mov",
+            "drive:UUID-RO",
+            "one.mov",
+        )
+        .unwrap();
+        let _ro_two = plan_move(
+            &mut connection,
+            "UUID-SRC",
+            "two.mov",
+            "drive:UUID-RO",
+            "two.mov",
+        )
+        .unwrap();
+
+        let live = validate_plan_live(&connection, &drives).unwrap();
+        let codes_for = |move_id: i64| -> Vec<&str> {
+            live.issues
+                .iter()
+                .filter(|issue| issue.move_id == Some(move_id))
+                .map(|issue| issue.code.as_str())
+                .collect()
+        };
+        assert!(codes_for(fat_name).is_empty(), "{:?}", live.issues);
+        assert!(
+            codes_for(fat_big).contains(&"destination_file_too_large"),
+            "{:?}",
+            live.issues
+        );
+        assert!(
+            !codes_for(exfat_big).contains(&"destination_file_too_large"),
+            "{:?}",
+            live.issues
+        );
+        let read_only: Vec<_> = live
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "destination_read_only")
+            .collect();
+        assert_eq!(read_only.len(), 1, "{:?}", live.issues);
+        assert_eq!(read_only[0].location_id.as_deref(), Some("drive:UUID-RO"));
+        assert!(issue_blocks_move(read_only[0], ro_one, "drive:UUID-RO"));
+        drop(attached);
     }
 
     #[test]
