@@ -44,7 +44,7 @@ Taken at `main` 66426ad (*Preview planned organisation from Plan (#34)*), with a
 6. The file is copied to `.mediamapper-transfer-<id>-<created_at>.partial` beside the destination. The partial is created with `create_new`, and writes bypass the cache (`F_NOCACHE`). Every 500 ms the copy checks by device and inode that the temporary path still leads to the open file.
 7. The data is synced (`fsync`). Dates, permissions and xattrs are copied, and the record moves to `verifying`.
 8. The copy is compared byte for byte with the source, reading the copy uncached.
-9. `renamex_np(RENAME_EXCL)` puts the copy in place without ever replacing anything.
+9. `renamex_np(RENAME_EXCL)` puts the copy in place without ever replacing anything. On exFAT, which has no exclusive rename on macOS (it answers `ENOTSUP` for a free name and `EEXIST` for a taken one), a final check and a plain rename follow immediately.
 10. In one transaction the record becomes `completed` and the planned move is deleted.
 
 Recovery runs at launch and before every transfer:
