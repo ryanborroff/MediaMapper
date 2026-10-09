@@ -1,12 +1,12 @@
-# Media Mapper UI Guidelines
+# Tidy Drives UI Guidelines
 
-These guidelines define the interface conventions for Media Mapper.
+These guidelines define the interface conventions for Tidy Drives.
 
-They are intentionally small. Media Mapper should feel like a focused desktop utility rather than a dashboard or web application.
+They are intentionally small. Tidy Drives should feel like a focused desktop utility rather than a dashboard or web application.
 
 ## 1. Product character
 
-Media Mapper is a calm, functional desktop tool for understanding and reorganising storage.
+Tidy Drives is a calm, functional desktop tool for understanding and reorganising storage.
 
 The interface should be:
 
@@ -15,7 +15,7 @@ The interface should be:
 - visually quiet
 - explicit about what is real and what is planned
 - consistent with native macOS conventions where practical
-- usable without learning Media Mapper-specific terminology
+- usable without learning Tidy Drives-specific terminology
 
 Avoid decorative UI, unnecessary icons, excessive colour, oversized typography and dashboard-style visual noise.
 
@@ -175,7 +175,7 @@ Do not use `Destination` and `Destination folder` together. They are too easily 
 
 External drives have three separate identities.
 
-### Media Mapper label
+### Tidy Drives label
 
 Optional, user-defined and human-readable.
 
@@ -195,7 +195,7 @@ Example:
 
 `Backup`
 
-Preserve this value and show it as secondary information when a Media Mapper label exists.
+Preserve this value and show it as secondary information when a Tidy Drives label exists.
 
 ### Persistent identifier
 
@@ -203,7 +203,7 @@ The machine identity used internally to associate a physical drive with its cata
 
 This should normally remain invisible.
 
-A Media Mapper label must never be used as the database identity of a drive.
+A Tidy Drives label must never be used as the database identity of a drive.
 
 Changing a label must not break catalogue records or planned moves.
 
@@ -216,7 +216,7 @@ Use:
 `Connected`
 `Offline`
 
-Do not use `Disconnected` for a catalogued drive. `Offline` better describes a drive that remains available in Media Mapper but is not physically attached.
+Do not use `Disconnected` for a catalogued drive. `Offline` better describes a drive that remains available in Tidy Drives but is not physically attached.
 
 Connection state must reflect current physical state, not the state recorded during the previous scan.
 
@@ -230,7 +230,7 @@ These are three distinct states and must never be visually or verbally blurred.
 
 ### Catalogue
 
-Represents Media Mapper's stored metadata describing the real filesystem at the time of its last successful scan.
+Represents the metadata Tidy Drives stores describing the real filesystem at the time of its last successful scan.
 
 Browsing the catalogue does not read the physical drive.
 
@@ -244,7 +244,7 @@ Creating, changing or removing a plan must not move, rename, copy or delete file
 
 Use explicit language where ambiguity is possible:
 
-`This changes the Media Mapper plan only. No files are moved.`
+`This changes the Tidy Drives plan only. No files are moved.`
 
 ### Execution
 
@@ -332,7 +332,7 @@ Examples:
 
 `Already at this location.`
 
-`This changes the Media Mapper plan only. No files are moved.`
+`This changes the Tidy Drives plan only. No files are moved.`
 
 Avoid marketing language inside the working interface.
 
@@ -340,7 +340,7 @@ Avoid technical explanations unless they help the user make a decision.
 
 ## 14. Safety messaging
 
-Media Mapper's read-only catalogue behaviour is a product feature and should remain visible without dominating the interface.
+The read-only catalogue behaviour of Tidy Drives is a product feature and should remain visible without dominating the interface.
 
 Current catalogue safety principle:
 
@@ -348,7 +348,7 @@ Current catalogue safety principle:
 
 Catalogue-browser principle:
 
-`This view comes from Media Mapper's local catalogue. Search and browsing do not read the drive.`
+`This view comes from the Tidy Drives local catalogue. Search and browsing do not read the drive.`
 
 Safety messages should be concise, factual and visually secondary.
 
@@ -401,7 +401,7 @@ Before adding a new UI pattern, check:
 1. Can an existing component or interaction handle it?
 2. Does it introduce another unnecessary font size?
 3. Is the primary action obvious?
-4. Is terminology consistent with the rest of Media Mapper?
+4. Is terminology consistent with the rest of Tidy Drives?
 5. Does colour communicate a real state?
 6. Is it clear whether the user is viewing reality, planning a change or executing one?
 7. Does it work when the relevant external drive is offline?

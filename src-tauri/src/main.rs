@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    media_mapper_lib::run()
+    tidy_drives_lib::run()
 }

@@ -1,12 +1,12 @@
 [package]
-name = "media-mapper"
+name = "tidy-drives"
 version = "1.0.0"
 description = "Catalogue external drives and plan where files should live"
 authors = ["ryanborroff"]
 edition = "2021"
 
 [lib]
-name = "media_mapper_lib"
+name = "tidy_drives_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

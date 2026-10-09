@@ -1,6 +1,6 @@
 # Hardening checklist
 
-The living checklist for taking Media Mapper from a working app to a V1 release. It covers safety, recovery, release builds, migrations, accessibility, error copy and shipping. It does not cover new features.
+The living checklist for taking Tidy Drives from a working app to a V1 release. It covers safety, recovery, release builds, migrations, accessibility, error copy and shipping. It does not cover new features.
 
 Ground rules for this work:
 
@@ -29,7 +29,7 @@ Taken at `main` 66426ad (*Preview planned organisation from Plan (#34)*), with a
 ### Shape of the code
 
 - The whole backend is one Rust file, `src-tauri/src/lib.rs` (8.9k lines, about 3.9k of them tests), which registers 23 Tauri commands. The frontend is a single React component file, `src/App.tsx` (3k lines).
-- The catalogue is SQLite (rusqlite, bundled) in WAL mode, stored at `~/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`.
+- The catalogue is SQLite (rusqlite, bundled) in WAL mode, stored at `~/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`.
 - Drives are found by running `diskutil`. Files are opened and revealed in Finder by running `/usr/bin/open`, and free space on this Mac is read by running `df`.
 - Transfers copy one file per command. The frontend loops over the ready file moves. Folder moves can be planned and previewed, but the frontend leaves them out of execution.
 - The app isn't sandboxed and has no entitlements or Info.plist additions. Tauri capabilities are `core:default`, `core:window:allow-show` and `dialog:default`.
@@ -90,7 +90,7 @@ Each gap is classed as **Blocker**, **Should fix before V1** or **Safe to defer*
 
 ### Release and shipping
 
-12. *Fixed: the identifier is now `com.ryanborroff.mediamapper`, and the old catalogue is brought across on first use (DATABASE.md).* **Blocker.** **The bundle identifier `com.mediamapper.app` ends in `.app`.** The Tauri CLI warns about this because it conflicts with the macOS bundle extension. The app data folder, and so the catalogue, is named after the identifier, so **changing it moves the database**. That has to be decided, with a migration path for existing catalogues, before the first public build fixes the identifier forever.
+12. *Fixed: the identifier is now `com.ryanborroff.tidydrives`, and the old catalogue is brought across on first use (DATABASE.md).* **Blocker.** **The bundle identifier `com.mediamapper.app` ends in `.app`.** The Tauri CLI warns about this because it conflicts with the macOS bundle extension. The app data folder, and so the catalogue, is named after the identifier, so **changing it moves the database**. That has to be decided, with a migration path for existing catalogues, before the first public build fixes the identifier forever.
 13. **Should fix before V1.** **No production build has been validated.** Nobody has checked the CSP, the dialog plugin, `diskutil` and `open` from a bundled app, or the removable-volume access prompt (TCC) in a release build. That's Phase 3.
 14. **Should fix before V1.** No signing, notarisation, versioning or update strategy yet. That's Phase 8.
 
@@ -170,7 +170,7 @@ What changed (`ed3f730`):
 
 Still open:
 
-- [x] Gap 12 (the identifier, and so where the catalogue lives) is fixed: `com.ryanborroff.mediamapper`, with a step that brings the catalogue across from the old folder.
+- [x] Gap 12 (the identifier, and so where the catalogue lives) is fixed: `com.ryanborroff.tidydrives`, with a step that brings the catalogue across from the old folder.
 - [ ] **Safe to defer.** The catalogue never gives back free space. The real copy was 500 MB with 99.7% free pages.
 
 ## Phase 5: Accessibility and keyboard (done 2026-10-01)
@@ -203,8 +203,8 @@ What changed:
 - [x] **One translation point.** Every command's error goes through `present_error`. Internal detail is logged. The window gets plain words, chosen by catalogue state, by the macOS error together with whether the source or the destination failed, and by what the user was doing.
 - [x] **Plain copy failures.** The copy loop tells reading the source from writing the copy, so I/O, permission and out-of-space failures name the right drive. A real full disk image now gives "The destination ran out of space during the copy…".
 - [x] **Rewritten user messages.** About 40 now say what to do next. Plan issues name the file rather than its path, and no message shows an internal id. Verification failure is described as the serious failure it is.
-- [x] **Plain history.** Transfer history shows the same wording, including for records written before this change. The interrupted-copy record reads "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
-- [x] **Diagnostics log** at `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`, rolling over at 1 MB. P3-5 is fixed.
+- [x] **Plain history.** Transfer history shows the same wording, including for records written before this change. The interrupted-copy record reads "Tidy Drives stopped before this copy was verified, so the copy wasn't kept."
+- [x] **Diagnostics log** at `~/Library/Logs/com.ryanborroff.tidydrives/tidy-drives.log`, rolling over at 1 MB. P3-5 is fixed.
 - [x] **Window wording.** A lost destination is named and isn't called a folder. Counts are singular for one.
 - [x] **Tests.** 5 new, and the opt-in out-of-space test now checks its message. Rust tests went from 111 to 116, plus 1 opt-in, and all pass. 14 existing tests asserted the old wording and were updated to the new constants, each still checking which failure occurred.
 
@@ -225,9 +225,9 @@ Built as decided in [DUPLICATES-DESIGN.md](DUPLICATES-DESIGN.md): information on
 The full audit, the decisions it needs, and a release checklist are in [SHIPPING.md](SHIPPING.md).
 
 - **Blockers:**
-  - the bundle identifier (gap 12 / P3-1). *Fixed: `com.ryanborroff.mediamapper`.*
+  - the bundle identifier (gap 12 / P3-1). *Fixed: `com.ryanborroff.tidydrives`.*
   - no Developer ID Application certificate on this Mac, only Apple Development and App Store distribution certificates;
-  - the icon is still Tauri's default. *Fixed: Media Mapper's own icon.*
+  - the icon is still Tauri's default. *Fixed: Tidy Drives' own icon.*
 - **Hardened runtime** (required for notarisation): a copy signed with it and no entitlements launched, detected and scanned a drive, and browsed it. No entitlements are needed.
 - [x] **Privacy usage descriptions** for removable volumes and the Documents, Desktop and Downloads folders (`761706c`). P3-4 is fixed.
 - [x] **Plan's empty state** named a "Plan move" button that doesn't exist (`ab858ee`).

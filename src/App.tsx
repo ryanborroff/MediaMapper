@@ -24,7 +24,7 @@ type CataloguedDrive = {
   // When a scan of this drive last completed. The catalogue is a snapshot
   // from then; the drive may have changed since.
   lastScannedAt: number | null;
-  // When Media Mapper last saw this drive connected. Kept for later use.
+  // When Tidy Drives last saw this drive connected. Kept for later use.
   lastConnectedAt: number | null;
   fileCount: number;
   directoryCount: number;
@@ -439,7 +439,7 @@ const TRANSFER_CANCELLED = "Copy cancelled.";
 // The backend's error when a copy was verified and put in place but its
 // completion could not be saved. The file was copied, so the window must not
 // say that nothing was.
-const COPIED_NOT_RECORDED = "The file was copied and verified, but Media Mapper couldn't save that it finished.";
+const COPIED_NOT_RECORDED = "The file was copied and verified, but Tidy Drives couldn't save that it finished.";
 
 function transferErrorMessage(message: string, destinationName: string | undefined) {
   if (!message.includes(DESTINATION_UNAVAILABLE)) return message;
@@ -730,7 +730,7 @@ function App() {
         message: cancelled
           ? `${cancelledMessage()}${skippedNote}`
           : notRecorded
-            ? `${copied.toLocaleString()} ${copied === 1 ? "file was" : "files were"} copied and verified, but Media Mapper couldn't save that the last one finished. It will check that copy again the next time it opens. The remaining files stay planned.${skippedNote}`
+            ? `${copied.toLocaleString()} ${copied === 1 ? "file was" : "files were"} copied and verified, but Tidy Drives couldn't save that the last one finished. It will check that copy again the next time it opens. The remaining files stay planned.${skippedNote}`
           : completed > 0
             ? `${completed.toLocaleString()} ${completed === 1 ? "file was" : "files were"} copied and verified before the transfer stopped. ${reason}${skippedNote}`
             : `Nothing was copied. ${reason}${skippedNote}`,
@@ -999,7 +999,7 @@ function App() {
         )
       : undefined;
 
-  // Media Mapper labels are the primary drive identity; the volume name is
+  // Tidy Drives labels are the primary drive identity; the volume name is
   // only a fallback when no label has been set.
   const driveDisplayName = (persistentIdentifier: string | null, volumeName: string) =>
     locationForDrive(persistentIdentifier)?.userLabel ?? volumeName;
@@ -1423,7 +1423,7 @@ function App() {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Choose a Media Mapper destination folder",
+        title: "Choose a Tidy Drives destination folder",
       });
 
       if (!selected || Array.isArray(selected)) return;
@@ -1701,11 +1701,11 @@ function App() {
     }
   };
 
-  // An automatic scan is one Media Mapper started because a catalogued drive
+  // An automatic scan is one Tidy Drives started because a catalogued drive
   // connected. It doesn't move focus or clear an error the user is reading.
   const scan = async (drive: DriveInfo, automatic = false) => {
     if (!drive.persistentIdentifier) {
-      setError("This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.");
+      setError("This drive doesn't report a permanent identity, so Tidy Drives can't recognise it reliably and won't catalogue it.");
       return;
     }
     const driveId = drive.persistentIdentifier;
@@ -1758,7 +1758,7 @@ function App() {
       } else if (!automatic) {
         setError(message);
       } else if (message.includes("A transfer is running") || message.includes("still finishing another task")) {
-        // Another copy of Media Mapper is busy. Try again once it may be done.
+        // Another copy of Tidy Drives is busy. Try again once it may be done.
         queueAutoScan(driveId, AUTO_SCAN_RETRY_MS);
       } else {
         // Ejecting a drive mid-scan is ordinary, so only report a failure
@@ -1767,7 +1767,7 @@ function App() {
           .then((drives) => drives.some((item) => item.persistentIdentifier === driveId))
           .catch(() => false);
         if (stillConnected) {
-          setError(`Media Mapper couldn't rescan ${name} when it connected. ${message}`);
+          setError(`Tidy Drives couldn't rescan ${name} when it connected. ${message}`);
         }
       }
     } finally {
@@ -1843,8 +1843,8 @@ function App() {
   if (activeView === "transfers" && !browserDrive) {
     return (
       <main className="app-shell app-navigation-shell">
-        <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">Media Mapper</div>
+        <aside className="app-sidebar" aria-label="Tidy Drives">
+          <div className="sidebar-brand">Tidy Drives</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
@@ -2016,8 +2016,8 @@ function App() {
 
     return (
       <main className="app-shell app-navigation-shell">
-        <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">Media Mapper</div>
+        <aside className="app-sidebar" aria-label="Tidy Drives">
+          <div className="sidebar-brand">Tidy Drives</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item" type="button" onClick={() => setActiveView("browse")}>Browse</button>
@@ -2361,8 +2361,8 @@ function App() {
 
     return (
       <main className="app-shell app-navigation-shell">
-        <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">Media Mapper</div>
+        <aside className="app-sidebar" aria-label="Tidy Drives">
+          <div className="sidebar-brand">Tidy Drives</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => leave("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page" onClick={() => leave("browse")}>Browse</button>
@@ -2381,7 +2381,7 @@ function App() {
               </nav>
               <h1>Duplicates</h1>
               <p className="duplicates-intro">
-                Files that appear more than once across your drives. Copies are often intentional, such as backups. Media Mapper never removes files.
+                Files that appear more than once across your drives. Copies are often intentional, such as backups. Tidy Drives never removes files.
               </p>
             </div>
           </header>
@@ -2524,8 +2524,8 @@ function App() {
 
     return (
       <main className="app-shell app-navigation-shell">
-        <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">Media Mapper</div>
+        <aside className="app-sidebar" aria-label="Tidy Drives">
+          <div className="sidebar-brand">Tidy Drives</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => setActiveView("drives")}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page">Browse</button>
@@ -2744,8 +2744,8 @@ function App() {
 
     return (
       <main className="app-navigation-shell">
-        <aside className="app-sidebar" aria-label="Media Mapper">
-          <div className="sidebar-brand">Media Mapper</div>
+        <aside className="app-sidebar" aria-label="Tidy Drives">
+          <div className="sidebar-brand">Tidy Drives</div>
           <nav className="sidebar-navigation" aria-label="Main navigation">
             <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("drives"); }}>Drives</button>
             <button className="sidebar-item active" type="button" aria-current="page" onClick={() => { setBrowserDrive(null); setBrowserPath(""); setEntries([]); setPlannedFolderEntries([]); setSearchQuery(""); setSearchResults([]); setActiveView("browse"); }}>Browse</button>
@@ -3087,8 +3087,8 @@ function App() {
 
   return (
     <main className="app-shell app-navigation-shell">
-      <aside className="app-sidebar" aria-label="Media Mapper">
-        <div className="sidebar-brand">Media Mapper</div>
+      <aside className="app-sidebar" aria-label="Tidy Drives">
+        <div className="sidebar-brand">Tidy Drives</div>
         <nav className="sidebar-navigation" aria-label="Main navigation">
           <button className="sidebar-item active" type="button" aria-current="page">Drives</button>
           <button className="sidebar-item" type="button" onClick={() => { setBrowserDrive(null); setActiveView("browse"); }}>Browse</button>
@@ -3546,7 +3546,7 @@ function App() {
                     <div>
                       <strong>Copy {readyCount.toLocaleString()} {readyCount === 1 ? "file" : "files"}?</strong>
                       <span>
-                        Media Mapper will run final checks again, copy each file with its dates and tags, verify it byte for byte, and leave every original untouched.
+                        Tidy Drives will run final checks again, copy each file with its dates and tags, verify it byte for byte, and leave every original untouched.
                       </span>
                       {blockedCount > 0 && (
                         <span>

@@ -1,6 +1,6 @@
 # Release readiness
 
-Where Media Mapper stands for V1, as of 2026-10-07 on `release-hardening` (`e7948de` plus this report). The supporting detail is in the documents linked from each section; this report doesn't repeat them.
+Where Tidy Drives stands for V1, as of 2026-10-07 on `release-hardening` (`e7948de` plus this report). The supporting detail is in the documents linked from each section; this report doesn't repeat them.
 
 **Verdict.** The app itself is ready. The copy pipeline, recovery, database upgrades, error wording, accessibility fixes and duplicate awareness are built, tested and checked in the release build. What stands between it and a public release is mostly not code:
 
@@ -11,15 +11,15 @@ All remaining issues are classified in [section 11](#11-remaining-blockers).
 
 ## 1. Product architecture
 
-Media Mapper is a macOS desktop app built with Tauri 2. The workflow is: browse what you have, plan what you want, preview the result, copy and verify, then see what happened.
+Tidy Drives is a macOS desktop app built with Tauri 2. The workflow is: browse what you have, plan what you want, preview the result, copy and verify, then see what happened.
 
 | Part | What it is |
 |---|---|
 | Backend | Rust, in `src-tauri/src/lib.rs`: about 6,100 lines of code and 6,800 of tests. It exposes 26 Tauri commands. |
 | Frontend | React 19 and TypeScript in `src/App.tsx` (3,600 lines), with `App.css`. Built with Vite. |
-| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`. Schema version 2. See [DATABASE.md](DATABASE.md). |
+| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`. Schema version 2. See [DATABASE.md](DATABASE.md). |
 | macOS tools | `diskutil` (finding drives and their capacity), `df` (free space on this Mac), `open` (opening files, and Show in Finder) |
-| Diagnostics | `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`, rolling over at 1 MB |
+| Diagnostics | `~/Library/Logs/com.ryanborroff.tidydrives/tidy-drives.log`, rolling over at 1 MB |
 | Permissions | Not sandboxed. Tauri capabilities: `core:default`, `core:window:allow-show`, `dialog:default`. Privacy usage descriptions for removable volumes and the Documents, Desktop and Downloads folders. |
 
 Planning is virtual: plans are rows in the catalogue, and nothing on any drive changes until the user chooses **Copy and verify**. Scanning and duplicate checks only read.
@@ -28,7 +28,7 @@ Planning is virtual: plans are rows in the catalogue, and nothing on any drive c
 
 These hold in the code and are each covered by tests ([SAFETY-MATRIX.md](SAFETY-MATRIX.md)):
 
-1. **Originals are never modified, moved or deleted.** Media Mapper has no code that deletes, renames or writes a source file. Deletion is outside the product.
+1. **Originals are never modified, moved or deleted.** Tidy Drives has no code that deletes, renames or writes a source file. Deletion is outside the product.
 2. **Nothing changes until an explicit copy.** Planning, previews, scanning and duplicate checks don't write to any drive.
 3. **Copies are checked before they count.**
    - Each file is written to a temporary `.mediamapper-transfer-<id>-<created>.partial` beside its destination, with writes bypassing the cache, and synced to disk.
@@ -87,7 +87,7 @@ After any interruption, the next launch, or the next copy attempt, resolves ever
 
 | Left in | Becomes | Disk |
 |---|---|---|
-| `pending` or `copying` | Failed: "Media Mapper stopped before this copy was verified, so the copy wasn't kept." | Its partial file is removed once its destination is connected |
+| `pending` or `copying` | Failed: "Tidy Drives stopped before this copy was verified, so the copy wasn't kept." | Its partial file is removed once its destination is connected |
 | `verifying`, before the rename | Failed, as above | Partial removed |
 | `verifying`, after the rename | Completed, **only** if the copy still matches the source byte for byte. Left waiting while either drive is offline. Failed if the source is gone or the copy differs. | A copy that doesn't match is never trusted, removed or overwritten |
 
@@ -145,7 +145,7 @@ The Duplicates view follows the same rules: groups are buttons with `aria-expand
 
 ## 9. Release-build status
 
-- **The build works.** `npm run build:release` produces a working universal `Media Mapper.app` (13 MB) and a DMG (6.2 MB). The arm64-only build was 6.4 MB and 3.1 MB.
+- **The build works.** `npm run build:release` produces a working universal `Tidy Drives.app` (13 MB) and a DMG (6.2 MB). The arm64-only build was 6.4 MB and 3.1 MB.
 - **The release CSP, dialogs and macOS tools all work** in the bundled app.
 - **The bundle is unsigned:** only the linker signs it, ad hoc, and `codesign --verify` fails.
 - **Settled:** a universal build (`npm run build:release`), version 1.0.0 build 1, minimum macOS 27.0, category Utility, "© 2026 Kind Enough Studio", and the app icon.
@@ -199,7 +199,7 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 | Log lines use Unix times | ERROR-MESSAGES.md |
 | Browse file list table semantics; announcing view changes | ACCESSIBILITY.md |
 | Remove the unreachable legacy dashboard code (`showLegacyDashboard`) | ACCESSIBILITY.md |
-| Record SHA-256 during copy verification, so Media Mapper's own copies show as identical without being read again | DUPLICATES-DESIGN step 5 |
+| Record SHA-256 during copy verification, so Tidy Drives' own copies show as identical without being read again | DUPLICATES-DESIGN step 5 |
 
 ## 12. Recommended V1 scope
 

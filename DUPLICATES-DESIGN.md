@@ -2,7 +2,7 @@
 
 **Status: built 2026-10-02**, as designed except where "As built" at the end says otherwise.
 
-The V1 goal is information only. Media Mapper says which files appear more than once, where the copies are, why it thinks they match, and how much space the confirmed extra copies take. It never deletes, never suggests deleting a particular copy, and never ranks one copy as "the original".
+The V1 goal is information only. Tidy Drives says which files appear more than once, where the copies are, why it thinks they match, and how much space the confirmed extra copies take. It never deletes, never suggests deleting a particular copy, and never ranks one copy as "the original".
 
 ## What exists today
 
@@ -44,7 +44,7 @@ Duplicates                                                         ›
 All files / Duplicates
 Duplicates
 Files that appear more than once across your drives. Copies are often
-intentional, such as backups. Media Mapper never removes files.
+intentional, such as backups. Tidy Drives never removes files.
 
 Identical: 12 groups · 48.2 GB in extra copies           [Check contents]
 Checks files that share a size on connected drives. Reads files only.
@@ -63,7 +63,7 @@ DSC_0412.JPG           2 copies · 8.4 MB each      Same name and size, not chec
 - **What the list answers:**
   - *What appears duplicated?* Each group shows its name, size and number of copies.
   - *Where are the copies?* Expanding a group lists each copy as "Drive / Folder", with whether the drive is connected, the copy's date, **Show in folder** (opens Browse there) and **Open**.
-  - *Why does Media Mapper think they match?* Each group carries its reason and the date its contents were checked.
+  - *Why does Tidy Drives think they match?* Each group carries its reason and the date its contents were checked.
   - *How much space?* The total counts identical groups only: size × (copies − 1), called "extra copies".
 - **Order:** identical groups first, then probable, each sorted by space in extra copies. The top 200 groups are listed, with a note when there are more.
 - **Not there:**
@@ -150,7 +150,7 @@ Each step is a small, separately tested commit:
 2. **Schema version 2.** `content_checks`, with its migration and fixture test.
 3. **Content check.** The staged check, with progress, cancel and estimate.
 4. **Identical in the view.** Identical groups, totals and the check controls.
-5. **Later, needs a separate decision:** record SHA-256 during copy verification, which already reads both files in full. Media Mapper's own copies would then show as identical after the destination is rescanned, without being read again. This touches the copy engine, so it is deliberately not part of V1.
+5. **Later, needs a separate decision:** record SHA-256 during copy verification, which already reads both files in full. Tidy Drives' own copies would then show as identical after the destination is rescanned, without being read again. This touches the copy engine, so it is deliberately not part of V1.
 
 ## Known limitations
 

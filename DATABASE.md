@@ -4,9 +4,9 @@ A catalogue can hold hours of scanning, the user's plan and their transfer histo
 
 ## Where it lives
 
-`~/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`. It's a SQLite database in WAL mode, so `catalogue.sqlite3-wal` and `catalogue.sqlite3-shm` sit beside it while the app is open. `catalogue.sqlite3.transfer-lock` is the lock that allows only one transfer or scan at a time.
+`~/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`. It's a SQLite database in WAL mode, so `catalogue.sqlite3-wal` and `catalogue.sqlite3-shm` sit beside it while the app is open. `catalogue.sqlite3.transfer-lock` is the lock that allows only one transfer or scan at a time.
 
-The folder is named after the bundle identifier, `com.ryanborroff.mediamapper`. Builds before it used `com.mediamapper.app`. The first time the app needs its catalogue and the new folder has none, it brings the old one across (`bring_legacy_catalogue_across`):
+The folder is named after the bundle identifier, `com.ryanborroff.tidydrives`. Earlier builds, from when the app was called Media Mapper, used `com.ryanborroff.mediamapper` and before that `com.mediamapper.app`. The first time the app needs its catalogue and the new folder has none, it brings the newest old one across (`bring_legacy_catalogues_across`), checking `com.ryanborroff.mediamapper` first, so an older copy never wins:
 
 1. it copies the old catalogue with `VACUUM INTO`, read-only, so writes still in its WAL are included;
 2. it runs `PRAGMA integrity_check` on the copy;
@@ -92,4 +92,4 @@ The first two new tests failed when the upgrade ran without its transaction, as 
 
 - **The catalogue never shrinks.** It isn't vacuumed, so space freed when a drive is rescanned or removed stays in the file. A copy of a real catalogue was 500 MB, and 99.7% of its pages were free. This is harmless but wasteful. An occasional `VACUUM` or `PRAGMA auto_vacuum = INCREMENTAL` would fix it. Safe to defer.
 - **Interrupted backups.** If the app is killed while writing a backup, a `catalogue-before-schema-<n>.sqlite3.<pid>-<n>.partial` file is left beside the catalogue. It's never mistaken for a backup, and the next upgrade writes a new one. Nothing removes it.
-- **The old folder is never removed.** After the catalogue is brought across, `~/Library/Application Support/com.mediamapper.app` stays as it was. Delete it by hand once you're happy with the new one.
+- **The old folder is never removed.** After the catalogue is brought across, the old folders (`~/Library/Application Support/com.ryanborroff.mediamapper` and `com.mediamapper.app`) stay as they were. Delete it by hand once you're happy with the new one.

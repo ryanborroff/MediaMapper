@@ -13,7 +13,7 @@ concurrency:
 jobs:
   check:
     name: Build and test
-    # Media Mapper is a macOS app: drive discovery only compiles on macOS.
+    # Tidy Drives is a macOS app: drive discovery only compiles on macOS.
     runs-on: macos-latest
     timeout-minutes: 30
     steps:

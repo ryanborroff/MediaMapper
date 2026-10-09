@@ -142,11 +142,11 @@ Use a **scratch** external drive whose contents don't matter, plus a second driv
 dd if=/dev/urandom of="/Volumes/<Source>/mm-test/big.bin" bs=1m count=4096
 ```
 
-Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destination.
+Scan the source drive in Tidy Drives, then plan `mm-test/big.bin` to the destination.
 
 **Checks after every manual case**
 
-1. Relaunch Media Mapper if it isn't running, and reconnect any drive you unplugged.
+1. Relaunch Tidy Drives if it isn't running, and reconnect any drive you unplugged.
 2. Open **Transfers**. The entry must not say "Copied and verified" unless the copy really finished.
 3. Open **Plan**. The move must still be planned unless it completed.
 4. List what is left in the destination folder:
@@ -166,7 +166,7 @@ Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destin
    Compare against a hash taken before the test.
 7. Optionally, read the raw records. Use plain `sqlite3`: `-readonly` fails on this WAL database when the app has no connection open.
    ```bash
-   sqlite3 ~/Library/Application\ Support/com.ryanborroff.mediamapper/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
+   sqlite3 ~/Library/Application\ Support/com.ryanborroff.tidydrives/catalogue.sqlite3 "SELECT id, status, error_message FROM transfers ORDER BY id DESC LIMIT 5"
    ```
 
 **Cases**
@@ -178,12 +178,12 @@ Scan the source drive in Media Mapper, then plan `mm-test/big.bin` to the destin
 | M3 | Copy planned files. While it shows **Copying**, unplug the **destination** drive. | The run stops with "The destination … is no longer available". The plan is kept. After reconnecting, relaunch: no partial remains on the destination. |
 | M4 | As M3, during **Verifying**. | As M3. Nothing named `big.bin` at the destination. |
 | M5 | Copy planned files. During **Copying**, quit with ⌘Q. Relaunch. | History shows Failed ("Interrupted before verification completed."). The partial is removed. Plan kept. Copy again: succeeds. |
-| M6 | As M5, but force-kill instead of quitting: `pkill -9 -f "Media Mapper"`. | As M5. |
+| M6 | As M5, but force-kill instead of quitting: `pkill -9 -f "Tidy Drives"`. | As M5. |
 | M7 | As M5, quitting during **Verifying**. | As M5. Never Copied and verified. |
 | M8 | As M6, killing during **Verifying**. | As M5. |
 | M9 | Start a copy, then try **Scan** on any drive. | The scan is refused while copying. |
 | M10 | Make a read-only destination with `hdiutil create -size 50m -fs APFS -volname MMReadOnly ro.dmg`, then `hdiutil attach -readonly ro.dmg`. Scan it, plan a small file to it, then copy. | Fails cleanly. Nothing is created. The plan is kept. |
-| M11 | Plan a move. Eject the source, connect another volume with the same name first (it takes `/Volumes/<Name>`), then reconnect the source (it mounts as `/Volumes/<Name> 1`). Copy. | Media Mapper copies from the correct drive, matched by volume UUID, never from the impostor. |
+| M11 | Plan a move. Eject the source, connect another volume with the same name first (it takes `/Volumes/<Name>`), then reconnect the source (it mounts as `/Volumes/<Name> 1`). Copy. | Tidy Drives copies from the correct drive, matched by volume UUID, never from the impostor. |
 
 ## Follow-ups
 

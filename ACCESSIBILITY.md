@@ -1,6 +1,6 @@
 # Accessibility
 
-Keyboard and VoiceOver status of Media Mapper's window. The audit, done in Phase 5 of [HARDENING.md](HARDENING.md), fixed defects without changing the design. Re-run the checks at the end after any change to the window.
+Keyboard and VoiceOver status of the Tidy Drives window. The audit, done in Phase 5 of [HARDENING.md](HARDENING.md), fixed defects without changing the design. Re-run the checks at the end after any change to the window.
 
 ## What was found and fixed
 
