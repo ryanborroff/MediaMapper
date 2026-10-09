@@ -1810,6 +1810,19 @@ where
         // preflight or during the copy must never be replaced.
         rename_exclusive(temporary, destination)?;
 
+        // The copy's data is already on the drive; make its new name durable
+        // too, before the transfer is recorded as completed. Otherwise a power
+        // cut just after could leave history saying "Copied and verified"
+        // while the drive still holds the temporary name. The copy is in place
+        // by now, so a folder that can't be synced is logged, not a failure:
+        // failing would make a retry find the finished copy in the way.
+        if let Err(error) = sync_folder(parent) {
+            log_diagnostic(&format!(
+                "Copied {} but couldn't sync its folder: {error}",
+                destination.display()
+            ));
+        }
+
         Ok(copied)
     };
     let mut result = attempt();
@@ -1832,6 +1845,13 @@ where
     }
 
     result
+}
+
+// Forces a folder's entries, such as a file just renamed into it, to the
+// drive. `sync_all` is `F_FULLFSYNC` on macOS, which APFS, Mac OS Extended,
+// exFAT and FAT32 all accept on a folder.
+fn sync_folder(folder: &Path) -> std::io::Result<()> {
+    fs::File::open(folder)?.sync_all()
 }
 
 // How often a running copy or verification confirms that its destination
@@ -12367,6 +12387,16 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         assert_eq!(fs::read(&fixture.source).unwrap(), fixture.contents);
         assert!(partial_files(fixture.destination.parent().unwrap()).is_empty());
         assert!(!planned_move_exists(&fixture.connection, fixture.move_id));
+    }
+
+    #[test]
+    fn a_folder_can_be_synced_and_a_missing_one_reports_it() {
+        let unique = format!("{}-{}", std::process::id(), now_unix());
+        let folder = TestVolume(std::env::temp_dir().join(format!("tidy-drives-sync-{unique}")));
+        fs::create_dir_all(&folder.0).unwrap();
+        fs::write(folder.0.join("clip.mov"), b"x").unwrap();
+        assert!(sync_folder(&folder.0).is_ok());
+        assert!(sync_folder(&folder.0.join("missing")).is_err());
     }
 
     #[test]
