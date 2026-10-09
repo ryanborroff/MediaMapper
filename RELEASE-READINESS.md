@@ -36,6 +36,7 @@ These hold in the code and are each covered by tests ([SAFETY-MATRIX.md](SAFETY-
    - Only after that is it put in place, with an exclusive rename.
 4. **An existing destination is never overwritten.**
    - The final rename (`renamex_np` with `RENAME_EXCL`) fails rather than replacing anything.
+   - exFAT has no exclusive rename on macOS. It still refuses an existing destination, and reports "not supported" only when the name is free, so the copy is then renamed into place at once after a final check. Only the instant between those two calls is unguarded.
    - Anything at the destination path is refused before copying, including a broken link or a file that appears mid-copy.
 5. **A failed, cancelled or interrupted copy is never shown as completed.**
    - Only a copy that is verified, in place and recorded is completed.
