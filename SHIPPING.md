@@ -1,6 +1,6 @@
-# Shipping Media Mapper
+# Shipping Tidy Drives
 
-This audit covers what it takes to distribute Media Mapper as a proper macOS app outside the Mac App Store: its identity, signing and notarisation, permissions, updates and first run. It was done on 2026-10-07 on `release-hardening`, using macOS 27.0.1, Xcode with `notarytool` 1.1.3, tauri-cli 2.12.0 and Rust 1.98.1.
+This audit covers what it takes to distribute Tidy Drives as a proper macOS app outside the Mac App Store: its identity, signing and notarisation, permissions, updates and first run. It was done on 2026-10-07 on `release-hardening`, using macOS 27.0.1, Xcode with `notarytool` 1.1.3, tauri-cli 2.12.0 and Rust 1.98.1.
 
 The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). What stops a public release is identity and signing, not code.
 
@@ -8,11 +8,11 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 
 | # | Decision | Recommendation | Why it matters |
 |---|---|---|---|
-| D1 | **Bundle identifier** | *Decided: `com.ryanborroff.mediamapper`.* | It can never change after the first public build. The catalogue's folder is named after it. |
+| D1 | **Bundle identifier** | *Decided: `com.ryanborroff.tidydrives`* (renamed with the product, before any public build). | It can never change after the first public build. The catalogue's folder is named after it. |
 | D2 | **App icon** | *Decided: three labelled external drives, stacked* (`design/app-icon.svg`). Every size is made with `npx tauri icon design/app-icon.png`. | It's the first thing anyone sees of the app |
 | D3 | **Apple silicon only, or universal** | *Decided: universal.* `npm run build:release` builds it. | An arm64-only build can't run on Intel Macs |
 | D4 | **Minimum macOS** | *Decided: macOS 27.0,* the version that can be tested. Lower it only after testing on an older version. | Anyone on an older macOS can't open it |
-| D5 | **Product name in the window** | *Decided: "Media Mapper"* everywhere, including the sidebar | |
+| D5 | **Product name in the window** | *Decided: "Tidy Drives"* everywhere, including the sidebar | |
 | D6 | **Version and build number** | *Decided:* V1 is `1.0.0`, build `1`. Raise `bundle.macOS.bundleVersion` by one for every build anyone else receives. | |
 | D7 | **Updates** | No automatic updater in V1. See [Updates](#updates). | An updater is a security-critical channel and needs its own keys and hosting |
 
@@ -20,32 +20,32 @@ The release build itself works; see [RELEASE-TESTING.md](RELEASE-TESTING.md). Wh
 
 | Item | Now | Needed |
 |---|---|---|
-| Product name | `Media Mapper` everywhere | Done (D5) |
-| Bundle identifier | `com.ryanborroff.mediamapper` (was `com.mediamapper.app`) | Done, with existing catalogues brought across (below) |
+| Product name | `Tidy Drives` everywhere | Done (D5) |
+| Bundle identifier | `com.ryanborroff.tidydrives` (earlier `com.ryanborroff.mediamapper`, then `com.mediamapper.app`) | Done, with existing catalogues brought across (below) |
 | Version | `1.0.0` in `tauri.conf.json`, `package.json` and `Cargo.toml` | Done |
 | Build number | `bundle.macOS.bundleVersion` = `1` | Done (D6); raise it for every build |
-| Icon | Media Mapper's own, from `design/app-icon.svg` | Done (D2) |
+| Icon | Tidy Drives' own, from `design/app-icon.svg` | Done (D2) |
 | Metadata | `bundle.category` is `Utility`; `bundle.copyright` is "© 2026 Kind Enough Studio" | Done |
 | Minimum macOS | `bundle.macOS.minimumSystemVersion` = `27.0` | Done (D4) |
 
 ### Changing the identifier without losing catalogues
 
-The catalogue, its pre-upgrade backups and the log all live in folders named after the identifier. Builds before 1.0 used `com.mediamapper.app`; the identifier is now `com.ryanborroff.mediamapper`.
+The catalogue, its pre-upgrade backups and the log all live in folders named after the identifier. Builds from when the app was called Media Mapper used `com.ryanborroff.mediamapper`, and before that `com.mediamapper.app`; the identifier is now `com.ryanborroff.tidydrives`.
 
-The first time the app needs its catalogue and the new folder holds none, it brings the old one across (`bring_legacy_catalogue_across`, details in [DATABASE.md](DATABASE.md)):
+The first time the app needs its catalogue and the new folder holds none, it brings the newest old one across (`bring_legacy_catalogues_across`, details in [DATABASE.md](DATABASE.md)):
 
 1. it copies the old catalogue with `VACUUM INTO`, as the schema backups already are;
 2. it runs `PRAGMA integrity_check` on the copy;
 3. only then does it link the copy into place, never replacing an existing catalogue;
 4. it leaves the old folder untouched.
 
-The old log isn't moved; a new one starts in `~/Library/Logs/com.ryanborroff.mediamapper/`. The identifier is permanent from the first build anyone else installs.
+The old log isn't moved; a new one starts in `~/Library/Logs/com.ryanborroff.tidydrives/`. The identifier is permanent from the first build anyone else installs.
 
 ## Distribution
 
 ### Release build
 
-`npm run tauri build` produces `Media Mapper.app` and `Media Mapper_<version>_aarch64.dmg`. The DMG holds the app and an Applications link. Its checksum is valid.
+`npm run tauri build` produces `Tidy Drives.app` and `Tidy Drives_<version>_aarch64.dmg`. The DMG holds the app and an Applications link. Its checksum is valid.
 
 ### Code signing
 
@@ -62,7 +62,7 @@ Today the bundle is signed only by the linker, ad hoc, and `codesign --verify --
 
 ### Hardened runtime and entitlements
 
-Notarisation requires the hardened runtime, and Tauri enables it by default when it signs. To check that Media Mapper works under it, a copy of the release app was signed ad hoc with `--options runtime` and **no entitlements**, then run with a separate home folder and a test disk image. These all worked:
+Notarisation requires the hardened runtime, and Tauri enables it by default when it signs. To check that Tidy Drives works under it, a copy of the release app was signed ad hoc with `--options runtime` and **no entitlements**, then run with a separate home folder and a test disk image. These all worked:
 
 - the window
 - drive detection, which runs `diskutil`
@@ -74,7 +74,7 @@ Five fresh launches in a row opened normally.
 
 One earlier launch, the very first of that newly signed copy, started without showing its window. It couldn't be reproduced. Check for it on the first Developer ID build.
 
-- **Entitlements:** none needed. Media Mapper doesn't use the App Sandbox, JIT, unsigned libraries or Apple Events. WebKit runs its JavaScript engine in its own Apple-signed processes.
+- **Entitlements:** none needed. Tidy Drives doesn't use the App Sandbox, JIT, unsigned libraries or Apple Events. WebKit runs its JavaScript engine in its own Apple-signed processes.
 - **App Sandbox:** not recommended for V1. It would need security-scoped bookmarks for every drive and folder, and it restricts running `diskutil`, `df` and `open`. It is only required for the Mac App Store, which is out of scope.
 
 ### Notarisation and stapling
@@ -90,9 +90,9 @@ Prefer the API key, and keep it out of the repository.
 Then notarise and staple the DMG as well, so it opens without a network check:
 
 ```bash
-xcrun notarytool submit "Media Mapper_1.0.0_universal.dmg" --keychain-profile <profile> --wait
-xcrun stapler staple "Media Mapper_1.0.0_universal.dmg"
-spctl -a -vv -t open --context context:primary-signature "Media Mapper_1.0.0_universal.dmg"
+xcrun notarytool submit "Tidy Drives_1.0.0_universal.dmg" --keychain-profile <profile> --wait
+xcrun stapler staple "Tidy Drives_1.0.0_universal.dmg"
+spctl -a -vv -t open --context context:primary-signature "Tidy Drives_1.0.0_universal.dmg"
 ```
 
 **Gatekeeper once signed and notarised:** downloaded from the web, the app opens after the standard "downloaded from the internet" confirmation. It is never reported as damaged or unverified.
@@ -108,7 +108,7 @@ rustup target add x86_64-apple-darwin
 npm run build:release
 ```
 
-It produces `src-tauri/target/universal-apple-darwin/release/bundle/macos/Media Mapper.app` and `.../bundle/dmg/Media Mapper_<version>_universal.dmg`.
+It produces `src-tauri/target/universal-apple-darwin/release/bundle/macos/Tidy Drives.app` and `.../bundle/dmg/Tidy Drives_<version>_universal.dmg`.
 
 ## Permissions
 
@@ -168,13 +168,13 @@ The flow is Drives → connect a drive → **Scan** → **Browse**, and it is ex
 
 | # | Finding | Class |
 |---|---|---|
-| S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Fixed: `com.ryanborroff.mediamapper` |
+| S1 | The bundle identifier ends in `.app` and must be chosen before any public build (D1) | Fixed: `com.ryanborroff.tidydrives` |
 | S2 | No Developer ID Application certificate, so no signing or notarisation is possible yet | Blocker |
 | S3 | The icon is Tauri's default (D2) | Fixed |
 | S4 | arm64-only build (D3) | Fixed: universal |
 | S5 | Minimum macOS declared as an untested 10.13 (D4) | Fixed: 27.0 |
 | S6 | Build number repeats the version (D6) | Fixed: 1.0.0, build 1 |
-| S7 | "MediaMapper" in the sidebar vs "Media Mapper" everywhere else (D5) | Fixed |
+| S7 | The product name was spelled two ways, "MediaMapper" and "Media Mapper" (D5) | Fixed: now "Tidy Drives" everywhere |
 | S8 | No copyright or category metadata | Fixed |
 | S9 | Privacy prompts not yet seen from a Finder launch (RELEASE-TESTING section 5) | Should fix before V1 |
 | S10 | Privacy usage descriptions | Fixed (`761706c`) |

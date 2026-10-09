@@ -41,7 +41,7 @@ struct CataloguedDrive {
     // was. The catalogue is a snapshot from this moment; the drive itself may
     // have changed since.
     last_scanned_at: Option<i64>,
-    // When Media Mapper last saw this drive connected, stored in the drive's
+    // When Tidy Drives last saw this drive connected, stored in the drive's
     // `last_seen_at` column. Connecting a drive is not a scan.
     last_connected_at: Option<i64>,
     file_count: i64,
@@ -177,7 +177,7 @@ struct DuplicateFile {
     modified_at: Option<i64>,
 }
 
-// Why Media Mapper thinks the files in a group are the same file.
+// Why Tidy Drives thinks the files in a group are the same file.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 enum DuplicateKind {
@@ -1079,9 +1079,9 @@ fn transfer_run_cancelled(run_id: u64) -> bool {
     run_id != 0 && CANCELLED_TRANSFER_RUN.load(Ordering::SeqCst) == run_id
 }
 // A copy that was verified and put in place, but whose completion could not
-// be saved. Media Mapper confirms it against the source when it next opens,
+// be saved. Tidy Drives confirms it against the source when it next opens,
 // or when the copy is tried again.
-const COPIED_NOT_RECORDED: &str = "The file was copied and verified, but Media Mapper couldn't save that it finished. It will check the copy again the next time it opens.";
+const COPIED_NOT_RECORDED: &str = "The file was copied and verified, but Tidy Drives couldn't save that it finished. It will check the copy again the next time it opens.";
 
 #[tauri::command]
 fn cancel_transfer(run_id: u64) {
@@ -1424,9 +1424,9 @@ fn bypass_cache(_file: &fs::File) -> Result<(), String> {
 const SOURCE_NOT_A_FILE: &str =
     "The source is no longer a file, so it was not copied. Rescan the source drive to update the catalogue.";
 
-const DESTINATION_EXISTS: &str = "There's already a file at the destination. Media Mapper never replaces existing files, so nothing was copied. Remove it from the plan, or choose another destination.";
+const DESTINATION_EXISTS: &str = "There's already a file at the destination. Tidy Drives never replaces existing files, so nothing was copied. Remove it from the plan, or choose another destination.";
 
-const DESTINATION_APPEARED: &str = "A file appeared at the destination during the copy. Media Mapper never replaces existing files, so the copy was discarded and that file was left as it is.";
+const DESTINATION_APPEARED: &str = "A file appeared at the destination during the copy. Tidy Drives never replaces existing files, so the copy was discarded and that file was left as it is.";
 
 // Opens a file for reading only if the path itself is a regular file. A
 // symbolic link at the path is never followed, so a source swapped for a
@@ -1644,7 +1644,7 @@ fn copy_file_details(_source: &Path, _copy: &Path) -> Result<(), String> {
 
 // The temporary file for one transfer record. It is named from the record
 // alone, so recovery after a crash can derive this exact path again and never
-// has to guess which hidden files belong to Media Mapper.
+// has to guess which hidden files belong to Tidy Drives.
 fn transfer_temporary_path(
     destination: &Path,
     transfer_id: i64,
@@ -1658,7 +1658,7 @@ fn transfer_temporary_path(
     ));
 
     if temporary == destination {
-        return Err("That name is reserved for Media Mapper's temporary copies. Remove the file from the plan and choose another name.".to_string());
+        return Err("That name is reserved for the temporary copies Tidy Drives makes. Remove the file from the plan and choose another name.".to_string());
     }
 
     Ok(temporary)
@@ -1908,25 +1908,36 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("Unable to locate Media Mapper data directory: {error}"))?;
+        .map_err(|error| format!("Unable to locate Tidy Drives data directory: {error}"))?;
     fs::create_dir_all(&directory)
-        .map_err(|error| format!("Unable to create Media Mapper data directory: {error}"))?;
+        .map_err(|error| format!("Unable to create Tidy Drives data directory: {error}"))?;
     let path = directory.join("catalogue.sqlite3");
     if !LEGACY_CATALOGUE_CHECKED.load(std::sync::atomic::Ordering::Acquire) {
-        if let Some(legacy) = directory
-            .parent()
-            .map(|parent| parent.join(LEGACY_IDENTIFIER).join("catalogue.sqlite3"))
-        {
-            bring_legacy_catalogue_across(&legacy, &path)?;
+        if let Some(parent) = directory.parent() {
+            let legacy: Vec<PathBuf> = LEGACY_IDENTIFIERS
+                .iter()
+                .map(|identifier| parent.join(identifier).join("catalogue.sqlite3"))
+                .collect();
+            bring_legacy_catalogues_across(&legacy, &path)?;
         }
         LEGACY_CATALOGUE_CHECKED.store(true, std::sync::atomic::Ordering::Release);
     }
     Ok(path)
 }
 
-// The bundle identifier before 1.0. Its data folder may hold a catalogue
-// from a development or test build.
-const LEGACY_IDENTIFIER: &str = "com.mediamapper.app";
+// Bundle identifiers used before 1.0, newest first, while the app was called
+// Media Mapper. Their data folders may hold a catalogue from a development or
+// test build.
+const LEGACY_IDENTIFIERS: [&str; 2] = ["com.ryanborroff.mediamapper", "com.mediamapper.app"];
+
+// Brings across the newest legacy catalogue that exists. Once one is in
+// place, the rest are skipped, so an older, staler copy never wins.
+fn bring_legacy_catalogues_across(legacy: &[PathBuf], path: &Path) -> Result<(), String> {
+    for candidate in legacy {
+        bring_legacy_catalogue_across(candidate, path)?;
+    }
+    Ok(())
+}
 
 // Set once the legacy catalogue has been brought across or found not to need
 // it, so later commands skip the check.
@@ -1995,7 +2006,7 @@ fn bring_legacy_catalogue_across(legacy: &Path, path: &Path) -> Result<(), Strin
                 "Bringing the catalogue across from {} failed: {error}",
                 legacy.display()
             ));
-            Err("Media Mapper couldn't move your catalogue to its new folder, so it was left where it was. Check that this Mac has free space, then reopen Media Mapper.".to_string())
+            Err("Tidy Drives couldn't move your catalogue to its new folder, so it was left where it was. Check that this Mac has free space, then reopen Tidy Drives.".to_string())
         }
     }
 }
@@ -2055,7 +2066,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 // at the previous version. See DATABASE.md.
 const SCHEMA_VERSION: i64 = 2;
 
-const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Media Mapper, so this version can't use it. Open it with the newer version of Media Mapper.";
+const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Tidy Drives, so this version can't use it. Open it with the newer version of Tidy Drives.";
 
 fn schema_version(connection: &Connection) -> Result<i64, String> {
     connection
@@ -2174,7 +2185,7 @@ fn back_up_before_migration(connection: &Connection, path: &Path) -> Result<(), 
 
     result.map_err(|error| {
         log_diagnostic(&format!("Catalogue backup failed: {error}"));
-        "Media Mapper couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Media Mapper.".to_string()
+        "Tidy Drives couldn't back up your catalogue before updating it, so it was left unchanged. Check that this Mac has free space, then reopen Tidy Drives.".to_string()
     })
 }
 
@@ -2363,7 +2374,7 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
             CREATE INDEX IF NOT EXISTS idx_files_drive_parent
                 ON files(drive_id, parent_path);
 
-            -- A location is somewhere Media Mapper can plan files to live.
+            -- A location is somewhere Tidy Drives can plan files to live.
             --
             -- external_drive locations point back to the existing catalogue
             -- drive identity. local_folder locations will later represent
@@ -2412,7 +2423,7 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
             .map_err(|error| format!("Unable to add drive labels: {error}"))?;
     }
 
-    // Planned destinations use Media Mapper locations rather than assuming
+    // Planned destinations use Tidy Drives locations rather than assuming
     // every destination is an external drive.
     let planned_move_table_exists: bool = connection
         .query_row(
@@ -2603,7 +2614,7 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-// Every catalogued external drive is also a Media Mapper location.
+// Every catalogued external drive is also a Tidy Drives location.
 //
 // The `drive:` prefix keeps the location namespace separate from future
 // local-folder identifiers while preserving the drive UUID as its stable
@@ -2659,7 +2670,7 @@ fn initialise_database(app: &tauri::AppHandle) -> Result<(), String> {
     sync_drive_locations(&connection)
 }
 
-const DRIVE_WITHOUT_IDENTITY: &str = "This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.";
+const DRIVE_WITHOUT_IDENTITY: &str = "This drive doesn't report a permanent identity, so Tidy Drives can't recognise it reliably and won't catalogue it.";
 
 // Parses `diskutil info` output into its `Key: Value` pairs.
 fn parse_diskutil_info(text: &str) -> std::collections::HashMap<String, String> {
@@ -2836,10 +2847,10 @@ const DESTINATION_STEPS: &[&str] = &[
 ];
 
 const CATALOGUE_BUSY: &str =
-    "Media Mapper is still finishing another task, such as a scan. Try again in a moment.";
-const CATALOGUE_DAMAGED: &str = "Media Mapper's catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Media Mapper, and keep its catalogue folder (Library › Application Support › com.ryanborroff.mediamapper) before trying anything else.";
+    "Tidy Drives is still finishing another task, such as a scan. Try again in a moment.";
+const CATALOGUE_DAMAGED: &str = "The Tidy Drives catalogue is damaged and can't be read. The files on your drives aren't affected. Quit Tidy Drives, and keep its catalogue folder (Library › Application Support › com.ryanborroff.tidydrives) before trying anything else.";
 const MAC_FULL: &str =
-    "This Mac is out of space, so Media Mapper couldn't save its catalogue. Free some space, then try again.";
+    "This Mac is out of space, so Tidy Drives couldn't save its catalogue. Free some space, then try again.";
 
 // The macOS error number in an `io::Error` message, as in "(os error 5)".
 fn os_error_code(error: &str) -> Option<i32> {
@@ -2893,10 +2904,10 @@ fn user_message(error: &str, action: &str) -> Option<String> {
         }
         // EACCES, EPERM
         (Some(1 | 13), true, _) => {
-            "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again."
+            "macOS didn't let Tidy Drives read the source file. Check its permissions in Finder, then copy again."
         }
         (Some(1 | 13), _, true) => {
-            "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again."
+            "macOS didn't let Tidy Drives add files to the destination. Check that you can add files there in Finder, then copy again."
         }
         // ENOENT
         (Some(2), true, _) => {
@@ -2911,15 +2922,15 @@ fn user_message(error: &str, action: &str) -> Option<String> {
         }
         (Some(1 | 13), _, _) => {
             return Some(format!(
-                "macOS didn't let Media Mapper {action}. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again."
+                "macOS didn't let Tidy Drives {action}. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again."
             ));
         }
         _ if action == "copy the file" => {
-            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+            "Tidy Drives couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Tidy Drives."
         }
         _ => {
             return Some(format!(
-                "Media Mapper couldn't {action}. Try again. If it keeps happening, quit and reopen Media Mapper."
+                "Tidy Drives couldn't {action}. Try again. If it keeps happening, quit and reopen Tidy Drives."
             ));
         }
     };
@@ -2941,22 +2952,22 @@ fn present_error(error: &str, action: &str) -> String {
 // the record agree. The window is shown the user-facing wording.
 fn present_transfer_error(error: &str) -> String {
     if error == INTERRUPTED_TRANSFER_MESSAGE {
-        return "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+        return "Tidy Drives stopped before this copy was verified, so the copy wasn't kept."
             .to_string();
     }
     user_message(error, "copy the file").unwrap_or_else(|| error.to_string())
 }
 
-// The diagnostics log: `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log`.
+// The diagnostics log: `~/Library/Logs/com.ryanborroff.tidydrives/tidy-drives.log`.
 // Set at startup. stderr alone is lost when the app is opened from Finder.
 static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
-// The log is moved to `media-mapper.log.1`, replacing any older one, once it
+// The log is moved to `tidy-drives.log.1`, replacing any older one, once it
 // passes this size.
 const LOG_LIMIT_BYTES: u64 = 1_000_000;
 
 fn log_diagnostic(message: &str) {
-    eprintln!("Media Mapper: {message}");
+    eprintln!("Tidy Drives: {message}");
     if let Some(path) = LOG_FILE.get() {
         append_log(path, message);
     }
@@ -2974,7 +2985,7 @@ fn append_log(path: &Path, message: &str) {
 }
 
 // Runs a command's work off the main thread and turns any failure into a
-// message for the window. `action` completes "Media Mapper couldn't …".
+// message for the window. `action` completes "Tidy Drives couldn't …".
 async fn run_command<T, F>(action: &str, work: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -3228,7 +3239,7 @@ fn scan_directory(
 
             // Ignore macOS Finder metadata rather than cataloguing it as user content.
             // AppleDouble sidecars mirror real files as tiny `._*` entries; .DS_Store
-            // stores Finder folder preferences. Neither belongs in Media Mapper's catalogue.
+            // stores Finder folder preferences. Neither belongs in the Tidy Drives catalogue.
             if name.starts_with("._") || name == ".DS_Store" {
                 continue;
             }
@@ -4671,7 +4682,7 @@ async fn set_drive_label(
 
         if changed == 0 {
             return Err(
-                "That drive is no longer in Media Mapper. Scan it again, then add the label."
+                "That drive is no longer in Tidy Drives. Scan it again, then add the label."
                     .to_string(),
             );
         }
@@ -4786,7 +4797,7 @@ async fn add_local_folder_location(
 // same source. The checks and the write share one transaction, so two plans
 // cannot claim the same destination between the check and the insert.
 //
-// Drives Media Mapper sees are almost always case-insensitive (APFS and HFS+
+// Drives Tidy Drives sees are almost always case-insensitive (APFS and HFS+
 // by default, exFAT and FAT always), so destinations that differ only in case
 // are treated as the same place.
 fn plan_move(
@@ -4814,7 +4825,7 @@ fn plan_move(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| {
-            "That destination is no longer in Media Mapper. Choose another location.".to_string()
+            "That destination is no longer in Tidy Drives. Choose another location.".to_string()
         })?;
 
     let same_drive = destination_drive_id.as_deref() == Some(source_drive_id);
@@ -4898,7 +4909,7 @@ fn plan_move(
 
             if fs::symlink_metadata(Path::new(local_path).join(destination_relative_path)).is_ok() {
                 return Err(
-                    "There's already a file with that name in that folder on this Mac. Media Mapper never replaces existing files, so choose another destination.".to_string()
+                    "There's already a file with that name in that folder on this Mac. Tidy Drives never replaces existing files, so choose another destination.".to_string()
                 );
             }
         }
@@ -5129,7 +5140,7 @@ fn plan_preflight(
             issues.push(PlanPreflightIssue {
                 code: "missing_destination".to_string(),
                 message: format!(
-                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    "The destination for {} is no longer in Tidy Drives. Remove it from the plan, then add it again.",
                     file_name_of(&planned.source_relative_path)
                 ),
                 move_id: Some(planned.id),
@@ -5492,7 +5503,7 @@ fn validate_plan_live(
                         issues.push(PlanPreflightIssue {
                             code: "source_unreadable_on_disk".to_string(),
                             message: format!(
-                                "Media Mapper can't check {} on the source drive right now. Make sure the drive is connected and readable.",
+                                "Tidy Drives can't check {} on the source drive right now. Make sure the drive is connected and readable.",
                                 file_name_of(&source_relative_path)
                             ),
                             move_id: Some(move_id),
@@ -5592,7 +5603,7 @@ fn validate_plan_live(
                 Ok(_) => issues.push(PlanPreflightIssue {
                     code: "destination_exists".to_string(),
                     message: format!(
-                        "{} already exists at the planned destination. Media Mapper never replaces existing files, so remove it from the plan or choose another destination.",
+                        "{} already exists at the planned destination. Tidy Drives never replaces existing files, so remove it from the plan or choose another destination.",
                         file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
@@ -5602,7 +5613,7 @@ fn validate_plan_live(
                 Err(_) => issues.push(PlanPreflightIssue {
                     code: "destination_unreadable".to_string(),
                     message: format!(
-                        "Media Mapper can't check whether {} is free at the destination. Make sure the destination is connected and readable.",
+                        "Tidy Drives can't check whether {} is free at the destination. Make sure the destination is connected and readable.",
                         file_name_of(&relative_path)
                     ),
                     move_id: Some(move_id),
@@ -5668,7 +5679,7 @@ fn validate_plan_live(
             _ => issues.push(PlanPreflightIssue {
                 code: "destination_missing".to_string(),
                 message: format!(
-                    "The destination for {} is no longer in Media Mapper. Remove it from the plan, then add it again.",
+                    "The destination for {} is no longer in Tidy Drives. Remove it from the plan, then add it again.",
                     file_name_of(&source_relative_path)
                 ),
                 move_id: Some(move_id),
@@ -6228,7 +6239,7 @@ pub fn run() {
         .setup(|app| {
             if let Ok(directory) = app.path().app_log_dir() {
                 if fs::create_dir_all(&directory).is_ok() {
-                    let _ = LOG_FILE.set(directory.join("media-mapper.log"));
+                    let _ = LOG_FILE.set(directory.join("tidy-drives.log"));
                 }
             }
 
@@ -6396,6 +6407,37 @@ mod tests {
         drop(writer);
 
         assert_eq!(drive_names(&folders.current()), vec!["Venus"]);
+    }
+
+    #[test]
+    fn newest_legacy_catalogue_is_brought_across_first() {
+        let folders = DataFolders::new("legacy-newest");
+        let older = folders.0.join("older").join("catalogue.sqlite3");
+        fs::create_dir_all(older.parent().unwrap()).unwrap();
+        insert_drive(
+            &open_database(&folders.legacy()).unwrap(),
+            "new-id",
+            "Newer",
+        );
+        insert_drive(&open_database(&older).unwrap(), "old-id", "Older");
+
+        bring_legacy_catalogues_across(&[folders.legacy(), older.clone()], &folders.current())
+            .unwrap();
+
+        assert_eq!(drive_names(&folders.current()), vec!["Newer"]);
+    }
+
+    #[test]
+    fn older_legacy_catalogue_is_used_when_the_newer_one_is_missing() {
+        let folders = DataFolders::new("legacy-fallback");
+        let older = folders.0.join("older").join("catalogue.sqlite3");
+        fs::create_dir_all(older.parent().unwrap()).unwrap();
+        insert_drive(&open_database(&older).unwrap(), "old-id", "Older");
+
+        bring_legacy_catalogues_across(&[folders.legacy(), older.clone()], &folders.current())
+            .unwrap();
+
+        assert_eq!(drive_names(&folders.current()), vec!["Older"]);
     }
 
     #[test]
@@ -8687,12 +8729,12 @@ mod tests {
             (
                 "Unable to create temporary destination file: Permission denied (os error 13)",
                 "copy the file",
-                "macOS didn't let Media Mapper add files to the destination. Check that you can add files there in Finder, then copy again.",
+                "macOS didn't let Tidy Drives add files to the destination. Check that you can add files there in Finder, then copy again.",
             ),
             (
                 "Unable to open source file: Operation not permitted (os error 1)",
                 "copy the file",
-                "macOS didn't let Media Mapper read the source file. Check its permissions in Finder, then copy again.",
+                "macOS didn't let Tidy Drives read the source file. Check its permissions in Finder, then copy again.",
             ),
             (
                 "Unable to read the source file: Input/output error (os error 5)",
@@ -8723,27 +8765,27 @@ mod tests {
             (
                 "Unable to create transfer record: constraint failed",
                 "copy the file",
-                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+                "Tidy Drives couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Tidy Drives.",
             ),
             (
                 "Destination location drive:UUID-B has no drive identity.",
                 "copy the file",
-                "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper.",
+                "Tidy Drives couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Tidy Drives.",
             ),
             (
                 "Unable to inspect selected folder: Operation not permitted (os error 1)",
                 "add that folder",
-                "macOS didn't let Media Mapper add that folder. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again.",
+                "macOS didn't let Tidy Drives add that folder. Check the permissions in Finder, or in System Settings › Privacy & Security › Files & Folders, then try again.",
             ),
             (
                 "Unable to read /Volumes: Input/output error (os error 5)",
                 "check which drives are connected",
-                "Media Mapper couldn't check which drives are connected. Try again. If it keeps happening, quit and reopen Media Mapper.",
+                "Tidy Drives couldn't check which drives are connected. Try again. If it keeps happening, quit and reopen Tidy Drives.",
             ),
             (
                 "Background task failed: task 7 panicked",
                 "load the plan",
-                "Media Mapper couldn't load the plan. Try again. If it keeps happening, quit and reopen Media Mapper.",
+                "Tidy Drives couldn't load the plan. Try again. If it keeps happening, quit and reopen Tidy Drives.",
             ),
         ];
         for (internal, action, expected) in cases {
@@ -8775,7 +8817,7 @@ mod tests {
         // The window recognises these by their wording.
         assert_eq!(TRANSFER_CANCELLED, "Copy cancelled.");
         assert!(COPIED_NOT_RECORDED.starts_with(
-            "The file was copied and verified, but Media Mapper couldn't save that it finished."
+            "The file was copied and verified, but Tidy Drives couldn't save that it finished."
         ));
         assert_eq!(
             DESTINATION_UNAVAILABLE,
@@ -8787,11 +8829,11 @@ mod tests {
     fn transfer_history_shows_failures_in_plain_words() {
         assert_eq!(
             present_transfer_error(INTERRUPTED_TRANSFER_MESSAGE),
-            "Media Mapper stopped before this copy was verified, so the copy wasn't kept."
+            "Tidy Drives stopped before this copy was verified, so the copy wasn't kept."
         );
         assert_eq!(
             present_transfer_error("Unable to copy file: Input/output error (os error 5)"),
-            "Media Mapper couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Media Mapper."
+            "Tidy Drives couldn't copy the file. The original is untouched. Try again. If it keeps happening, quit and reopen Tidy Drives."
         );
         assert_eq!(
             present_transfer_error("Unable to read the source file: Input/output error (os error 5)"),
@@ -8873,7 +8915,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let log = directory.join("media-mapper.log");
+        let log = directory.join("tidy-drives.log");
 
         append_log(&log, "Couldn't copy the file: first");
         append_log(&log, "Couldn't copy the file: second");
@@ -8892,7 +8934,7 @@ mod tests {
                 .1,
             "after rollover"
         );
-        assert!(directory.join("media-mapper.log.1").exists());
+        assert!(directory.join("tidy-drives.log.1").exists());
 
         fs::remove_dir_all(&directory).unwrap();
     }

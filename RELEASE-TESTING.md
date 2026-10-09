@@ -1,6 +1,6 @@
 # Release testing
 
-A repeatable smoke test for a production build of Media Mapper, run outside `tauri dev`. It uses disk images as stand-in drives and a separate home folder. That way it never touches your real catalogue or your real drives.
+A repeatable smoke test for a production build of Tidy Drives, run outside `tauri dev`. It uses disk images as stand-in drives and a separate home folder. That way it never touches your real catalogue or your real drives.
 
 Run it before every release candidate, and after any change to Tauri configuration, capabilities, the copy engine or the database.
 
@@ -17,18 +17,18 @@ This runs `npm run build` (type check and Vite) first, then builds the Rust app 
 
 What it produces:
 
-- `src-tauri/target/universal-apple-darwin/release/bundle/macos/Media Mapper.app`
-- `src-tauri/target/universal-apple-darwin/release/bundle/dmg/Media Mapper_<version>_universal.dmg`
+- `src-tauri/target/universal-apple-darwin/release/bundle/macos/Tidy Drives.app`
+- `src-tauri/target/universal-apple-darwin/release/bundle/dmg/Tidy Drives_<version>_universal.dmg`
 
 Expected output: no warnings or failures. (Before the identifier changed, the Tauri CLI warned that it ended in `.app`.)
 
 ## 2. Inspect the bundle
 
 ```bash
-APP="src-tauri/target/release/bundle/macos/Media Mapper.app"
+APP="src-tauri/target/release/bundle/macos/Tidy Drives.app"
 DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg)
 plutil -p "$APP/Contents/Info.plist"
-file "$APP/Contents/MacOS/media-mapper"
+file "$APP/Contents/MacOS/tidy-drives"
 codesign -dv --verbose=2 "$APP"
 codesign --verify --deep --strict "$APP"; echo "verify exit $?"
 hdiutil verify "$DMG"
@@ -36,19 +36,19 @@ hdiutil verify "$DMG"
 
 | Check | Expected now (unsigned build) | Expected once Phase 8 is done |
 |---|---|---|
-| `CFBundleIdentifier` | `com.ryanborroff.mediamapper` | The same. It is permanent. |
+| `CFBundleIdentifier` | `com.ryanborroff.tidydrives` | The same. It is permanent. |
 | `CFBundleShortVersionString` / `CFBundleVersion` | `1.0.0` / `1` | The same, with the build number raised for each build |
 | `LSMinimumSystemVersion` | `27.0` | The same, unless an older macOS has been tested |
 | Architecture | `x86_64` and `arm64` (universal) | The same |
 | Signature | `adhoc,linker-signed`, so `codesign --verify` **fails** ("code has no resources but signature indicates they must be present") | Developer ID, hardened runtime, notarised and stapled |
-| DMG | Checksum VALID; holds `Media Mapper.app` and an `Applications` link | Same, signed |
+| DMG | Checksum VALID; holds `Tidy Drives.app` and an `Applications` link | Same, signed |
 | Usage descriptions (`NS…UsageDescription`) | None | See the [permissions](#5-permissions-and-first-launch-from-finder) section |
 
 The unsigned build runs on the Mac that built it. Copied to another Mac it is quarantined, and Gatekeeper reports it as damaged.
 
 ## 3. Set up stand-in drives and an isolated home
 
-Disk images mount under `/Volumes`. `diskutil` reports them as `Device Location: External`, so Media Mapper treats them as external drives. Unmounting one with `diskutil eject force` behaves like unplugging a drive mid-copy.
+Disk images mount under `/Volumes`. `diskutil` reports them as `Device Location: External`, so Tidy Drives treats them as external drives. Unmounting one with `diskutil eject force` behaves like unplugging a drive mid-copy.
 
 ```bash
 T=$(mktemp -d /tmp/mm-release-XXXX)
@@ -64,10 +64,10 @@ dd if=/dev/urandom of=/Volumes/MMSmokeLarge/huge.bin bs=1m count=2048
 shasum -a 256 /Volumes/MMSmokeSource/Films/big.bin /Volumes/MMSmokeLarge/huge.bin > "$T/sources.sha"
 ```
 
-Launch the release app with the separate home folder. The catalogue then lives at `$T/home/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3`, and your real one is never opened:
+Launch the release app with the separate home folder. The catalogue then lives at `$T/home/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`, and your real one is never opened:
 
 ```bash
-HOME="$T/home" "$APP/Contents/MacOS/media-mapper"
+HOME="$T/home" "$APP/Contents/MacOS/tidy-drives"
 ```
 
 Started this way, the app inherits Terminal's privacy permissions, so macOS asks for nothing. Section 5 covers first launch from Finder.
@@ -75,7 +75,7 @@ Started this way, the app inherits Terminal's privacy permissions, so macOS asks
 To read the test catalogue:
 
 ```bash
-sqlite3 "$T/home/Library/Application Support/com.ryanborroff.mediamapper/catalogue.sqlite3" "SELECT id, status, copied_bytes, error_message FROM transfers"
+sqlite3 "$T/home/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3" "SELECT id, status, copied_bytes, error_message FROM transfers"
 ```
 
 Use plain `sqlite3`, not `-readonly`. The database is in WAL mode, and a read-only open fails when the app has no connection open.
@@ -122,14 +122,14 @@ rm -rf "$T"
 
 These can't be automated. They need a person at the Mac, because macOS shows privacy prompts only to an app launched on its own, from Finder or the Dock. An app started from Terminal uses Terminal's permissions instead.
 
-Before you start, quit Media Mapper and back up the real catalogue. A Finder launch can't be pointed at another home folder:
+Before you start, quit Tidy Drives and back up the real catalogue. A Finder launch can't be pointed at another home folder:
 
 ```bash
-cp ~/Library/Application\ Support/com.ryanborroff.mediamapper/catalogue.sqlite3 ~/Desktop/catalogue-backup.sqlite3
+cp ~/Library/Application\ Support/com.ryanborroff.tidydrives/catalogue.sqlite3 ~/Desktop/catalogue-backup.sqlite3
 ```
 
-1. Copy `Media Mapper.app` to `/Applications` and open it from Finder.
-2. Scan a real external drive. **Expected:** macOS asks whether Media Mapper may access files on a removable volume. Allow it. The scan completes. Decline instead and the scan should report it couldn't read the drive, not crash.
+1. Copy `Tidy Drives.app` to `/Applications` and open it from Finder.
+2. Scan a real external drive. **Expected:** macOS asks whether Tidy Drives may access files on a removable volume. Allow it. The scan completes. Decline instead and the scan should report it couldn't read the drive, not crash.
 3. Add a folder inside **Documents**, **Desktop** or **Downloads** as a destination, and copy to it. Note any prompt. The release has no usage-description text, so prompts show only the system wording.
 4. Quit and relaunch, then copy to that folder again. Note whether macOS asks again.
 5. Record the results in the table below.
@@ -166,11 +166,11 @@ Run with disk images and a separate home folder, driving the bundled app through
 
 | # | Finding | Class |
 |---|---|---|
-| P3-1 | The bundle identifier ends in `.app`, and the catalogue folder is named after it. This is gap 12 in [HARDENING.md](HARDENING.md). | Fixed: `com.ryanborroff.mediamapper`, and the old catalogue is brought across on first use |
+| P3-1 | The bundle identifier ends in `.app`, and the catalogue folder is named after it. This is gap 12 in [HARDENING.md](HARDENING.md). | Fixed: `com.ryanborroff.tidydrives`, and the old catalogue is brought across on first use |
 | P3-2 | The bundle signature is invalid (linker ad-hoc only). Fine on the building Mac. On any other Mac it's reported as damaged. To fix in Phase 8 with Developer ID signing and notarisation. | Blocker for distribution (Phase 8) |
 | P3-3 | arm64-only build: Intel Macs can't run it. Universal or arm64-only is a decision for Phase 8. | Fixed: universal (`npm run build:release`) |
 | P3-4 | No `NSRemovableVolumesUsageDescription` or Documents, Desktop and Downloads usage strings. Development never shows these prompts, so they are untested: see section 5. | Fixed in `761706c` (SHIPPING.md) |
-| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.ryanborroff.mediamapper/media-mapper.log` |
+| P3-5 | Diagnostics go to stderr (`eprintln!`), which is lost when the app is launched from Finder. Recovery and database errors leave no trace on a user's Mac. | Fixed in Phase 6: `~/Library/Logs/com.ryanborroff.tidydrives/tidy-drives.log` |
 | P3-6 | Plan's "Space after transfer" uses the free space stored at the last scan, while readiness uses current free space. The two can contradict each other on one screen, and the planned-data figure is the truthful one to show. | Fixed: Plan uses current free space for connected drives, and labels an offline drive's figure "At last scan". A stale last-scan shortfall no longer blocks a copy, and a shortfall is reported once. |
 | P3-7 | Plan readiness isn't rechecked when free space changes on a drive that stays connected. It refreshes on connect, disconnect and user actions. Execution always rechecks, so this is never unsafe. | Safe to defer |
 | P3-8 | `LSMinimumSystemVersion` is 10.13, lower than Tauri 2 supports (10.15). | Fixed: 27.0 |
