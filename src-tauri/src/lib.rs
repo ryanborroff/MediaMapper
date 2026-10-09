@@ -1564,6 +1564,20 @@ fn rename_exclusive(source: &Path, destination: &Path) -> Result<(), String> {
         return Err(DESTINATION_APPEARED.to_string());
     }
 
+    // exFAT, as macOS mounts it, has no exclusive rename. It still refuses an
+    // existing destination with EEXIST above, and answers ENOTSUP only when
+    // the name is free, so the destination was free a moment ago. Confirm it
+    // still is and rename straight away. This leaves only the instant between
+    // the two calls for another file to take the name.
+    const ENOTSUP: i32 = 45;
+    if error.raw_os_error() == Some(ENOTSUP) {
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(DESTINATION_APPEARED.to_string());
+        }
+        return fs::rename(source, destination)
+            .map_err(|error| format!("Unable to finalise copied file: {error}"));
+    }
+
     Err(format!(
         "Unable to finalise copied file without overwrite: {error}"
     ))
@@ -13195,6 +13209,84 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let history = list_transfer_records(&fixture.connection).unwrap();
         assert_eq!(history[0].status, "failed");
         let _ = &fixture.database;
+    }
+
+    // Opt-in: the whole copy, including the never-overwrite final rename and
+    // the dates and Finder tags, onto real FAT32 and exFAT images, the formats
+    // drives shared with Windows use.
+    #[test]
+    #[ignore]
+    fn copies_complete_on_fat32_and_exfat() {
+        let unique = format!("{}-{}", std::process::id(), now_unix());
+        let work = TestVolume(std::env::temp_dir().join(format!("tidy-drives-copyfs-{unique}")));
+        fs::create_dir_all(&work.0).unwrap();
+        let work_path = fs::canonicalize(&work.0).unwrap();
+        let source = work_path.join("Café clip.mov");
+        let contents: Vec<u8> = (0..3_000_000_u32).map(|n| (n % 251) as u8).collect();
+        fs::write(&source, &contents).unwrap();
+        let tagged = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.metadata:_kMDItemUserTags"])
+            .arg("(\"Red\n6\")")
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(tagged.status.success(), "{tagged:?}");
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+
+        for (label, fs_name) in [("MMFAT", "MS-DOS FAT32"), ("MMEXFAT", "ExFAT")] {
+            let image = work_path.join(format!("{label}.dmg"));
+            let mount = work_path.join(label);
+            let created = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["create", "-size", "40m", "-fs", fs_name, "-volname", label])
+                .arg(&image)
+                .output()
+                .unwrap();
+            assert!(created.status.success(), "{created:?}");
+            fs::create_dir_all(&mount).unwrap();
+            let attached = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["attach", "-nobrowse", "-mountpoint"])
+                .arg(&mount)
+                .arg(&image)
+                .output()
+                .unwrap();
+            assert!(attached.status.success(), "{attached:?}");
+            let _detach = AttachedImage(mount.clone());
+
+            let destination = mount.join("Trip: Paris/Café clip.mov");
+            let copied = copy_file_verified(&source, &destination);
+            assert_eq!(copied, Ok(contents.len() as u64), "{label}");
+            assert_eq!(fs::read(&destination).unwrap(), contents, "{label}");
+            let modified = fs::metadata(&destination).unwrap().modified().unwrap();
+            let drift = modified
+                .duration_since(old)
+                .unwrap_or_else(|error| error.duration());
+            assert!(
+                drift <= Duration::from_secs(2),
+                "{label}: date drifted by {drift:?}"
+            );
+            assert!(
+                partial_files(destination.parent().unwrap()).is_empty(),
+                "{label}"
+            );
+            // A second copy to the same name must be refused, not overwrite.
+            assert_eq!(
+                copy_file_verified(&source, &destination),
+                Err(DESTINATION_EXISTS.to_string()),
+                "{label}"
+            );
+            let tags = std::process::Command::new("/usr/bin/xattr")
+                .args(["-p", "com.apple.metadata:_kMDItemUserTags"])
+                .arg(&destination)
+                .output()
+                .unwrap();
+            println!("{label}: tag kept = {}", tags.status.success());
+        }
     }
 
     // ---- Scale ----
