@@ -2078,7 +2078,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 // To change the schema: add a step at the end of `migrate_schema` that checks
 // before it writes, bump this number, and add a fixture test for a catalogue
 // at the previous version. See DATABASE.md.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Tidy Drives, so this version can't use it. Open it with the newer version of Tidy Drives.";
 
@@ -2112,6 +2112,11 @@ fn migrate_database(connection: &mut Connection, path: &Path) -> Result<(), Stri
         .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
 
     back_up_before_migration(connection, path)?;
+
+    // The version 3 step folds existing names for search, so the function
+    // must exist on this connection however it was opened.
+    register_search_function(connection)
+        .map_err(|error| format!("Unable to prepare catalogue search: {error}"))?;
 
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -2625,6 +2630,32 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Unable to initialise content check schema: {error}"))?;
 
+    // Version 3: each entry's name and path, folded for search, stored once
+    // rather than folded again for every row on every search. Existing
+    // entries are filled in here, and scans write both columns as they
+    // insert (`SCAN_INSERT_SQL`), so anything else that adds entries must
+    // write them too. There is deliberately no trigger: even one that never
+    // fires made every insert about four times slower.
+    let has_search_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('files') WHERE name = 'search_name')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to inspect file columns: {error}"))?;
+    if !has_search_columns {
+        connection
+            .execute_batch(
+                "
+                ALTER TABLE files ADD COLUMN search_name TEXT NOT NULL DEFAULT '';
+                ALTER TABLE files ADD COLUMN search_path TEXT NOT NULL DEFAULT '';
+                UPDATE files
+                   SET search_name = mm_search_fold(name),
+                       search_path = mm_search_fold(relative_path);
+                ",
+            )
+            .map_err(|error| format!("Unable to prepare catalogue search: {error}"))?;
+    }
     Ok(())
 }
 
@@ -3193,6 +3224,13 @@ fn is_volume_system_folder(name: &str) -> bool {
 // folder), so one unreadable folder does not stop the whole scan. The scan
 // still fails if the top folder of the drive cannot be listed at all, since
 // nothing could be catalogued.
+// How a scan writes one catalogue entry. `scan_directory` supplies all nine
+// values, including the name and path folded for search.
+const SCAN_INSERT_SQL: &str = "INSERT INTO files
+    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at,
+     search_name, search_path)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
 fn scan_directory(
     root: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
@@ -3302,7 +3340,9 @@ fn scan_directory(
                     parent_path,
                     if is_directory { 1 } else { 0 },
                     size_bytes,
-                    modified_at
+                    modified_at,
+                    search_fold(&name),
+                    search_fold(&relative)
                 ])
                 .map_err(|error| format!("Unable to write catalogue entry: {error}"))?;
 
@@ -3404,13 +3444,7 @@ fn scan_drive_job(
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
 
         let mut insert_statement = transaction
-            .prepare_cached(
-                "
-                INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ",
-            )
+            .prepare_cached(SCAN_INSERT_SQL)
             .map_err(|error| format!("Unable to prepare catalogue writer: {error}"))?;
 
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
@@ -3531,6 +3565,40 @@ async fn scan_connected_drive(
     .map_err(|error| format!("Drive scan task failed: {error}"))?
 }
 
+fn list_folder(
+    connection: &Connection,
+    persistent_identifier: &str,
+    parent_path: &str,
+) -> Result<Vec<CatalogueEntry>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
+            FROM files
+            WHERE drive_id = ?1
+              AND parent_path = ?2
+            ORDER BY is_directory DESC, lower(name), name
+            ",
+        )
+        .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
+
+    let rows = statement
+        .query_map(params![persistent_identifier, parent_path], |row| {
+            Ok(CatalogueEntry {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                is_directory: row.get::<_, i64>(2)? != 0,
+                size_bytes: row.get(3)?,
+                modified_at: row.get(4)?,
+                unreadable: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+}
+
 #[tauri::command]
 async fn list_catalogue_entries(
     app: tauri::AppHandle,
@@ -3539,34 +3607,7 @@ async fn list_catalogue_entries(
 ) -> Result<Vec<CatalogueEntry>, String> {
     run_command("open this folder", move || {
         let connection = open_database(&database_path(&app)?)?;
-
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
-                FROM files
-                WHERE drive_id = ?1
-                  AND parent_path = ?2
-                ORDER BY is_directory DESC, lower(name), name
-                ",
-            )
-            .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
-
-        let rows = statement
-            .query_map(params![persistent_identifier, parent_path], |row| {
-                Ok(CatalogueEntry {
-                    relative_path: row.get(0)?,
-                    name: row.get(1)?,
-                    is_directory: row.get::<_, i64>(2)? != 0,
-                    size_bytes: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    unreadable: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+        list_folder(&connection, &persistent_identifier, &parent_path)
     })
     .await
 }
@@ -3641,15 +3682,73 @@ fn register_name_key_function(connection: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn normalised_search_expression(column: &str) -> String {
-    format!("mm_search_fold({column})")
-}
-
 fn search_tokens(query: &str) -> Vec<String> {
     search_fold(query)
         .split_whitespace()
         .map(str::to_owned)
         .collect()
+}
+
+fn search_drive(
+    connection: &Connection,
+    persistent_identifier: &str,
+    query: &str,
+) -> Result<Vec<CatalogueEntry>, String> {
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let name_expr = "search_name";
+    let path_expr = "search_path";
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 2;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
+        "SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
+         FROM files
+         WHERE drive_id = ?1
+           AND {}
+         ORDER BY is_directory DESC, lower(name), relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
+    values.push(&persistent_identifier);
+    for token in &tokens {
+        values.push(token);
+    }
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search catalogue: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(CatalogueEntry {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                is_directory: row.get::<_, i64>(2)? != 0,
+                size_bytes: row.get(3)?,
+                modified_at: row.get(4)?,
+                unreadable: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(|error| format!("Unable to read search results: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read search result rows: {error}"))
 }
 
 #[tauri::command]
@@ -3659,65 +3758,72 @@ async fn search_catalogue(
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
     run_command("search this drive", move || {
-        let tokens = search_tokens(query.trim());
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let connection = open_database(&database_path(&app)?)?;
-
-        let name_expr = normalised_search_expression("name");
-        let path_expr = normalised_search_expression("relative_path");
-
-        let conditions: Vec<String> = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let parameter = index + 2;
-                format!(
-                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-                )
-            })
-            .collect();
-
-        let sql = format!(
-            "SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
-             FROM files
-             WHERE drive_id = ?1
-               AND {}
-             ORDER BY is_directory DESC, lower(name), relative_path
-             LIMIT 200",
-            conditions.join(" AND ")
-        );
-
-        let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
-        values.push(&persistent_identifier);
-        for token in &tokens {
-            values.push(token);
-        }
-
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|error| format!("Unable to search catalogue: {error}"))?;
-
-        let rows = statement
-            .query_map(values.as_slice(), |row| {
-                Ok(CatalogueEntry {
-                    relative_path: row.get(0)?,
-                    name: row.get(1)?,
-                    is_directory: row.get::<_, i64>(2)? != 0,
-                    size_bytes: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    unreadable: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .map_err(|error| format!("Unable to read search results: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read search result rows: {error}"))
+        search_drive(&connection, &persistent_identifier, &query)
     })
     .await
+}
+
+fn search_library(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<LibrarySearchResult>, String> {
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let name_expr = "f.search_name";
+    let path_expr = "f.search_path";
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 1;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
+        "SELECT f.drive_id, d.name, f.relative_path, f.name,
+                f.is_directory, f.size_bytes, f.modified_at
+         FROM files f
+         JOIN drives d ON d.persistent_identifier = f.drive_id
+         WHERE {}
+         ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let values: Vec<&dyn rusqlite::ToSql> = tokens
+        .iter()
+        .map(|token| token as &dyn rusqlite::ToSql)
+        .collect();
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search library: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(LibrarySearchResult {
+                drive_id: row.get(0)?,
+                drive_name: row.get(1)?,
+                relative_path: row.get(2)?,
+                name: row.get(3)?,
+                is_directory: row.get::<_, i64>(4)? != 0,
+                size_bytes: row.get(5)?,
+                modified_at: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("Unable to read library search results: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read library search result rows: {error}"))
 }
 
 #[tauri::command]
@@ -3726,64 +3832,8 @@ async fn search_all_catalogues(
     query: String,
 ) -> Result<Vec<LibrarySearchResult>, String> {
     run_command("search your drives", move || {
-        let tokens = search_tokens(query.trim());
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let connection = open_database(&database_path(&app)?)?;
-
-        let name_expr = normalised_search_expression("f.name");
-        let path_expr = normalised_search_expression("f.relative_path");
-
-        let conditions: Vec<String> = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let parameter = index + 1;
-                format!(
-                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-                )
-            })
-            .collect();
-
-        let sql = format!(
-            "SELECT f.drive_id, d.name, f.relative_path, f.name,
-                    f.is_directory, f.size_bytes, f.modified_at
-             FROM files f
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE {}
-             ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
-             LIMIT 200",
-            conditions.join(" AND ")
-        );
-
-        let values: Vec<&dyn rusqlite::ToSql> = tokens
-            .iter()
-            .map(|token| token as &dyn rusqlite::ToSql)
-            .collect();
-
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|error| format!("Unable to search library: {error}"))?;
-
-        let rows = statement
-            .query_map(values.as_slice(), |row| {
-                Ok(LibrarySearchResult {
-                    drive_id: row.get(0)?,
-                    drive_name: row.get(1)?,
-                    relative_path: row.get(2)?,
-                    name: row.get(3)?,
-                    is_directory: row.get::<_, i64>(4)? != 0,
-                    size_bytes: row.get(5)?,
-                    modified_at: row.get(6)?,
-                })
-            })
-            .map_err(|error| format!("Unable to read library search results: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read library search result rows: {error}"))
+        search_library(&connection, &query)
     })
     .await
 }
@@ -6619,6 +6669,19 @@ mod tests {
         assert_eq!(fs::read(folders.legacy()).unwrap(), b"not a database");
     }
 
+    // Fills the search columns for entries a test inserted directly, as a
+    // scan writes them for real entries.
+    fn fill_search_columns(connection: &Connection) {
+        connection
+            .execute(
+                "UPDATE files
+                    SET search_name = mm_search_fold(name),
+                        search_path = mm_search_fold(relative_path)",
+                [],
+            )
+            .unwrap();
+    }
+
     fn insert_drive(connection: &Connection, id: &str, name: &str) {
         connection
             .execute(
@@ -7195,8 +7258,32 @@ mod tests {
                     ..with_unreadable
                 },
             ),
+            // Version 2 adds content checks and an index on file size.
+            (
+                "duplicates (version 2)",
+                format!("{main}{FIXTURE_VERSION_2}PRAGMA user_version = 2;"),
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
         ]
     }
+
+    const FIXTURE_VERSION_2: &str = "
+        CREATE TABLE content_checks (
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            modified_at INTEGER,
+            sample_hash BLOB NOT NULL,
+            full_hash BLOB,
+            checked_at INTEGER NOT NULL,
+            PRIMARY KEY (drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_files_size ON files(size_bytes) WHERE is_directory = 0;
+    ";
 
     fn create_fixture(path: &Path, sql: &str) {
         Connection::open(path).unwrap().execute_batch(sql).unwrap();
@@ -7570,6 +7657,14 @@ mod tests {
                 "the {commit} catalogue must end with the current schema"
             );
             assert_catalogue_survived(&connection, holds, commit);
+            // Entries from before version 3 are searchable, folded like new ones.
+            let found = search_library(&connection, "ÉTÉ 2024").unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|result| result.relative_path == "Films/Été 2024"),
+                "the {commit} catalogue must be searchable after its upgrade: {found:?}"
+            );
 
             // Reopening, as the next launch does, changes nothing.
             drop(connection);
@@ -7892,13 +7987,7 @@ mod tests {
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-SCAN", "Test");
         let transaction = connection.transaction().unwrap();
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .unwrap();
+        let mut insert = transaction.prepare(SCAN_INSERT_SQL).unwrap();
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
 
         let result = scan_directory(
@@ -8043,10 +8132,13 @@ mod tests {
             )
             .unwrap();
 
+        fill_search_columns(&connection);
+
         let matches = |query: &str| -> bool {
             let tokens = search_tokens(query);
             assert!(!tokens.is_empty());
-            let expression = normalised_search_expression("name");
+            // The stored column, as a scan would have written it.
+            let expression = "search_name";
             tokens.iter().all(|token| {
                 connection
                     .query_row(
@@ -11204,13 +11296,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-LOCK", "Test");
         let transaction = connection.transaction().unwrap();
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .unwrap();
+        let mut insert = transaction.prepare(SCAN_INSERT_SQL).unwrap();
         let mut scan = |counters: &mut (i64, i64, i64, i64), unreadable: &mut Vec<String>| {
             transaction
                 .execute("DELETE FROM files WHERE drive_id = 'UUID-LOCK'", [])
@@ -13201,6 +13287,146 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
                 .unwrap();
             println!("{label}: tag kept = {}", tags.status.success());
         }
+    }
+
+    // ---- Scale ----
+
+    fn timed<T>(label: &str, work: impl FnOnce() -> T) -> (T, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let result = work();
+        let elapsed = started.elapsed();
+        println!("SCALE {label}: {:.0} ms", elapsed.as_secs_f64() * 1000.0);
+        (result, elapsed)
+    }
+
+    // Opt-in benchmark: a catalogue of a million files across three drives,
+    // laid out like footage (year / project / clip), then the searches and
+    // folder views people use constantly. Run with
+    // `cargo test --release --lib catalogue_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn catalogue_at_scale_stays_responsive() {
+        let database = TestDatabase::new("scale-catalogue");
+        let mut connection = open_database(&database.0).unwrap();
+        let drives = ["UUID-A", "UUID-B", "UUID-C"];
+        for (index, id) in drives.iter().enumerate() {
+            insert_drive(&connection, id, &format!("Archive {}", index + 1));
+        }
+        let per_drive = 333_334_i64;
+        let ((), _) = timed("insert 1,000,000 catalogue rows", || {
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .unwrap();
+                for id in drives {
+                    for n in 0..per_drive {
+                        let year = 2015 + n % 10;
+                        let project = n / 400;
+                        let folder = format!("{year}/Project {project:04} Été");
+                        if n % 400 == 0 {
+                            insert
+                                .execute(params![
+                                    id,
+                                    folder,
+                                    format!("Project {project:04} Été"),
+                                    year.to_string(),
+                                    1,
+                                    None::<i64>,
+                                    0
+                                ])
+                                .unwrap();
+                        }
+                        let name = format!("Clip_{n:06}_Café.mov");
+                        insert
+                            .execute(params![
+                                id,
+                                format!("{folder}/{name}"),
+                                name,
+                                folder,
+                                0,
+                                1_000_000 + n * 37,
+                                1_600_000_000 + n
+                            ])
+                            .unwrap();
+                    }
+                }
+            }
+            transaction.commit().unwrap();
+        });
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        println!("SCALE catalogue rows: {count}");
+        timed(
+            "fold 1,000,000 rows for search, as the version 3 upgrade does",
+            || fill_search_columns(&connection),
+        );
+
+        let (results, search_all) = timed("search all drives: `clip 004217`", || {
+            search_library(&connection, "clip 004217").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, search_common) = timed("search all drives, common word: `café`", || {
+            search_library(&connection, "café").unwrap()
+        });
+        assert_eq!(results.len(), 200);
+        let (results, search_none) = timed("search all drives, no match: `zebra`", || {
+            search_library(&connection, "zebra").unwrap()
+        });
+        assert!(results.is_empty());
+        let (results, search_one) = timed("search one drive: `clip 004217`", || {
+            search_drive(&connection, "UUID-B", "clip 004217").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, folder) = timed("open a 400-file folder", || {
+            list_folder(&connection, "UUID-B", "2017/Project 0012 Été").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, root) = timed("open a drive's top level", || {
+            list_folder(&connection, "UUID-B", "").unwrap()
+        });
+        println!("SCALE top-level entries: {}", results.len());
+
+        // Generous ceilings, for a release build on an Apple silicon Mac.
+        // They catch a regression to a much slower plan, not small drift.
+        for (label, elapsed) in [
+            ("search all", search_all),
+            ("search common", search_common),
+            ("search none", search_none),
+            ("search one", search_one),
+            ("folder", folder),
+            ("root", root),
+        ] {
+            assert!(elapsed.as_secs_f64() < 5.0, "{label} took {elapsed:?}");
+        }
+    }
+
+    // Opt-in benchmark: scans 100,000 real files in 500 folders.
+    #[test]
+    #[ignore]
+    fn scanning_a_hundred_thousand_files() {
+        let database = TestDatabase::new("scale-scan");
+        let unique = format!("{}-{}", std::process::id(), now_unix());
+        let volume = TestVolume(std::env::temp_dir().join(format!("tidy-drives-scale-{unique}")));
+        let ((), _) = timed("create 100,000 files", || {
+            for folder in 0..500 {
+                let directory = volume.0.join(format!("Shoot {folder:03}"));
+                fs::create_dir_all(&directory).unwrap();
+                for file in 0..200 {
+                    fs::write(directory.join(format!("IMG_{file:04}.CR3")), b"x").unwrap();
+                }
+            }
+        });
+        let drive = test_drive("UUID-SCALE", "Scale", &volume.0, 1_000_000_000);
+        let (result, _) = timed("scan 100,000 files", || {
+            scan_drive_job(database.0.clone(), drive, |_, _, _| {})().unwrap()
+        });
+        assert_eq!(result.file_count, 100_000);
+        assert_eq!(result.directory_count, 500);
     }
 
     // ---- Content checks ----

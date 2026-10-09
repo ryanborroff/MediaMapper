@@ -17,7 +17,7 @@ Tidy Drives is a macOS desktop app built with Tauri 2. The workflow is: browse w
 |---|---|
 | Backend | Rust, in `src-tauri/src/lib.rs`: about 6,100 lines of code and 6,800 of tests. It exposes 26 Tauri commands. |
 | Frontend | React 19 and TypeScript in `src/App.tsx` (3,600 lines), with `App.css`. Built with Vite. |
-| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`. Schema version 2. See [DATABASE.md](DATABASE.md). |
+| Data | One SQLite catalogue in WAL mode, at `~/Library/Application Support/com.ryanborroff.tidydrives/catalogue.sqlite3`. Schema version 3. See [DATABASE.md](DATABASE.md). |
 | macOS tools | `diskutil` (finding drives and their capacity), `df` (free space on this Mac), `open` (opening files, and Show in Finder) |
 | Diagnostics | `~/Library/Logs/com.ryanborroff.tidydrives/tidy-drives.log`, rolling over at 1 MB |
 | Permissions | Not sandboxed. Tauri capabilities: `core:default`, `core:window:allow-show`, `dialog:default`. Privacy usage descriptions for removable volumes and the Documents, Desktop and Downloads folders. |
@@ -136,7 +136,7 @@ The Duplicates view follows the same rules: groups are buttons with `aria-expand
 
 ## 8. Database and migration status
 
-- **Schema version 2,** stored in `PRAGMA user_version`. Version 2 added `content_checks` and a size index.
+- **Schema version 3,** stored in `PRAGMA user_version`. Version 2 added `content_checks` and a size index; version 3 stores each entry's name and path folded for search.
 - **Upgrades** run in one `BEGIN IMMEDIATE` transaction, after a `VACUUM INTO` backup that never replaces an existing file.
 - **Failure or interruption keeps nothing.** A second app instance waits, then finds the catalogue current.
 - **Newer catalogues** are refused and left unchanged.
