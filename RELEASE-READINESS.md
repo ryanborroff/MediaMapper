@@ -40,7 +40,7 @@ These hold in the code and are each covered by tests ([SAFETY-MATRIX.md](SAFETY-
 5. **A failed, cancelled or interrupted copy is never shown as completed.**
    - Only a copy that is verified, in place and recorded is completed.
    - A crash after the rename is completed only after recovery compares the copy with the source again.
-6. **Final checks run immediately before each file.** Drives must be connected, the source unchanged since its scan, the destination clear, and free space current, including a 1 GB reserve when copying to this Mac.
+6. **Final checks run immediately before each file.** Drives must be connected, the source unchanged since its scan, the destination clear and writable, the file within the destination format's limits (4 GB on FAT32), and free space current, including a 1 GB reserve when copying to this Mac.
 7. **The source can't be swapped.** Sources are opened without following links and must be regular files. A folder move can't reach the copy engine.
 8. **One copy, scan or content check at a time,** across threads and app instances, using an OS file lock.
 9. **Cleanup is narrow.** Only the exact temporary file of a known transfer record is ever removed. A folder, link or unrelated file at that path is left alone.

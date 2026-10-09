@@ -82,6 +82,8 @@ Run the suite with `cargo test --manifest-path src-tauri/Cargo.toml`. The out-of
 | D11 | Not enough free space | Refused at validation | Auto: `preflight_reports_insufficient_capacity_and_missing_sources`, `destination_space_must_cover_the_file_exactly` | Existing / New | Pass | |
 | D12 | Free space changes between planning and execution | Current free space checked immediately before each copy | Auto: `live_validation_checks_source_disk_and_current_capacity` | Existing | Pass | |
 | D13 | Volume fills up during the copy | Copy fails; partial removed; plan kept | Auto (opt-in, real disk image): `copy_that_runs_out_of_space_fails_and_cleans_up` | New | Pass (run 2026-10-01) | Not part of CI |
+| D14 | File larger than the destination format allows (over 4 GB on FAT32) | Refused at validation, before any record | Auto: `destination_format_rules_match_each_format`; Auto (opt-in, real FAT32 and exFAT disk images): `live_validation_refuses_what_the_destination_format_cannot_take` | New | Pass (run 2026-10-09) | FAT32 refuses 4 GB + 1 byte with EFBIG, checked on a real image. Names with `: ? * " < > \|` are not refused: macOS stores them on FAT32 and exFAT and reads them back unchanged. |
+| D15 | Destination volume mounted read-only (such as NTFS) | Refused at validation for every file planned to it | Auto: `mount_list_is_parsed_including_spaces_and_read_only`, opt-in disk-image test above; Manual: M10 | New / Manual | Pass / Not run | The startup disk is skipped: its sealed system volume is listed read-only at `/` |
 
 ## Application interruption
 
