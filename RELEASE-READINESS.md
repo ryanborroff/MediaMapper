@@ -33,7 +33,7 @@ These hold in the code and are each covered by tests ([SAFETY-MATRIX.md](SAFETY-
 3. **Copies are checked before they count.**
    - Each file is written to a temporary `.mediamapper-transfer-<id>-<created>.partial` beside its destination, with writes bypassing the cache, and synced to disk.
    - It is then compared byte for byte with the source, reading the copy back from the drive rather than from memory.
-   - Only after that is it put in place, with an exclusive rename.
+   - Only after that is it put in place, with an exclusive rename. The folder is then synced (`F_FULLFSYNC`), so the new name is on the drive before the copy is recorded as completed.
 4. **An existing destination is never overwritten.**
    - The final rename (`renamex_np` with `RENAME_EXCL`) fails rather than replacing anything.
    - exFAT has no exclusive rename on macOS. It still refuses an existing destination, and reports "not supported" only when the name is free, so the copy is then renamed into place at once after a final check. Only the instant between those two calls is unguarded.
