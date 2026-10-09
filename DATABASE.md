@@ -36,6 +36,7 @@ The schema version is SQLite's `PRAGMA user_version`. `SCHEMA_VERSION` in `src-t
 | 0 | Every build before `ed3f730` | No version stored. The schema could be any of the eight shapes below. |
 | 1 | `ed3f730` | The schema as of `main` 66426ad, with a version |
 | 2 | Duplicate awareness | Adds `content_checks` and an index on file size. Nothing existing changes. |
+| 3 | Faster search | Adds `files.search_name` and `files.search_path`: the name and path folded for search (`search_fold`). The upgrade fills them for existing entries (about 3.4 s for a million entries on an Apple silicon Mac), and scans write them as they insert (`SCAN_INSERT_SQL`). Search reads them instead of folding every row on every search, which took a million-entry search from 1–2.6 s to 0.2–0.5 s. Anything that adds entries must write both columns; there is deliberately no trigger, because even one that never fires made inserts about four times slower. |
 
 The shapes that version 0 covers, each of which has a test fixture:
 
@@ -78,7 +79,7 @@ In `src-tauri/src/lib.rs`, `mod tests`:
 
 | Test | Checks |
 |---|---|
-| `every_historical_catalogue_upgrades_keeping_its_data` | Each of the eight version 0 shapes, and a version 1 catalogue, upgrades to exactly the current schema. Drives, capacity, mount points, scan and connection times, totals, every entry with its exact name and parent folder, unreadable markers, locations, labels, folders on this Mac, planned moves, transfer history (including a cancel and an unfinished record), foreign keys and integrity are all kept. Reopening changes nothing. |
+| `every_historical_catalogue_upgrades_keeping_its_data` | Each of the eight version 0 shapes, a version 1 and a version 2 catalogue, upgrades to exactly the current schema. Drives, capacity, mount points, scan and connection times, totals, every entry with its exact name and parent folder, unreadable markers, locations, labels, folders on this Mac, planned moves, transfer history (including a cancel and an unfinished record), foreign keys and integrity are all kept. Every one is searchable afterwards (`ÉTÉ 2024` finds `Films/Été 2024`). Reopening changes nothing. |
 | `a_failed_upgrade_leaves_the_catalogue_exactly_as_it_was` | An upgrade that fails at its last step keeps none of its earlier steps, and succeeds in full later |
 | `two_app_instances_upgrading_at_once_both_succeed` | Six connections upgrading at once, without the in-app lock, all succeed |
 | `a_catalogue_from_a_newer_version_is_left_untouched` | Refused, unchanged, no backup |

@@ -2064,7 +2064,7 @@ fn open_database(path: &Path) -> Result<Connection, String> {
 // To change the schema: add a step at the end of `migrate_schema` that checks
 // before it writes, bump this number, and add a fixture test for a catalogue
 // at the previous version. See DATABASE.md.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const NEWER_CATALOGUE_MESSAGE: &str = "This catalogue was updated by a newer version of Tidy Drives, so this version can't use it. Open it with the newer version of Tidy Drives.";
 
@@ -2098,6 +2098,11 @@ fn migrate_database(connection: &mut Connection, path: &Path) -> Result<(), Stri
         .map_err(|error| format!("Unable to initialise catalogue database: {error}"))?;
 
     back_up_before_migration(connection, path)?;
+
+    // The version 3 step folds existing names for search, so the function
+    // must exist on this connection however it was opened.
+    register_search_function(connection)
+        .map_err(|error| format!("Unable to prepare catalogue search: {error}"))?;
 
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -2611,6 +2616,32 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Unable to initialise content check schema: {error}"))?;
 
+    // Version 3: each entry's name and path, folded for search, stored once
+    // rather than folded again for every row on every search. Existing
+    // entries are filled in here, and scans write both columns as they
+    // insert (`SCAN_INSERT_SQL`), so anything else that adds entries must
+    // write them too. There is deliberately no trigger: even one that never
+    // fires made every insert about four times slower.
+    let has_search_columns: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('files') WHERE name = 'search_name')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to inspect file columns: {error}"))?;
+    if !has_search_columns {
+        connection
+            .execute_batch(
+                "
+                ALTER TABLE files ADD COLUMN search_name TEXT NOT NULL DEFAULT '';
+                ALTER TABLE files ADD COLUMN search_path TEXT NOT NULL DEFAULT '';
+                UPDATE files
+                   SET search_name = mm_search_fold(name),
+                       search_path = mm_search_fold(relative_path);
+                ",
+            )
+            .map_err(|error| format!("Unable to prepare catalogue search: {error}"))?;
+    }
     Ok(())
 }
 
@@ -3179,6 +3210,13 @@ fn is_volume_system_folder(name: &str) -> bool {
 // folder), so one unreadable folder does not stop the whole scan. The scan
 // still fails if the top folder of the drive cannot be listed at all, since
 // nothing could be catalogued.
+// How a scan writes one catalogue entry. `scan_directory` supplies all nine
+// values, including the name and path folded for search.
+const SCAN_INSERT_SQL: &str = "INSERT INTO files
+    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at,
+     search_name, search_path)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
 fn scan_directory(
     root: &Path,
     insert_statement: &mut rusqlite::Statement<'_>,
@@ -3288,7 +3326,9 @@ fn scan_directory(
                     parent_path,
                     if is_directory { 1 } else { 0 },
                     size_bytes,
-                    modified_at
+                    modified_at,
+                    search_fold(&name),
+                    search_fold(&relative)
                 ])
                 .map_err(|error| format!("Unable to write catalogue entry: {error}"))?;
 
@@ -3390,13 +3430,7 @@ fn scan_drive_job(
             .map_err(|error| format!("Unable to prepare drive rescan: {error}"))?;
 
         let mut insert_statement = transaction
-            .prepare_cached(
-                "
-                INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ",
-            )
+            .prepare_cached(SCAN_INSERT_SQL)
             .map_err(|error| format!("Unable to prepare catalogue writer: {error}"))?;
 
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
@@ -3634,10 +3668,6 @@ fn register_name_key_function(connection: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn normalised_search_expression(column: &str) -> String {
-    format!("mm_search_fold({column})")
-}
-
 fn search_tokens(query: &str) -> Vec<String> {
     search_fold(query)
         .split_whitespace()
@@ -3655,8 +3685,8 @@ fn search_drive(
         return Ok(Vec::new());
     }
 
-    let name_expr = normalised_search_expression("name");
-    let path_expr = normalised_search_expression("relative_path");
+    let name_expr = "search_name";
+    let path_expr = "search_path";
 
     let conditions: Vec<String> = tokens
         .iter()
@@ -3729,8 +3759,8 @@ fn search_library(
         return Ok(Vec::new());
     }
 
-    let name_expr = normalised_search_expression("f.name");
-    let path_expr = normalised_search_expression("f.relative_path");
+    let name_expr = "f.search_name";
+    let path_expr = "f.search_path";
 
     let conditions: Vec<String> = tokens
         .iter()
@@ -6625,6 +6655,19 @@ mod tests {
         assert_eq!(fs::read(folders.legacy()).unwrap(), b"not a database");
     }
 
+    // Fills the search columns for entries a test inserted directly, as a
+    // scan writes them for real entries.
+    fn fill_search_columns(connection: &Connection) {
+        connection
+            .execute(
+                "UPDATE files
+                    SET search_name = mm_search_fold(name),
+                        search_path = mm_search_fold(relative_path)",
+                [],
+            )
+            .unwrap();
+    }
+
     fn insert_drive(connection: &Connection, id: &str, name: &str) {
         connection
             .execute(
@@ -7201,8 +7244,32 @@ mod tests {
                     ..with_unreadable
                 },
             ),
+            // Version 2 adds content checks and an index on file size.
+            (
+                "duplicates (version 2)",
+                format!("{main}{FIXTURE_VERSION_2}PRAGMA user_version = 2;"),
+                Holds {
+                    transfers: true,
+                    ..with_unreadable
+                },
+            ),
         ]
     }
+
+    const FIXTURE_VERSION_2: &str = "
+        CREATE TABLE content_checks (
+            drive_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            modified_at INTEGER,
+            sample_hash BLOB NOT NULL,
+            full_hash BLOB,
+            checked_at INTEGER NOT NULL,
+            PRIMARY KEY (drive_id, relative_path),
+            FOREIGN KEY(drive_id) REFERENCES drives(persistent_identifier) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_files_size ON files(size_bytes) WHERE is_directory = 0;
+    ";
 
     fn create_fixture(path: &Path, sql: &str) {
         Connection::open(path).unwrap().execute_batch(sql).unwrap();
@@ -7576,6 +7643,14 @@ mod tests {
                 "the {commit} catalogue must end with the current schema"
             );
             assert_catalogue_survived(&connection, holds, commit);
+            // Entries from before version 3 are searchable, folded like new ones.
+            let found = search_library(&connection, "ÉTÉ 2024").unwrap();
+            assert!(
+                found
+                    .iter()
+                    .any(|result| result.relative_path == "Films/Été 2024"),
+                "the {commit} catalogue must be searchable after its upgrade: {found:?}"
+            );
 
             // Reopening, as the next launch does, changes nothing.
             drop(connection);
@@ -7898,13 +7973,7 @@ mod tests {
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-SCAN", "Test");
         let transaction = connection.transaction().unwrap();
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .unwrap();
+        let mut insert = transaction.prepare(SCAN_INSERT_SQL).unwrap();
         let mut counters = (0_i64, 0_i64, 0_i64, 0_i64);
 
         let result = scan_directory(
@@ -8049,10 +8118,13 @@ mod tests {
             )
             .unwrap();
 
+        fill_search_columns(&connection);
+
         let matches = |query: &str| -> bool {
             let tokens = search_tokens(query);
             assert!(!tokens.is_empty());
-            let expression = normalised_search_expression("name");
+            // The stored column, as a scan would have written it.
+            let expression = "search_name";
             tokens.iter().all(|token| {
                 connection
                     .query_row(
@@ -11210,13 +11282,7 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let mut connection = open_database(&database.0).unwrap();
         insert_drive(&connection, "UUID-LOCK", "Test");
         let transaction = connection.transaction().unwrap();
-        let mut insert = transaction
-            .prepare(
-                "INSERT INTO files
-                    (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )
-            .unwrap();
+        let mut insert = transaction.prepare(SCAN_INSERT_SQL).unwrap();
         let mut scan = |counters: &mut (i64, i64, i64, i64), unreadable: &mut Vec<String>| {
             transaction
                 .execute("DELETE FROM files WHERE drive_id = 'UUID-LOCK'", [])
@@ -13203,6 +13269,10 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap();
         println!("SCALE catalogue rows: {count}");
+        timed(
+            "fold 1,000,000 rows for search, as the version 3 upgrade does",
+            || fill_search_columns(&connection),
+        );
 
         let (results, search_all) = timed("search all drives: `clip 004217`", || {
             search_library(&connection, "clip 004217").unwrap()
