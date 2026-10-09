@@ -473,6 +473,13 @@ function isPlanReady(
     (preflight?.issues.length ?? 0) === 0;
 }
 
+// macOS can report a drive before it is ready to read, so an automatic scan
+// waits this long after the drive appears.
+const AUTO_SCAN_SETTLE_MS = 3000;
+// How long an automatic scan waits to try again when another copy of Media
+// Mapper is busy with the drives.
+const AUTO_SCAN_RETRY_MS = 10000;
+
 function App() {
   const [connected, setConnected] = useState<DriveInfo[]>([]);
   const [catalogued, setCatalogued] = useState<CataloguedDrive[]>([]);
@@ -482,6 +489,20 @@ function App() {
   const [scanComplete, setScanComplete] = useState<ScanResult | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [scanCancelledId, setScanCancelledId] = useState<string | null>(null);
+  // The drive being rescanned because it connected, rather than because the
+  // user chose Rescan.
+  const [autoScanningId, setAutoScanningId] = useState<string | null>(null);
+  // Catalogued drives waiting to be rescanned, oldest first, each with when
+  // it may start. Changing the tick makes the queue be looked at again.
+  const autoScanQueue = useRef<{ driveId: string; dueAt: number }[]>([]);
+  const [autoScanTick, setAutoScanTick] = useState(0);
+  const queueAutoScan = useCallback((driveId: string, delay: number) => {
+    autoScanQueue.current = [
+      ...autoScanQueue.current.filter((item) => item.driveId !== driveId),
+      { driveId, dueAt: Date.now() + delay },
+    ];
+    setAutoScanTick((tick) => tick + 1);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<"drives" | "browse" | "plan" | "transfers">("drives");
   const [browserDrive, setBrowserDrive] = useState<CataloguedDrive | null>(null);
@@ -1680,20 +1701,30 @@ function App() {
     }
   };
 
-  const scan = async (drive: DriveInfo) => {
+  // An automatic scan is one Media Mapper started because a catalogued drive
+  // connected. It doesn't move focus or clear an error the user is reading.
+  const scan = async (drive: DriveInfo, automatic = false) => {
     if (!drive.persistentIdentifier) {
       setError("This drive doesn't report a permanent identity, so Media Mapper can't recognise it reliably and won't catalogue it.");
       return;
     }
-    setScanningId(drive.persistentIdentifier);
+    const driveId = drive.persistentIdentifier;
+    // This scan brings the drive up to date, so a queued automatic one isn't needed.
+    autoScanQueue.current = autoScanQueue.current.filter((item) => item.driveId !== driveId);
+    setScanningId(driveId);
+    setAutoScanningId(automatic ? driveId : null);
     setCancellingId(null);
     setScanCancelledId(null);
     setScanComplete(null);
-    setScanProgress({ persistentIdentifier: drive.persistentIdentifier, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
-    setError(null);
-    const name = driveDisplayName(drive.persistentIdentifier, drive.name);
-    setAnnouncement(`Scanning ${name}.`);
-    setPendingFocus({ selector: `[data-focus="cancel-scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
+    setScanProgress({ persistentIdentifier: driveId, fileCount: 0, directoryCount: 0, cataloguedBytes: 0, skippedCount: 0, currentPath: "" });
+    const name = driveDisplayName(driveId, drive.name);
+    if (automatic) {
+      setAnnouncement(`${name} connected. Rescanning it.`);
+    } else {
+      setError(null);
+      setAnnouncement(`Scanning ${name}.`);
+      setPendingFocus({ selector: `[data-focus="cancel-scan-${CSS.escape(driveId)}"]`, onlyIfLost: true });
+    }
     try {
       const result = await invoke<ScanResult>("scan_drive", { persistentIdentifier: drive.persistentIdentifier });
       setScanComplete({ ...result, currentPath: "" });
@@ -1724,16 +1755,74 @@ function App() {
         setScanCancelledId(drive.persistentIdentifier);
         setAnnouncement("Scan cancelled.");
         window.setTimeout(() => setScanCancelledId(null), 4000);
-      } else {
+      } else if (!automatic) {
         setError(message);
+      } else if (message.includes("A transfer is running") || message.includes("still finishing another task")) {
+        // Another copy of Media Mapper is busy. Try again once it may be done.
+        queueAutoScan(driveId, AUTO_SCAN_RETRY_MS);
+      } else {
+        // Ejecting a drive mid-scan is ordinary, so only report a failure
+        // while the drive is still there.
+        const stillConnected = await invoke<DriveInfo[]>("list_external_drives")
+          .then((drives) => drives.some((item) => item.persistentIdentifier === driveId))
+          .catch(() => false);
+        if (stillConnected) {
+          setError(`Media Mapper couldn't rescan ${name} when it connected. ${message}`);
+        }
       }
     } finally {
       setScanningId(null);
+      setAutoScanningId(null);
       setCancellingId(null);
       setScanProgress(null);
-      setPendingFocus({ selector: `[data-focus="scan-${CSS.escape(drive.persistentIdentifier)}"]`, onlyIfLost: true });
+      setPendingFocus({ selector: `[data-focus="scan-${CSS.escape(driveId)}"]`, onlyIfLost: true });
     }
   };
+
+  // Drives already in the catalogue are rescanned whenever they connect, and
+  // when the app opens with them connected, so the catalogue keeps up without
+  // the user remembering to rescan. A drive that has never been scanned waits
+  // for the user to choose Scan, so nothing is catalogued uninvited.
+  const seenConnectedIds = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    if (loading) return;
+    const current = new Set(
+      connected.flatMap((drive) => (drive.persistentIdentifier ? [drive.persistentIdentifier] : [])),
+    );
+    const seen = seenConnectedIds.current ?? new Set<string>();
+    seenConnectedIds.current = current;
+    const cataloguedIds = new Set(catalogued.map((drive) => drive.persistentIdentifier));
+    // A drive that has gone is dropped. If it comes back, it is queued afresh.
+    autoScanQueue.current = autoScanQueue.current.filter((item) => current.has(item.driveId));
+    for (const id of current) {
+      if (!seen.has(id) && cataloguedIds.has(id)) {
+        queueAutoScan(id, AUTO_SCAN_SETTLE_MS);
+      }
+    }
+  }, [loading, connected, catalogued, queueAutoScan]);
+
+  // Starts the next queued scan once its drive has settled and nothing else
+  // holds the drives: one copy, scan or content check runs at a time.
+  useEffect(() => {
+    const next = autoScanQueue.current[0];
+    if (!next) return;
+    const busy = scanningId !== null || executingPlan || executionRunning.current || contentCheck.phase === "running";
+    if (busy) return;
+    const wait = next.dueAt - Date.now();
+    if (wait > 0) {
+      const timeout = window.setTimeout(() => setAutoScanTick((tick) => tick + 1), wait);
+      return () => window.clearTimeout(timeout);
+    }
+    autoScanQueue.current = autoScanQueue.current.slice(1);
+    const drive = connected.find((item) => item.persistentIdentifier === next.driveId);
+    if (drive) {
+      void scan(drive, true);
+    } else {
+      setAutoScanTick((tick) => tick + 1);
+    }
+    // `scan` is recreated every render, so it isn't a dependency. The queue
+    // and the flags above decide when this runs.
+  }, [autoScanTick, scanningId, executingPlan, contentCheck.phase, connected]);
 
   const catalogueFor = (id: string | null) =>
     id ? catalogued.find((item) => item.persistentIdentifier === id) : undefined;
@@ -3158,7 +3247,7 @@ function App() {
                   {scanning && scanProgress?.persistentIdentifier === drive.persistentIdentifier ? (
                     <div className="scan-progress">
                       <div className="scan-progress-row">
-                        <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : "Scanning catalogue…"}</strong>
+                        <strong>{cancellingId === drive.persistentIdentifier ? "Cancelling scan…" : autoScanningId === drive.persistentIdentifier ? "Connected. Rescanning…" : "Scanning catalogue…"}</strong>
                         <div className="scan-progress-actions">
                           <span>{count((scanProgress.fileCount + scanProgress.directoryCount), "item")}</span>
                           <button

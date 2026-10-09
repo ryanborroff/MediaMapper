@@ -109,6 +109,7 @@ Work through the table in order. "History" means the **Transfers** view.
 | R19 | Persistence | Quit and relaunch. | Drives, scan times, labels, history and the remaining plan are all still there. |
 | R20 | Offline browsing | Eject all images and relaunch. | All three drives are listed under Offline. Browsing MMSmokeSource › Films still lists its contents. |
 | R21 | Search | Browse › **All files**, search `clip`. | `Café clip.mov` on MMSmokeSource, marked "Drive offline". |
+| R22 | Automatic rescan | Add a file to MMSmokeSource, eject it, then attach it again. Then attach an image that has never been scanned. | A few seconds after MMSmokeSource mounts, its card shows "Connected. Rescanning…", then the new file is in the catalogue. Drives connected at launch are rescanned the same way. The image never scanned is listed but not scanned. Ejecting a drive during an automatic rescan shows no error. |
 
 Teardown:
 
