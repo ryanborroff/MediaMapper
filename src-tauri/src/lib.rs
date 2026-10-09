@@ -3517,6 +3517,40 @@ async fn scan_connected_drive(
     .map_err(|error| format!("Drive scan task failed: {error}"))?
 }
 
+fn list_folder(
+    connection: &Connection,
+    persistent_identifier: &str,
+    parent_path: &str,
+) -> Result<Vec<CatalogueEntry>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
+            FROM files
+            WHERE drive_id = ?1
+              AND parent_path = ?2
+            ORDER BY is_directory DESC, lower(name), name
+            ",
+        )
+        .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
+
+    let rows = statement
+        .query_map(params![persistent_identifier, parent_path], |row| {
+            Ok(CatalogueEntry {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                is_directory: row.get::<_, i64>(2)? != 0,
+                size_bytes: row.get(3)?,
+                modified_at: row.get(4)?,
+                unreadable: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+}
+
 #[tauri::command]
 async fn list_catalogue_entries(
     app: tauri::AppHandle,
@@ -3525,34 +3559,7 @@ async fn list_catalogue_entries(
 ) -> Result<Vec<CatalogueEntry>, String> {
     run_command("open this folder", move || {
         let connection = open_database(&database_path(&app)?)?;
-
-        let mut statement = connection
-            .prepare(
-                "
-                SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
-                FROM files
-                WHERE drive_id = ?1
-                  AND parent_path = ?2
-                ORDER BY is_directory DESC, lower(name), name
-                ",
-            )
-            .map_err(|error| format!("Unable to query catalogue entries: {error}"))?;
-
-        let rows = statement
-            .query_map(params![persistent_identifier, parent_path], |row| {
-                Ok(CatalogueEntry {
-                    relative_path: row.get(0)?,
-                    name: row.get(1)?,
-                    is_directory: row.get::<_, i64>(2)? != 0,
-                    size_bytes: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    unreadable: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .map_err(|error| format!("Unable to read catalogue entries: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read catalogue entry rows: {error}"))
+        list_folder(&connection, &persistent_identifier, &parent_path)
     })
     .await
 }
@@ -3638,6 +3645,68 @@ fn search_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn search_drive(
+    connection: &Connection,
+    persistent_identifier: &str,
+    query: &str,
+) -> Result<Vec<CatalogueEntry>, String> {
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let name_expr = normalised_search_expression("name");
+    let path_expr = normalised_search_expression("relative_path");
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 2;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
+        "SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
+         FROM files
+         WHERE drive_id = ?1
+           AND {}
+         ORDER BY is_directory DESC, lower(name), relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
+    values.push(&persistent_identifier);
+    for token in &tokens {
+        values.push(token);
+    }
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search catalogue: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(CatalogueEntry {
+                relative_path: row.get(0)?,
+                name: row.get(1)?,
+                is_directory: row.get::<_, i64>(2)? != 0,
+                size_bytes: row.get(3)?,
+                modified_at: row.get(4)?,
+                unreadable: row.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(|error| format!("Unable to read search results: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read search result rows: {error}"))
+}
+
 #[tauri::command]
 async fn search_catalogue(
     app: tauri::AppHandle,
@@ -3645,65 +3714,72 @@ async fn search_catalogue(
     query: String,
 ) -> Result<Vec<CatalogueEntry>, String> {
     run_command("search this drive", move || {
-        let tokens = search_tokens(query.trim());
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let connection = open_database(&database_path(&app)?)?;
-
-        let name_expr = normalised_search_expression("name");
-        let path_expr = normalised_search_expression("relative_path");
-
-        let conditions: Vec<String> = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let parameter = index + 2;
-                format!(
-                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-                )
-            })
-            .collect();
-
-        let sql = format!(
-            "SELECT relative_path, name, is_directory, size_bytes, modified_at, unreadable
-             FROM files
-             WHERE drive_id = ?1
-               AND {}
-             ORDER BY is_directory DESC, lower(name), relative_path
-             LIMIT 200",
-            conditions.join(" AND ")
-        );
-
-        let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(tokens.len() + 1);
-        values.push(&persistent_identifier);
-        for token in &tokens {
-            values.push(token);
-        }
-
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|error| format!("Unable to search catalogue: {error}"))?;
-
-        let rows = statement
-            .query_map(values.as_slice(), |row| {
-                Ok(CatalogueEntry {
-                    relative_path: row.get(0)?,
-                    name: row.get(1)?,
-                    is_directory: row.get::<_, i64>(2)? != 0,
-                    size_bytes: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    unreadable: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .map_err(|error| format!("Unable to read search results: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read search result rows: {error}"))
+        search_drive(&connection, &persistent_identifier, &query)
     })
     .await
+}
+
+fn search_library(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<LibrarySearchResult>, String> {
+    let tokens = search_tokens(query.trim());
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let name_expr = normalised_search_expression("f.name");
+    let path_expr = normalised_search_expression("f.relative_path");
+
+    let conditions: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let parameter = index + 1;
+            format!(
+                "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
+                  OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
+            )
+        })
+        .collect();
+
+    let sql = format!(
+        "SELECT f.drive_id, d.name, f.relative_path, f.name,
+                f.is_directory, f.size_bytes, f.modified_at
+         FROM files f
+         JOIN drives d ON d.persistent_identifier = f.drive_id
+         WHERE {}
+         ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
+         LIMIT 200",
+        conditions.join(" AND ")
+    );
+
+    let values: Vec<&dyn rusqlite::ToSql> = tokens
+        .iter()
+        .map(|token| token as &dyn rusqlite::ToSql)
+        .collect();
+
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("Unable to search library: {error}"))?;
+
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(LibrarySearchResult {
+                drive_id: row.get(0)?,
+                drive_name: row.get(1)?,
+                relative_path: row.get(2)?,
+                name: row.get(3)?,
+                is_directory: row.get::<_, i64>(4)? != 0,
+                size_bytes: row.get(5)?,
+                modified_at: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("Unable to read library search results: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to read library search result rows: {error}"))
 }
 
 #[tauri::command]
@@ -3712,64 +3788,8 @@ async fn search_all_catalogues(
     query: String,
 ) -> Result<Vec<LibrarySearchResult>, String> {
     run_command("search your drives", move || {
-        let tokens = search_tokens(query.trim());
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let connection = open_database(&database_path(&app)?)?;
-
-        let name_expr = normalised_search_expression("f.name");
-        let path_expr = normalised_search_expression("f.relative_path");
-
-        let conditions: Vec<String> = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let parameter = index + 1;
-                format!(
-                    "({name_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE \
-                      OR {path_expr} LIKE '%' || ?{parameter} || '%' COLLATE NOCASE)"
-                )
-            })
-            .collect();
-
-        let sql = format!(
-            "SELECT f.drive_id, d.name, f.relative_path, f.name,
-                    f.is_directory, f.size_bytes, f.modified_at
-             FROM files f
-             JOIN drives d ON d.persistent_identifier = f.drive_id
-             WHERE {}
-             ORDER BY f.is_directory DESC, lower(f.name), lower(d.name), f.relative_path
-             LIMIT 200",
-            conditions.join(" AND ")
-        );
-
-        let values: Vec<&dyn rusqlite::ToSql> = tokens
-            .iter()
-            .map(|token| token as &dyn rusqlite::ToSql)
-            .collect();
-
-        let mut statement = connection
-            .prepare(&sql)
-            .map_err(|error| format!("Unable to search library: {error}"))?;
-
-        let rows = statement
-            .query_map(values.as_slice(), |row| {
-                Ok(LibrarySearchResult {
-                    drive_id: row.get(0)?,
-                    drive_name: row.get(1)?,
-                    relative_path: row.get(2)?,
-                    name: row.get(3)?,
-                    is_directory: row.get::<_, i64>(4)? != 0,
-                    size_bytes: row.get(5)?,
-                    modified_at: row.get(6)?,
-                })
-            })
-            .map_err(|error| format!("Unable to read library search results: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to read library search result rows: {error}"))
+        search_library(&connection, &query)
     })
     .await
 }
@@ -13109,6 +13129,142 @@ map auto_home 0 0 0 100% /System/Volumes/Data/home";
         let history = list_transfer_records(&fixture.connection).unwrap();
         assert_eq!(history[0].status, "failed");
         let _ = &fixture.database;
+    }
+
+    // ---- Scale ----
+
+    fn timed<T>(label: &str, work: impl FnOnce() -> T) -> (T, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let result = work();
+        let elapsed = started.elapsed();
+        println!("SCALE {label}: {:.0} ms", elapsed.as_secs_f64() * 1000.0);
+        (result, elapsed)
+    }
+
+    // Opt-in benchmark: a catalogue of a million files across three drives,
+    // laid out like footage (year / project / clip), then the searches and
+    // folder views people use constantly. Run with
+    // `cargo test --release --lib catalogue_at_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn catalogue_at_scale_stays_responsive() {
+        let database = TestDatabase::new("scale-catalogue");
+        let mut connection = open_database(&database.0).unwrap();
+        let drives = ["UUID-A", "UUID-B", "UUID-C"];
+        for (index, id) in drives.iter().enumerate() {
+            insert_drive(&connection, id, &format!("Archive {}", index + 1));
+        }
+        let per_drive = 333_334_i64;
+        let ((), _) = timed("insert 1,000,000 catalogue rows", || {
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO files (drive_id, relative_path, name, parent_path, is_directory, size_bytes, modified_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .unwrap();
+                for id in drives {
+                    for n in 0..per_drive {
+                        let year = 2015 + n % 10;
+                        let project = n / 400;
+                        let folder = format!("{year}/Project {project:04} Été");
+                        if n % 400 == 0 {
+                            insert
+                                .execute(params![
+                                    id,
+                                    folder,
+                                    format!("Project {project:04} Été"),
+                                    year.to_string(),
+                                    1,
+                                    None::<i64>,
+                                    0
+                                ])
+                                .unwrap();
+                        }
+                        let name = format!("Clip_{n:06}_Café.mov");
+                        insert
+                            .execute(params![
+                                id,
+                                format!("{folder}/{name}"),
+                                name,
+                                folder,
+                                0,
+                                1_000_000 + n * 37,
+                                1_600_000_000 + n
+                            ])
+                            .unwrap();
+                    }
+                }
+            }
+            transaction.commit().unwrap();
+        });
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        println!("SCALE catalogue rows: {count}");
+
+        let (results, search_all) = timed("search all drives: `clip 004217`", || {
+            search_library(&connection, "clip 004217").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, search_common) = timed("search all drives, common word: `café`", || {
+            search_library(&connection, "café").unwrap()
+        });
+        assert_eq!(results.len(), 200);
+        let (results, search_none) = timed("search all drives, no match: `zebra`", || {
+            search_library(&connection, "zebra").unwrap()
+        });
+        assert!(results.is_empty());
+        let (results, search_one) = timed("search one drive: `clip 004217`", || {
+            search_drive(&connection, "UUID-B", "clip 004217").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, folder) = timed("open a 400-file folder", || {
+            list_folder(&connection, "UUID-B", "2017/Project 0012 Été").unwrap()
+        });
+        assert!(!results.is_empty());
+        let (results, root) = timed("open a drive's top level", || {
+            list_folder(&connection, "UUID-B", "").unwrap()
+        });
+        println!("SCALE top-level entries: {}", results.len());
+
+        // Generous ceilings, for a release build on an Apple silicon Mac.
+        // They catch a regression to a much slower plan, not small drift.
+        for (label, elapsed) in [
+            ("search all", search_all),
+            ("search common", search_common),
+            ("search none", search_none),
+            ("search one", search_one),
+            ("folder", folder),
+            ("root", root),
+        ] {
+            assert!(elapsed.as_secs_f64() < 5.0, "{label} took {elapsed:?}");
+        }
+    }
+
+    // Opt-in benchmark: scans 100,000 real files in 500 folders.
+    #[test]
+    #[ignore]
+    fn scanning_a_hundred_thousand_files() {
+        let database = TestDatabase::new("scale-scan");
+        let unique = format!("{}-{}", std::process::id(), now_unix());
+        let volume = TestVolume(std::env::temp_dir().join(format!("tidy-drives-scale-{unique}")));
+        let ((), _) = timed("create 100,000 files", || {
+            for folder in 0..500 {
+                let directory = volume.0.join(format!("Shoot {folder:03}"));
+                fs::create_dir_all(&directory).unwrap();
+                for file in 0..200 {
+                    fs::write(directory.join(format!("IMG_{file:04}.CR3")), b"x").unwrap();
+                }
+            }
+        });
+        let drive = test_drive("UUID-SCALE", "Scale", &volume.0, 1_000_000_000);
+        let (result, _) = timed("scan 100,000 files", || {
+            scan_drive_job(database.0.clone(), drive, |_, _, _| {})().unwrap()
+        });
+        assert_eq!(result.file_count, 100_000);
+        assert_eq!(result.directory_count, 500);
     }
 
     // ---- Content checks ----
