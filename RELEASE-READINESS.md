@@ -205,7 +205,7 @@ Every open issue, in the three classes. "You" marks a decision or action only yo
 
 Ship what exists today, with nothing added:
 
-- **Drives:** discovery, labels, scanning, and a persistent catalogue that stays browsable offline.
+- **Drives:** discovery, labels, scanning, automatic rescans of catalogued drives when they connect, and a persistent catalogue that stays browsable offline.
 - **Browse:** browsing and search across drives, opening files, and Show in Finder.
 - **Plan:** virtual planned moves to drives and to folders on this Mac, with previews, destination capacity and live readiness.
 - **Copy:** copy and verify with cancellation, interruption recovery and destination-loss detection.
